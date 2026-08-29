@@ -3312,8 +3312,11 @@ def _qwen_subagent_launch_overrides(
     "sub_agent"``), not the ``omnigent.ui`` label — the server stamps that on
     native sub-agents too, so it cannot tell the two apart.
 
-    Best-effort: a bridge dir that cannot be written costs the overrides, not the
-    session, so the launch continues with qwen's defaults.
+    Best-effort, and deliberately total: NOTHING here may stop qwen from
+    starting. A bridge dir that cannot be written, a settings file that cannot be
+    parsed or merged, any surprise at all — the session launches with qwen's
+    defaults instead of not launching. The trim is an optimization; the session
+    is the product.
 
     :param session_id: Session/conversation identifier, for the log lines.
     :param launch_config: Session snapshot config; read for the parent link.
@@ -3331,7 +3334,7 @@ def _qwen_subagent_launch_overrides(
         return QwenSubagentLaunch()
     try:
         overrides = subagent_launch_overrides(bridge_dir)
-    except OSError:
+    except Exception:  # noqa: BLE001 - the launch must survive any failure here
         _logger.warning(
             "qwen-native: could not materialize the sub-agent tool-surface trim in %s; "
             "session %s launches with qwen's full tool registry.",
@@ -3478,7 +3481,16 @@ async def _auto_create_qwen_terminal(
     # relay will actually start (``ensure_comment_relay`` present), else the
     # registered tools would be dead (serve-mcp with nothing to route calls back
     # to) — mirrors the opencode-native gating.
-    mcp_enabled = server_client is not None and ensure_comment_relay is not None
+    # Skipped for a trimmed sub-agent: its ``mcp.excluded: ["*"]`` refuses every
+    # server INCLUDING this CLI-provided one (verified — qwen lists ``omnigent``
+    # as ``disconnected`` and registers none of its tools), so preparing it would
+    # write a relay token and spawn ``serve-mcp`` for a connection qwen declines.
+    # The comment relay itself still starts below; only the MCP wiring is dropped.
+    mcp_enabled = (
+        server_client is not None
+        and ensure_comment_relay is not None
+        and not subagent_overrides.env
+    )
     mcp_args: list[str] = []
     if mcp_enabled:
         try:

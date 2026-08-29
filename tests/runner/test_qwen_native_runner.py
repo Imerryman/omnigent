@@ -287,6 +287,36 @@ def test_subagent_launch_survives_an_unwritable_bridge_dir(
     assert "full tool registry" in caplog.text
 
 
+def test_no_failure_in_the_trim_can_abort_the_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The trim is an optimization; the session is the product.
+
+    An ``OSError`` is the expected failure, but the guard is deliberately broad:
+    a parse or merge surprise (a hand-edited settings file with an unhashable
+    entry used to raise ``TypeError`` here) must cost the trim, never the qwen
+    process.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    def _boom(_settings_dir: object) -> None:
+        raise TypeError("unhashable type: 'dict'")
+
+    monkeypatch.setattr("omnigent.qwen_native_settings.subagent_launch_overrides", _boom)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.native.orchestration"):
+        overrides = _qwen_subagent_launch_overrides(
+            "conv_child",
+            _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+            tmp_path / "bridge",
+        )
+
+    assert overrides.env == {}
+    assert overrides.args == []
+    assert "full tool registry" in caplog.text
+
+
 def test_the_prompt_append_is_sub_agent_scoped(tmp_path: Path) -> None:
     """B1: the implementer override rides in argv, and only for a sub-agent.
 
