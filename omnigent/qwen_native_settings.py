@@ -14,7 +14,7 @@ The whole surface is revealed because qwen's deferred-tool preload budget is
 is 100k tokens, which the entire registry fits under, so nothing stays behind
 ``tool_search``.
 
-Four knobs cut it (see :func:`subagent_settings_overlay`):
+Six knobs cut it (see :func:`subagent_settings_overlay`):
 
 - ``tools.toolSearch.threshold: 0`` — never preload deferred tools; the model
   reaches the rest through ``tool_search`` if it genuinely needs them.

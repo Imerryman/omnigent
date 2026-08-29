@@ -33,9 +33,12 @@ from omnigent.qwen_native_bridge import (
 )
 from omnigent.qwen_native_forwarder import (
     _DEDUP_WINDOW,
+    _STATUS_FAILED,
+    _STATUS_IDLE,
     _compaction_status_from_record,
     _event_to_items,
     _ForwardState,
+    _item_already_seen,
     _new_seen,
     _read_new_compaction_statuses,
     _read_state,
@@ -61,16 +64,26 @@ def _event_to_item(event: dict, agent_name: str) -> fwd._MirrorItem | None:
     return items[0] if items else None
 
 
-def _read_new_events(f: Path, offset: int, seen, agent_name: str) -> tuple[list, int]:
-    """``(items, new_offset)`` view of the 4-tuple ``_read_new_events`` returns.
+def _poll(
+    f: Path,
+    offset: int = 0,
+    seen: object = frozenset(),
+    agent_name: str = _AGENT,
+    state: fwd._ForwardState | None = None,
+) -> fwd._PollResult:
+    """Read *f* past *offset* and return the WHOLE :class:`_PollResult`.
 
-    The turn-end uuids and threaded ``last_stop_reason`` are the parent-wake
-    plumbing; the tests below assert only on mirrored items and the offset.
+    Nothing is discarded: the wake edges and the threaded turn classification
+    are the parent-wake contract these tests exist to pin, so they are asserted
+    on directly rather than dropped by a convenience shim.
     """
-    items, _turn_end_uuids, new_offset, _last_stop_reason = _read_new_events_raw(
-        f, offset, seen, agent_name
-    )
-    return items, new_offset
+    return _read_new_events_raw(f, offset, seen, agent_name, state)
+
+
+def _read_new_events(f: Path, offset: int, seen, agent_name: str) -> tuple[list, int]:
+    """``(items, new_offset)`` narrowing for the mirroring-only tests below."""
+    r = _poll(f, offset, seen, agent_name)
+    return r.items, r.offset
 
 
 def _user_ev(uuid: str, text: str) -> dict:
@@ -504,6 +517,7 @@ async def test_post_conversation_item_shape() -> None:
     client = _RecordingClient()
     item = fwd._MirrorItem(
         uuid="u1",
+        index=0,
         item_type="message",
         item_data={"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
         response_id="qwen:u1",
@@ -554,9 +568,11 @@ async def test_forward_loop_posts_new_events_and_persists(
 
     assert posted == ["qwen:u1"]
     # Offset + dedup set are persisted so a restart resumes without re-posting.
+    # The recorded id is the per-ITEM id ("<event-uuid>#<index>"), not the bare
+    # event uuid — see _MirrorItem.item_uuid.
     state = _read_state(bridge)
     assert state.offset > 0
-    assert "u1" in (state.seen_uuids or [])
+    assert "u1#0" in (state.seen_uuids or [])
 
 
 async def test_compaction_mirror_seeds_at_eof_and_posts_new(
@@ -629,3 +645,636 @@ async def test_supervise_restarts_then_propagates_cancel(
 
     assert calls["n"] == 2
     assert sleeps == [1.0]  # initial backoff before the one restart
+
+
+# --------------------------------------------------------------------------
+# Parent-wake path (P11-P13). These replace the old shims that discarded the
+# turn-end uuids and the stop-reason classification.
+#
+# The fixtures under tests/fixtures/qwen_native/ are REAL qwen bridge output
+# (qwen v0.22.0, stream-json protocol 2) distilled down: envelopes and the
+# fields the forwarder reads are verbatim, content_block_delta noise is dropped
+# and long prose is truncated. Facts they pin, measured over 319k recorded
+# events across 23 sessions:
+#   * a turn is a message_start...message_stop window, and windows never nest
+#     (max concurrent depth 1), so the opening message.id names the turn;
+#   * message_stop is bare -- {"type": "message_stop"}, no id -- so the
+#     classification has to come from the open window, not the stop event;
+#   * stop_reason is only ever None (turn end) or "tool_use" (mid-loop);
+#   * qwen never emits a `result` event in interactive TUI mode (0 occurrences)
+#     even though session_start advertises it, and only 2 of 23 sessions carry
+#     system/session_end -- hence the process-exit fallback.
+# --------------------------------------------------------------------------
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "qwen_native"
+
+
+def _fixture_events(name: str) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (_FIXTURES / name).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def _write_events(path: Path, events: list[dict]) -> None:
+    path.write_bytes(b"".join(_ev_bytes(e) for e in events))
+
+
+def _stream_ev(uuid: str, inner: dict, parent_tool_use_id: str | None = None) -> dict:
+    return {
+        "type": "stream_event",
+        "uuid": uuid,
+        "parent_tool_use_id": parent_tool_use_id,
+        "event": inner,
+    }
+
+
+def _msg_start(uuid: str, msg_id: str, parent_tool_use_id: str | None = None) -> dict:
+    return _stream_ev(
+        uuid,
+        {"type": "message_start", "message": {"id": msg_id, "role": "assistant", "content": []}},
+        parent_tool_use_id,
+    )
+
+
+def _msg_stop(uuid: str, parent_tool_use_id: str | None = None) -> dict:
+    return _stream_ev(uuid, {"type": "message_stop"}, parent_tool_use_id)
+
+
+def _asst_stop(uuid: str, stop_reason: str | None, blocks: list[dict] | None = None) -> dict:
+    return {
+        "type": "assistant",
+        "uuid": uuid,
+        "parent_tool_use_id": None,
+        "message": {
+            "role": "assistant",
+            "stop_reason": stop_reason,
+            "content": blocks if blocks is not None else [{"type": "text", "text": "ok"}],
+        },
+    }
+
+
+# --- fixture-driven: the real recorded sessions ----------------------------
+
+
+def test_real_tool_loop_session_wakes_exactly_once(tmp_path: Path) -> None:
+    """A real 7-message_stop tool loop must wake the parent exactly ONCE.
+
+    Regression pin for the premature-wake bug: six of those stops close
+    ``stop_reason="tool_use"`` steps that qwen auto-continues from.
+    """
+    events = _fixture_events("tool_loop_session.ndjson")
+    raw_stops = [e for e in events if (e.get("event") or {}).get("type") == "message_stop"]
+    assert len(raw_stops) == 7, "fixture must exercise the multi-stop tool loop"
+
+    f = tmp_path / "events.ndjson"
+    _write_events(f, events)
+    result = _poll(f)
+
+    assert [w.status for w in result.wakes] == [_STATUS_IDLE]
+    assert result.turn_open is False
+    # The single wake is the LAST message_stop, not one of the tool-loop ones.
+    assert result.wakes[0].uuid == raw_stops[-1]["uuid"]
+
+
+def test_real_tool_loop_wake_is_last_and_follows_all_items(tmp_path: Path) -> None:
+    """Ordering: every mirrored item of the turn precedes the wake edge."""
+    events = _fixture_events("tool_loop_session.ndjson")
+    f = tmp_path / "events.ndjson"
+    _write_events(f, events)
+    result = _poll(f)
+
+    assert result.items, "the fixture mirrors real tool calls and prose"
+    assert {i.item_type for i in result.items} >= {"function_call", "function_call_output"}
+    # _PollResult keeps them in separate lists and the loop drains items first,
+    # so the wake can only be posted after every item of the batch.
+    assert len(result.wakes) == 1
+
+
+def test_real_api_error_session_still_wakes(tmp_path: Path) -> None:
+    """A real API-failure turn (error prose, no tool calls) still wakes the parent."""
+    events = _fixture_events("api_error_session.ndjson")
+    f = tmp_path / "events.ndjson"
+    _write_events(f, events)
+    result = _poll(f)
+
+    assert [w.status for w in result.wakes] == [_STATUS_IDLE]
+    prose = [i for i in result.items if i.item_type == "message"]
+    assert any("API Error" in str(i.item_data) for i in prose)
+
+
+def test_real_session_end_after_message_stop_does_not_double_wake(tmp_path: Path) -> None:
+    """``system/session_end`` after a clean turn end must NOT add a second wake."""
+    events = _fixture_events("session_end_session.ndjson")
+    assert events[-1]["subtype"] == "session_end", "fixture must end with session_end"
+    f = tmp_path / "events.ndjson"
+    _write_events(f, events)
+    result = _poll(f)
+
+    assert [w.status for w in result.wakes] == [_STATUS_IDLE]
+    assert result.turn_open is False
+
+
+def test_session_end_wakes_when_turn_never_stopped(tmp_path: Path) -> None:
+    """``session_end`` while a turn is still open IS the terminal edge."""
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _msg_start("s1", "m1"),
+            _asst_stop("m1", None),
+            {
+                "type": "system",
+                "subtype": "session_end",
+                "uuid": "se1",
+                "parent_tool_use_id": None,
+            },
+        ],
+    )
+    result = _poll(f)
+    assert [(w.uuid, w.status) for w in result.wakes] == [("se1", _STATUS_IDLE)]
+    assert result.turn_open is False
+
+
+# --- BLOCKING #1: tool-loop state must survive a forwarder restart ----------
+
+
+def test_tool_use_stop_does_not_wake_within_one_poll(tmp_path: Path) -> None:
+    f = tmp_path / "events.ndjson"
+    _write_events(f, [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use"), _msg_stop("t1")])
+    result = _poll(f)
+    assert result.wakes == []
+    assert result.turn_open is True, "the tool loop is still in flight"
+
+
+def test_tool_use_stop_does_not_wake_across_a_split_poll(tmp_path: Path) -> None:
+    """The classification survives a poll boundary (the cross-poll carry)."""
+    f = tmp_path / "events.ndjson"
+    _write_events(f, [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    first = _poll(f, 0, set(), _AGENT, _ForwardState())
+    assert first.wakes == []
+    assert first.pending_stop_reason == "tool_use"
+
+    state = _ForwardState(
+        offset=first.offset,
+        seen_uuids=[],
+        pending_window_id=first.pending_window_id,
+        pending_stop_reason=first.pending_stop_reason,
+        turn_open=first.turn_open,
+    )
+    with open(f, "ab") as fh:
+        fh.write(_ev_bytes(_msg_stop("t1")))
+    second = _poll(f, first.offset, set(), _AGENT, state)
+    assert second.wakes == [], "a tool_use stop is never a turn end"
+
+
+def test_tool_use_classification_survives_a_forwarder_RESTART(tmp_path: Path) -> None:
+    """BLOCKING #1. The bug: ``last_stop_reason`` was a local that started None on
+    every forwarder start, so a ``tool_use`` step whose offset was persisted before
+    the restart lost its classification and the following ``message_stop`` was
+    misread as a turn end -> premature parent wake mid tool-loop.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    f = events_file_path(bridge)
+
+    # Poll 1: the tool_use step is consumed and its offset persisted.
+    _write_events(f, [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    first = _poll(f, 0, set(), _AGENT, _ForwardState())
+    _write_state(
+        bridge,
+        _ForwardState(
+            offset=first.offset,
+            seen_uuids=[],
+            pending_window_id=first.pending_window_id,
+            pending_stop_reason=first.pending_stop_reason,
+            turn_open=first.turn_open,
+        ),
+    )
+
+    # ---- forwarder restarts here: all in-memory state is gone ----
+    restored = _read_state(bridge)
+    assert restored.pending_stop_reason == "tool_use", "classification must be durable"
+    assert restored.turn_open is True
+
+    # The message_stop now arrives, after the restart.
+    with open(f, "ab") as fh:
+        fh.write(_ev_bytes(_msg_stop("t1")))
+    after = _poll(f, restored.offset, set(), _AGENT, restored)
+    assert after.wakes == [], "restart must not resurrect the premature wake"
+
+
+def test_nested_assistant_event_cannot_overwrite_top_level_classification(
+    tmp_path: Path,
+) -> None:
+    """BLOCKING #1 (second half). ``last_stop_reason`` was updated from EVERY
+    assistant event while the turn-end check filters to top level, so a nested
+    sub-tool assistant event could overwrite the top-level classification.
+    """
+    f = tmp_path / "events.ndjson"
+    nested = {
+        "type": "assistant",
+        "uuid": "n1",
+        "parent_tool_use_id": "call_42",  # nested: belongs to a sub-tool stream
+        "message": {"role": "assistant", "stop_reason": None, "content": []},
+    }
+    _write_events(
+        f,
+        [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use"), nested, _msg_stop("t1")],
+    )
+    result = _poll(f)
+    assert result.wakes == [], "the nested event must not clear the tool_use classification"
+
+
+def test_nested_message_stop_is_never_a_turn_end(tmp_path: Path) -> None:
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _msg_start("s1", "m1"),
+            _asst_stop("m1", None),
+            _msg_stop("t_nested", parent_tool_use_id="call_42"),
+        ],
+    )
+    assert _poll(f).wakes == []
+
+
+def test_assistant_and_stop_are_correlated_by_the_open_window(tmp_path: Path) -> None:
+    """Ordering pin: a new ``message_start`` resets the classification, so the
+    previous window's ``tool_use`` cannot leak into the next window's stop.
+    """
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _msg_start("s1", "m1"),
+            _asst_stop("m1", "tool_use"),
+            _msg_stop("t1"),  # mid-loop: no wake
+            _msg_start("s2", "m2"),
+            _asst_stop("m2", None),
+            _msg_stop("t2"),  # real turn end: wake
+        ],
+    )
+    result = _poll(f)
+    assert [w.uuid for w in result.wakes] == ["t2"]
+
+
+# --- BLOCKING #2: a partial multi-item event must not lose items ------------
+
+
+def test_multi_item_event_gets_distinct_deterministic_item_ids() -> None:
+    """BLOCKING #2. All items of one event used to share the event uuid."""
+    event = _asst_ev(
+        "a1",
+        [
+            {"type": "tool_use", "id": "call_1", "name": "read", "input": {"p": "/x"}},
+            {"type": "text", "text": "reading now"},
+        ],
+    )
+    items = _event_to_items(event, _AGENT)
+    assert len(items) == 2
+    assert [i.item_uuid for i in items] == ["a1#0", "a1#1"]
+    assert len({i.item_uuid for i in items}) == 2
+    # Deterministic: re-deriving after a truncation rewind yields the same ids.
+    assert [i.item_uuid for i in _event_to_items(event, _AGENT)] == ["a1#0", "a1#1"]
+
+
+def test_partial_event_replays_only_the_failed_item(tmp_path: Path) -> None:
+    """BLOCKING #2. Item 1 POSTs, item 2 fails; the retry must re-offer item 2
+    and ONLY item 2. Before the fix the event uuid was marked seen after item 1,
+    so the whole event was suppressed and item 2 was dropped for good.
+    """
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _asst_ev(
+                "a1",
+                [
+                    {"type": "tool_use", "id": "call_1", "name": "read", "input": {}},
+                    {"type": "text", "text": "prose that must not be lost"},
+                ],
+            )
+        ],
+    )
+    first = _poll(f)
+    assert [i.item_uuid for i in first.items] == ["a1#0", "a1#1"]
+
+    # Item 1 succeeded, item 2's POST raised: only item 1 is recorded.
+    seen = _new_seen(["a1#0"])
+    # The retry re-reads from the SAME offset (the cursor was not advanced).
+    retry = _poll(f, 0, seen, _AGENT, _ForwardState())
+    assert [i.item_uuid for i in retry.items] == ["a1#1"]
+    assert "prose that must not be lost" in str(retry.items[0].item_data)
+
+
+def test_partial_event_of_several_tool_calls_replays_only_the_gap(tmp_path: Path) -> None:
+    """Same guarantee for an event carrying several tool calls."""
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _asst_ev(
+                "a1",
+                [
+                    {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
+                    {"type": "tool_use", "id": "c2", "name": "grep", "input": {}},
+                    {"type": "tool_use", "id": "c3", "name": "edit", "input": {}},
+                ],
+            )
+        ],
+    )
+    seen = _new_seen(["a1#0", "a1#2"])  # the middle POST failed
+    retry = _poll(f, 0, seen, _AGENT, _ForwardState())
+    assert [i.item_uuid for i in retry.items] == ["a1#1"]
+    assert retry.items[0].item_data["call_id"] == "c2"
+
+
+def test_legacy_bare_event_uuid_in_state_still_suppresses_the_event() -> None:
+    """Upgrade safety: state written by the pre-patch build holds bare event
+    uuids, and must keep suppressing that event rather than re-posting history.
+    """
+    items = _event_to_items(_asst_ev("a1", [{"type": "text", "text": "hi"}]), _AGENT)
+    assert _item_already_seen(items[0], {"a1"}) is True
+    assert _item_already_seen(items[0], {"a1#0"}) is True
+    assert _item_already_seen(items[0], {"a1#1"}) is False
+
+
+# --- BLOCKING #3: a terminal edge on failure / EOF --------------------------
+
+
+def test_eof_without_message_stop_leaves_the_turn_open(tmp_path: Path) -> None:
+    """BLOCKING #3, precondition: a stream that dies mid-turn never produces a
+    turn-end marker, so nothing on the message_stop path can wake the parent.
+    """
+    events = _fixture_events("tool_loop_session.ndjson")
+    # Truncate the real session just before its final message_stop -- the shape
+    # of the one recorded session that really did end mid-stream.
+    cut = len(events) - 1
+    assert (events[cut].get("event") or {}).get("type") == "message_stop"
+    f = tmp_path / "events.ndjson"
+    _write_events(f, events[:cut])
+
+    result = _poll(f)
+    assert result.wakes == [], "no message_stop means no wake on the normal path"
+    assert result.turn_open is True, "so the fallback must have something to fire on"
+
+
+async def test_process_exit_posts_terminal_status_after_draining(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKING #3. The qwen process is gone with a turn still open: the
+    forwarder must drain the stream, mirror what is there, and THEN post a
+    terminal edge so the parent is not stranded.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events = _fixture_events("tool_loop_session.ndjson")
+    _write_events(events_file_path(bridge), events[: len(events) - 1])  # no message_stop
+
+    posted_items: list[str] = []
+    statuses: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        posted_items.append(item.item_uuid)  # type: ignore[attr-defined]
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: False,  # the pane is gone
+        )
+    )
+    for _ in range(300):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_FAILED], "exactly one terminal edge"
+    assert posted_items, "the stream was drained BEFORE the terminal edge"
+    # Durably closed, so a restart does not fire it again.
+    assert _read_state(bridge).turn_open is False
+
+
+async def test_process_exit_does_not_double_wake_after_a_clean_turn_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKING #3, dedup half. A complete turn already posted its ``idle``; the
+    process-exit fallback must stay silent.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    _write_events(events_file_path(bridge), _fixture_events("tool_loop_session.ndjson"))
+
+    statuses: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: False,
+        )
+    )
+    for _ in range(300):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)  # let several more polls run
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_IDLE], "the message_stop wake only, never a second edge"
+
+
+async def test_wake_is_posted_after_items_and_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering + exactly-once, asserted on one interleaved call log."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    _write_events(events_file_path(bridge), _fixture_events("tool_loop_session.ndjson"))
+
+    calls: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        calls.append(f"item:{item.item_uuid}")  # type: ignore[attr-defined]
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        calls.append(f"status:{status}")
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: True,  # still running
+        )
+    )
+    for _ in range(300):
+        if any(c.startswith("status:") for c in calls):
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert [c for c in calls if c.startswith("status:")] == ["status:idle"]
+    # Every mirrored item precedes the single wake.
+    assert calls.index("status:idle") == len(calls) - 1
+    assert all(c.startswith("item:") for c in calls[:-1])
+
+
+def test_result_event_is_honoured_when_qwen_emits_one(tmp_path: Path) -> None:
+    """qwen advertises ``result`` in ``supported_events`` but never emits it in
+    the interactive mode we tail; handled anyway so a future build is correct.
+    """
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _msg_start("s1", "m1"),
+            _asst_stop("m1", "tool_use"),
+            {"type": "result", "uuid": "r1", "parent_tool_use_id": None, "is_error": True},
+        ],
+    )
+    result = _poll(f)
+    assert [(w.uuid, w.status) for w in result.wakes] == [("r1", _STATUS_FAILED)]
+    assert result.turn_open is False
+
+
+def test_result_event_success_maps_to_idle(tmp_path: Path) -> None:
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _msg_start("s1", "m1"),
+            {
+                "type": "result",
+                "uuid": "r1",
+                "parent_tool_use_id": None,
+                "subtype": "success",
+                "is_error": False,
+            },
+        ],
+    )
+    assert [w.status for w in _poll(f).wakes] == [_STATUS_IDLE]
+
+
+# --- #5: idempotency key on the terminal edge ------------------------------
+
+
+async def test_status_post_carries_a_stable_idempotency_key() -> None:
+    client = _RecordingClient()
+    await fwd._post_external_session_status(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        status="idle",
+        idempotency_key="turn-end-uuid",
+    )
+    _url, body = client.posts[0]
+    assert body["data"] == {"status": "idle", "idempotency_key": "qwen:turn-end-uuid"}
+
+
+async def test_status_post_without_a_key_is_unchanged() -> None:
+    client = _RecordingClient()
+    await fwd._post_external_session_status(
+        client,  # type: ignore[arg-type]
+        session_id="conv_1",
+        status="failed",
+    )
+    _url, body = client.posts[0]
+    assert body["data"] == {"status": "failed"}
+
+
+# --- liveness probe fail-safety --------------------------------------------
+
+
+def test_tmux_probe_assumes_alive_when_target_unadvertised(tmp_path: Path) -> None:
+    """A false "dead" would wake the parent mid-turn, so uncertainty means alive."""
+    assert fwd._tmux_pane_is_alive(tmp_path) is True
+
+
+def test_tmux_probe_assumes_alive_when_tmux_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+
+    def _boom(*_a: object, **_k: object) -> object:
+        raise OSError("tmux missing")
+
+    monkeypatch.setattr(fwd.subprocess, "run", _boom)
+    assert fwd._tmux_pane_is_alive(tmp_path) is True
+
+
+def test_tmux_probe_reports_dead_on_nonzero_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+
+    class _Proc:
+        returncode = 1
+
+    monkeypatch.setattr(fwd.subprocess, "run", lambda *_a, **_k: _Proc())
+    assert fwd._tmux_pane_is_alive(tmp_path) is False
+
+
+# --- state round-trip for the new durable fields ---------------------------
+
+
+def test_forward_state_roundtrips_the_turn_classification(tmp_path: Path) -> None:
+    state = _ForwardState(
+        offset=42,
+        seen_uuids=["a#0"],
+        pending_window_id="m1",
+        pending_stop_reason="tool_use",
+        turn_open=True,
+    )
+    assert _write_state(tmp_path, state) is True
+    assert _read_state(tmp_path) == state
+
+
+def test_forward_state_from_a_pre_patch_file_reads_cold_defaults(tmp_path: Path) -> None:
+    """A state file written by the old build has no classification fields."""
+    (tmp_path / "qwen_forwarder.json").write_text(
+        json.dumps({"offset": 9, "seen_uuids": ["u1"]}), encoding="utf-8"
+    )
+    state = _read_state(tmp_path)
+    assert state.offset == 9
+    assert state.pending_window_id is None
+    assert state.pending_stop_reason is None
+    assert state.turn_open is False

@@ -146,7 +146,7 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # Native Kimi TUI harness shares the multi-provider kimi resolution path.
     "kimi-native": "kimi",
     "qwen": "qwen",
-    # LOCAL PATCH (2026-08-24): stock 0.10.0 registers only the bare "qwen"
+    # LOCAL PATCH (2026-08-24): stock upstream (v0.11.0) registers only the bare "qwen"
     # key, but the launchable harness id is "qwen-native" (harness_plugins.py
     # QWEN_NATIVE_CODING_AGENT). Without these aliases, _resolve_model_provider
     # short-circuits to "no model-provider resolution" (source=none) before it
