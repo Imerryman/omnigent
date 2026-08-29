@@ -1,9 +1,10 @@
-"""Tests for the qwen sub-agent workspace tool-surface trim.
+"""Tests for the qwen sub-agent tool-surface trim.
 
 Covers :mod:`omnigent.qwen_native_settings` — the four settings knobs that take a
-qwen implementer sub-agent from qwen-code's whole 63-tool registry (~35.5k
-prefill tokens) down to its coding tools (~11.1k), and the merge semantics that
-keep a workspace's pre-existing ``.qwen/settings.json`` intact.
+qwen implementer sub-agent from qwen-code's whole built-in registry (67 declared
+tools, ~47.7k prefill tokens) down to its coding tools (~12.0k), delivered as an
+ephemeral per-session file via ``QWEN_CODE_SYSTEM_SETTINGS_PATH`` rather than a
+workspace ``.qwen/settings.json``.
 """
 
 from __future__ import annotations
@@ -16,21 +17,28 @@ import pytest
 from omnigent.qwen_native_settings import (
     QWEN_SUBAGENT_CORE_TOOLS,
     QWEN_SUBAGENT_DISABLED_TOOLS,
-    QWEN_WORKSPACE_SETTINGS_PATH,
+    QWEN_SYSTEM_SETTINGS_ENV_VAR,
+    subagent_launch_env,
     subagent_settings_overlay,
-    write_subagent_workspace_settings,
+    system_settings_path,
+    write_subagent_system_settings,
 )
 
 
-def _written(workspace: Path) -> dict:
-    return json.loads((workspace / QWEN_WORKSPACE_SETTINGS_PATH).read_text(encoding="utf-8"))
+def _written(settings_dir: Path) -> dict:
+    return json.loads(system_settings_path(settings_dir).read_text(encoding="utf-8"))
+
+
+# ---------------------------------------------------------------------------
+# What the trim declares
+# ---------------------------------------------------------------------------
 
 
 def test_writes_the_four_trim_keys(tmp_path: Path) -> None:
     """The written file pins every knob the token measurement depends on."""
-    path = write_subagent_workspace_settings(tmp_path)
+    path = write_subagent_system_settings(tmp_path)
 
-    assert path == tmp_path / ".qwen" / "settings.json"
+    assert path == tmp_path / "qwen_system_settings.json"
     settings = _written(tmp_path)
     # threshold 0 = never preload deferred tools (10% of a 1M window otherwise
     # fits the whole registry, so qwen declares all of it upfront).
@@ -40,27 +48,9 @@ def test_writes_the_four_trim_keys(tmp_path: Path) -> None:
     assert settings["tools"]["disabled"] == sorted(QWEN_SUBAGENT_DISABLED_TOOLS)
 
 
-def test_creates_the_settings_dir_when_absent(tmp_path: Path) -> None:
-    """A fresh worktree has no ``.qwen/``; the writer makes one."""
-    workspace = tmp_path / "worktree"
-    workspace.mkdir()
-    assert not (workspace / ".qwen").exists()
-
-    write_subagent_workspace_settings(workspace)
-
-    assert (workspace / ".qwen" / "settings.json").is_file()
-
-
-def test_accepts_a_string_workspace(tmp_path: Path) -> None:
-    """The runner hands over a realpath'd ``str``, not a ``Path``."""
-    write_subagent_workspace_settings(str(tmp_path))
-
-    assert _written(tmp_path)["tools"]["toolSearch"]["threshold"] == 0
-
-
 def test_disables_orchestration_tools_only(tmp_path: Path) -> None:
     """The implementer keeps its coding tools; the parent keeps orchestration."""
-    write_subagent_workspace_settings(tmp_path)
+    write_subagent_system_settings(tmp_path)
     disabled = set(_written(tmp_path)["tools"]["disabled"])
 
     # Spawning, worktree state, scheduling and goal/artifact state belong to the
@@ -85,80 +75,6 @@ def test_disables_orchestration_tools_only(tmp_path: Path) -> None:
     assert disabled.isdisjoint(QWEN_SUBAGENT_CORE_TOOLS)
 
 
-def test_merges_into_an_existing_settings_file(tmp_path: Path) -> None:
-    """Unrelated user settings survive; only the trim's own keys are pinned."""
-    settings_path = tmp_path / ".qwen" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text(
-        json.dumps(
-            {
-                "model": {"name": "qwen3-coder"},
-                "mcpServers": {"searxng": {"command": "npx"}},
-                "tools": {"approvalMode": "yolo", "toolSearch": {"enabled": True}},
-                "memory": {"importFormat": "flat"},
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    write_subagent_workspace_settings(tmp_path)
-
-    settings = _written(tmp_path)
-    assert settings["model"] == {"name": "qwen3-coder"}
-    assert settings["mcpServers"] == {"searxng": {"command": "npx"}}
-    # Sibling keys inside the branches we touch are kept, not clobbered.
-    assert settings["tools"]["approvalMode"] == "yolo"
-    assert settings["tools"]["toolSearch"]["enabled"] is True
-    assert settings["memory"]["importFormat"] == "flat"
-    # The trim still wins where it overlaps.
-    assert settings["tools"]["toolSearch"]["threshold"] == 0
-    assert settings["memory"]["enableManagedAutoMemory"] is False
-
-
-def test_unions_a_pre_existing_disabled_list(tmp_path: Path) -> None:
-    """A workspace that already hid a tool keeps hiding it."""
-    settings_path = tmp_path / ".qwen" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text(
-        json.dumps({"tools": {"disabled": ["enter_plan_mode", "agent"]}}), encoding="utf-8"
-    )
-
-    write_subagent_workspace_settings(tmp_path)
-
-    disabled = _written(tmp_path)["tools"]["disabled"]
-    assert "enter_plan_mode" in disabled
-    assert set(QWEN_SUBAGENT_DISABLED_TOOLS) <= set(disabled)
-    # Union, not concatenation: the overlap appears once.
-    assert disabled.count("agent") == 1
-    assert disabled == sorted(disabled)
-
-
-def test_overwrites_an_unparseable_existing_file(tmp_path: Path) -> None:
-    """qwen would reject the broken file anyway; preserving it helps nobody."""
-    settings_path = tmp_path / ".qwen" / "settings.json"
-    settings_path.parent.mkdir(parents=True)
-    settings_path.write_text("{ not json", encoding="utf-8")
-
-    write_subagent_workspace_settings(tmp_path)
-
-    assert _written(tmp_path)["tools"]["computerUse"]["enabled"] is False
-
-
-def test_is_idempotent(tmp_path: Path) -> None:
-    """Relaunching in the same worktree rewrites identical bytes."""
-    first = write_subagent_workspace_settings(tmp_path).read_text(encoding="utf-8")
-    second = write_subagent_workspace_settings(tmp_path).read_text(encoding="utf-8")
-
-    assert first == second
-
-
-def test_leaves_no_temp_files_behind(tmp_path: Path) -> None:
-    """The atomic write replaces in place rather than littering ``.qwen/``."""
-    write_subagent_workspace_settings(tmp_path)
-
-    assert [p.name for p in (tmp_path / ".qwen").iterdir()] == ["settings.json"]
-
-
 def test_overlay_is_a_fresh_object() -> None:
     """Callers mutating the overlay must not corrupt the module constants."""
     overlay = subagent_settings_overlay()
@@ -168,11 +84,194 @@ def test_overlay_is_a_fresh_object() -> None:
     assert "read_file" not in QWEN_SUBAGENT_DISABLED_TOOLS
 
 
+# ---------------------------------------------------------------------------
+# How it is delivered: ephemeral file + env var, never the workspace
+# ---------------------------------------------------------------------------
+
+
+def test_launch_env_points_qwen_at_the_written_file(tmp_path: Path) -> None:
+    env = subagent_launch_env(tmp_path)
+
+    assert env == {QWEN_SYSTEM_SETTINGS_ENV_VAR: str(system_settings_path(tmp_path))}
+    assert _written(tmp_path)["tools"]["toolSearch"]["threshold"] == 0
+
+
+def test_creates_the_settings_dir_when_absent(tmp_path: Path) -> None:
+    """The bridge dir may not exist yet on a first launch."""
+    settings_dir = tmp_path / "bridge" / "nested"
+
+    subagent_launch_env(settings_dir)
+
+    assert system_settings_path(settings_dir).is_file()
+
+
+def test_accepts_a_string_settings_dir(tmp_path: Path) -> None:
+    """The runner may hand over a ``str`` rather than a ``Path``."""
+    subagent_launch_env(str(tmp_path))
+
+    assert _written(tmp_path)["tools"]["computerUse"]["enabled"] is False
+
+
+def test_writes_nothing_outside_the_settings_dir(tmp_path: Path) -> None:
+    """The launch cwd must never gain a ``.qwen/`` — that is project config."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    settings_dir = tmp_path / "bridge"
+
+    subagent_launch_env(settings_dir)
+
+    assert list(workspace.iterdir()) == []
+    assert [p.name for p in settings_dir.iterdir()] == ["qwen_system_settings.json"]
+
+
 def test_raises_when_the_settings_dir_cannot_be_made(tmp_path: Path) -> None:
     """The caller decides how to degrade; the writer reports the failure."""
-    # ``.qwen`` occupied by a regular file — mkdir cannot make a dir there.
-    # Chosen over a chmod'd workspace because root ignores the mode bits.
-    (tmp_path / ".qwen").write_text("", encoding="utf-8")
+    # The dir path is occupied by a regular file — mkdir cannot make a dir there.
+    # Chosen over a chmod'd parent because root ignores the mode bits.
+    occupied = tmp_path / "bridge"
+    occupied.write_text("", encoding="utf-8")
 
     with pytest.raises(OSError):
-        write_subagent_workspace_settings(tmp_path)
+        subagent_launch_env(occupied)
+
+
+# ---------------------------------------------------------------------------
+# Living alongside qwen's own writes to the same file
+# ---------------------------------------------------------------------------
+
+
+def test_leaves_a_file_qwen_stamped_untouched(tmp_path: Path) -> None:
+    """The real lifecycle: write -> qwen boots and adds ``$version`` -> relaunch.
+
+    qwen persists ``"$version": 4`` into a versionless settings file when it
+    loads one, so the file after a boot is not the file we wrote. A relaunch must
+    not fight that: the trim is already satisfied, so the file is left exactly as
+    qwen left it (same bytes, same mtime).
+    """
+    path = write_subagent_system_settings(tmp_path)
+    booted = json.loads(path.read_text(encoding="utf-8"))
+    booted["$version"] = 4  # what qwen writes back on boot
+    path.write_text(json.dumps(booted, indent=2), encoding="utf-8")
+    before = path.read_bytes()
+    before_mtime = path.stat().st_mtime_ns
+
+    write_subagent_system_settings(tmp_path)
+
+    assert path.read_bytes() == before
+    assert path.stat().st_mtime_ns == before_mtime
+    assert json.loads(path.read_text(encoding="utf-8"))["$version"] == 4
+
+
+def test_rewrites_when_the_trim_is_no_longer_satisfied(tmp_path: Path) -> None:
+    """A file that drifted (or was never ours) is brought back to the trim."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"$version": 4, "tools": {"toolSearch": {"threshold": 10}}}),
+        encoding="utf-8",
+    )
+
+    write_subagent_system_settings(tmp_path)
+
+    settings = _written(tmp_path)
+    assert settings["tools"]["toolSearch"]["threshold"] == 0
+    # Whatever qwen added is carried forward, not stripped.
+    assert settings["$version"] == 4
+
+
+def test_a_true_boolean_does_not_count_as_zero(tmp_path: Path) -> None:
+    """``False == 0`` in Python; the satisfied-check must not conflate them."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"tools": {"toolSearch": {"threshold": False}}}), encoding="utf-8")
+
+    write_subagent_system_settings(tmp_path)
+
+    assert _written(tmp_path)["tools"]["toolSearch"]["threshold"] == 0
+    assert _written(tmp_path)["tools"]["toolSearch"]["threshold"] is not False
+
+
+# ---------------------------------------------------------------------------
+# Reading an existing file: lenient, never destructive, never fatal
+# ---------------------------------------------------------------------------
+
+
+def test_preserves_a_jsonc_file_with_comments(tmp_path: Path) -> None:
+    """qwen accepts JSONC; ``json.loads`` does not. Merge it, do not discard it."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """{
+  // the operator pinned a model here
+  "model": { "name": "qwen3-coder" },
+  /* and a server */
+  "mcpServers": { "searxng": { "command": "npx" } },
+  "tools": { "disabled": ["enter_plan_mode"], },
+}""",
+        encoding="utf-8",
+    )
+
+    write_subagent_system_settings(tmp_path)
+
+    settings = _written(tmp_path)
+    assert settings["model"] == {"name": "qwen3-coder"}
+    assert settings["mcpServers"] == {"searxng": {"command": "npx"}}
+    # Union, not replace: what was already hidden stays hidden.
+    assert "enter_plan_mode" in settings["tools"]["disabled"]
+    assert set(QWEN_SUBAGENT_DISABLED_TOOLS) <= set(settings["tools"]["disabled"])
+    assert settings["tools"]["toolSearch"]["threshold"] == 0
+
+
+def test_a_double_slash_inside_a_string_is_not_a_comment(tmp_path: Path) -> None:
+    """The JSONC strip must skip string literals, or URLs lose their tail."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"env": {"OPENAI_BASE_URL": "http://192.168.2.7:18010/v1"}}),
+        encoding="utf-8",
+    )
+
+    write_subagent_system_settings(tmp_path)
+
+    assert _written(tmp_path)["env"]["OPENAI_BASE_URL"] == "http://192.168.2.7:18010/v1"
+
+
+def test_invalid_utf8_does_not_abort_the_launch(tmp_path: Path) -> None:
+    """``read_text`` raises UnicodeDecodeError, which is not an OSError."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'{"tools": "\xff\xfe not utf-8"}')
+
+    # Must not raise; the trim is re-established over an empty base.
+    write_subagent_system_settings(tmp_path)
+
+    assert _written(tmp_path)["tools"]["toolSearch"]["threshold"] == 0
+
+
+def test_unparseable_content_does_not_abort_the_launch(tmp_path: Path) -> None:
+    """Garbage in our own session-private file must not fail the session."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{ not json at all", encoding="utf-8")
+
+    write_subagent_system_settings(tmp_path)
+
+    assert _written(tmp_path)["tools"]["computerUse"]["enabled"] is False
+
+
+def test_a_json_array_reads_as_empty_rather_than_crashing(tmp_path: Path) -> None:
+    """Valid JSON that is not an object still has to merge cleanly."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("[1, 2, 3]", encoding="utf-8")
+
+    write_subagent_system_settings(tmp_path)
+
+    assert _written(tmp_path)["memory"]["enableManagedAutoMemory"] is False
+
+
+def test_leaves_no_temp_files_behind(tmp_path: Path) -> None:
+    """The atomic write replaces in place rather than littering the dir."""
+    subagent_launch_env(tmp_path)
+
+    assert [p.name for p in tmp_path.iterdir()] == ["qwen_system_settings.json"]

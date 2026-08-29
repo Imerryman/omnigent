@@ -11,12 +11,15 @@ import httpx
 import pytest
 
 from omnigent import qwen_native_bridge as qnb
-from omnigent.qwen_native_settings import QWEN_SUBAGENT_DISABLED_TOOLS
+from omnigent.qwen_native_settings import (
+    QWEN_SUBAGENT_DISABLED_TOOLS,
+    QWEN_SYSTEM_SETTINGS_ENV_VAR,
+)
 from omnigent.runner.app import _build_qwen_fork_recording, _persist_qwen_external_session_id
 from omnigent.runner.native.orchestration import (
     _pi_native_launch_config,
     _PiNativeLaunchConfig,
-    _trim_qwen_subagent_tool_surface,
+    _qwen_subagent_trim_env,
 )
 
 
@@ -157,11 +160,12 @@ async def test_build_qwen_fork_recording_does_not_clobber_existing(
 
 
 # ---------------------------------------------------------------------------
-# Sub-agent tool-surface trim (``_trim_qwen_subagent_tool_surface``)
+# Sub-agent tool-surface trim (``_qwen_subagent_trim_env``)
 #
-# A qwen sub-agent boots with qwen-code's whole 63-tool registry declared
-# upfront; the runner materializes a workspace ``.qwen/settings.json`` at launch
-# to cut that to the implementer's coding tools. Gated to sub-agent sessions:
+# A qwen sub-agent otherwise boots with qwen's full built-in registry declared
+# upfront. The runner points it at an ephemeral per-session trim through
+# ``QWEN_CODE_SYSTEM_SETTINGS_PATH`` — qwen's highest-precedence settings scope —
+# and writes NOTHING into the launch cwd. Gated to sub-agent sessions:
 # ``omnigent qwen`` (the interactive TUI, where the human is the orchestrator)
 # must keep the full surface.
 # ---------------------------------------------------------------------------
@@ -178,77 +182,104 @@ def _qwen_launch_config(workspace: Path, *, parent_session_id: str | None) -> An
     )
 
 
-def _trim_settings(workspace: Path) -> dict:
-    return json.loads((workspace / ".qwen" / "settings.json").read_text(encoding="utf-8"))
-
-
-def test_subagent_launch_writes_the_trimmed_workspace_settings(tmp_path: Path) -> None:
-    workspace = tmp_path / "worktree"
+def test_subagent_launch_points_qwen_at_an_ephemeral_trim(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
     workspace.mkdir()
+    bridge_dir = tmp_path / "bridge"
 
-    _trim_qwen_subagent_tool_surface(
+    env = _qwen_subagent_trim_env(
         "conv_child",
         _qwen_launch_config(workspace, parent_session_id="conv_parent"),
-        str(workspace),
+        bridge_dir,
     )
 
-    settings = _trim_settings(workspace)
+    settings_path = Path(env[QWEN_SYSTEM_SETTINGS_ENV_VAR])
+    assert settings_path.parent == bridge_dir
+    settings = json.loads(settings_path.read_text(encoding="utf-8"))
     assert settings["tools"]["toolSearch"]["threshold"] == 0
     assert settings["tools"]["computerUse"]["enabled"] is False
     assert settings["memory"]["enableManagedAutoMemory"] is False
     assert set(QWEN_SUBAGENT_DISABLED_TOOLS) <= set(settings["tools"]["disabled"])
 
 
-def test_interactive_launch_leaves_the_workspace_untouched(tmp_path: Path) -> None:
-    """No parent session → ``omnigent qwen``'s TUI, which keeps every tool."""
-    workspace = tmp_path / "repo"
+def test_subagent_launch_writes_nothing_into_the_workspace(tmp_path: Path) -> None:
+    """The launch cwd is often the user's real checkout — never touch it."""
+    workspace = tmp_path / "workspace"
     workspace.mkdir()
 
-    _trim_qwen_subagent_tool_surface(
-        "conv_top_level",
-        _qwen_launch_config(workspace, parent_session_id=None),
-        str(workspace),
+    _qwen_subagent_trim_env(
+        "conv_child",
+        _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+        tmp_path / "bridge",
     )
 
     assert list(workspace.iterdir()) == []
 
 
-def test_subagent_launch_merges_an_existing_workspace_settings_file(tmp_path: Path) -> None:
-    """A worktree carrying the user's own ``.qwen/settings.json`` keeps it."""
-    workspace = tmp_path / "worktree"
-    (workspace / ".qwen").mkdir(parents=True)
-    (workspace / ".qwen" / "settings.json").write_text(
-        json.dumps({"ui": {"theme": "Default"}, "tools": {"approvalMode": "yolo"}}),
-        encoding="utf-8",
+def test_interactive_launch_gets_no_trim_env(tmp_path: Path) -> None:
+    """No parent session -> ``omnigent qwen``'s TUI, which keeps every tool."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    env = _qwen_subagent_trim_env(
+        "conv_top_level",
+        _qwen_launch_config(workspace, parent_session_id=None),
+        tmp_path / "bridge",
     )
 
-    _trim_qwen_subagent_tool_surface(
+    assert env == {}
+
+
+def test_a_child_launch_does_not_trim_a_later_top_level_launch(tmp_path: Path) -> None:
+    """The leak this design exists to prevent.
+
+    Sub-agent sessions frequently carry no explicit workspace and fall back to
+    ``OMNIGENT_RUNNER_WORKSPACE`` — the user's real checkout. A workspace
+    ``.qwen/settings.json`` is persistent project config, so a child writing one
+    there would trim every later interactive ``omnigent qwen`` in that same cwd.
+    Here the child and the top-level session share a cwd, and the top-level
+    launch must still come out untrimmed.
+    """
+    shared_cwd = tmp_path / "the-users-checkout"
+    shared_cwd.mkdir()
+
+    child_env = _qwen_subagent_trim_env(
         "conv_child",
-        _qwen_launch_config(workspace, parent_session_id="conv_parent"),
-        str(workspace),
+        _qwen_launch_config(shared_cwd, parent_session_id="conv_parent"),
+        tmp_path / "bridge_child",
+    )
+    assert child_env  # the child IS trimmed
+
+    top_level_env = _qwen_subagent_trim_env(
+        "conv_top_level",
+        _qwen_launch_config(shared_cwd, parent_session_id=None),
+        tmp_path / "bridge_top",
     )
 
-    settings = _trim_settings(workspace)
-    assert settings["ui"] == {"theme": "Default"}
-    assert settings["tools"]["approvalMode"] == "yolo"
-    assert settings["tools"]["toolSearch"]["threshold"] == 0
+    # Nothing was left in the shared cwd for the TUI to pick up, and its own
+    # process carries no settings override.
+    assert list(shared_cwd.iterdir()) == []
+    assert top_level_env == {}
+    assert QWEN_SYSTEM_SETTINGS_ENV_VAR not in top_level_env
 
 
-def test_subagent_launch_survives_an_unwritable_workspace(
+def test_subagent_launch_survives_an_unwritable_bridge_dir(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Losing the trim must not fail the launch — qwen still starts, untrimmed."""
-    workspace = tmp_path / "worktree"
+    occupied = tmp_path / "bridge"
+    occupied.write_text("", encoding="utf-8")
+    workspace = tmp_path / "workspace"
     workspace.mkdir()
-    (workspace / ".qwen").write_text("", encoding="utf-8")
 
     with caplog.at_level(logging.WARNING, logger="omnigent.runner.native.orchestration"):
-        _trim_qwen_subagent_tool_surface(
+        env = _qwen_subagent_trim_env(
             "conv_child",
             _qwen_launch_config(workspace, parent_session_id="conv_parent"),
-            str(workspace),
+            occupied,
         )
 
+    assert env == {}
     assert "full tool registry" in caplog.text
 
 
