@@ -69,7 +69,8 @@ _logger = logging.getLogger(__name__)
 #: sub-second cadence keeps the mirrored chat tracking the terminal step by step.
 _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
-# Liveness probe budget; a hung tmux answers "assume alive" rather than blocking.
+# Liveness probe budget; a hung tmux yields an INCONCLUSIVE verdict rather
+# than blocking the poll loop (see _tmux_pane_is_alive).
 _TMUX_PROBE_TIMEOUT_S = 5.0
 # Minimum gap between liveness probes. The probe spawns a `tmux list-panes`
 # subprocess, so it must not ride the sub-second poll cadence; this bounds the
@@ -79,8 +80,12 @@ _TMUX_PROBE_INTERVAL_S = 5.0
 # timeout) may persist alongside a silent event stream before the pane is
 # treated as dead. Deliberately biased toward eventually firing the terminal
 # edge: a parent orchestrator stalled forever is worse than a late `failed`.
-# Any new stream bytes reset the clock, and a live qwen mid-turn is never
-# silent for this long (311k of 319k recorded events are content_block_delta).
+# Newly CONSUMED records reset the clock -- i.e. the read advanced the offset
+# past a complete record, or produced an item/wake. A partial dribble does
+# NOT extend the grace: an unterminated half-record is exactly what a dying
+# qwen leaves behind, so letting it refresh the window would defeat it. A
+# live qwen mid-turn is never silent for this long (311k of 319k recorded
+# events are content_block_delta).
 _LIVENESS_UNKNOWN_GRACE_S = 300.0
 
 # Supervisor backoff (mirrors goose_native_forwarder.supervise_goose_forwarder).
@@ -799,6 +804,46 @@ async def _post_external_session_status(
     resp.raise_for_status()
 
 
+# Stderr fragments that mean the probe TARGET IS GONE, as opposed to the probe
+# itself having failed. Measured against tmux 3.3a on this host:
+#   socket file absent   -> "error connecting to <path> (No such file or directory)"
+#   socket not a socket  -> "no server running on <path>"
+#   session absent       -> "can't find window: <name>"  (tmux says "window")
+#   window/pane absent   -> "can't find window: <n>"
+# whereas an OPERATIONAL failure looks like
+#   "error connecting to <path> (Permission denied)"
+# which travels through the SAME message as the missing-socket case and must not
+# be read as death -- hence the errno-text check in _tmux_error_means_absent.
+_TMUX_ABSENT_FRAGMENTS = (
+    "no server running",
+    "can't find session",
+    "can't find window",
+    "can't find pane",
+    "session not found",
+    "no such session",
+)
+
+
+def _tmux_error_means_absent(stderr: str) -> bool:
+    """Whether a failed ``tmux`` probe proves the TARGET is gone.
+
+    ``list-panes`` exits non-zero both when the session/pane genuinely no longer
+    exists AND when the probe could not be carried out at all — a socket the
+    forwarder may not open, a protocol-version mismatch against a tmux upgraded
+    underneath it, a half-initialised bridge dir. Only the first is evidence of
+    death. Reading the second as death lets an operational fault fire a spurious
+    ``failed`` at the parent, so anything unrecognised stays INCONCLUSIVE and is
+    left to the grace window, which is the mechanism built for "we cannot tell".
+    """
+    # LOCAL PATCH #6 (round 3): don't equate "the probe failed" with "it died".
+    err = stderr.lower()
+    if any(fragment in err for fragment in _TMUX_ABSENT_FRAGMENTS):
+        return True
+    # "error connecting to <sock> (<errno>)" is absence ONLY for a missing
+    # socket; the identical message carries "(Permission denied)" too.
+    return "error connecting to" in err and "no such file or directory" in err
+
+
 def _tmux_pane_is_alive(bridge_dir: Path) -> bool | None:
     """Whether the qwen terminal's PANE PROCESS is still running.
 
@@ -852,9 +897,21 @@ def _tmux_pane_is_alive(bridge_dir: Path) -> bool | None:
     except (OSError, subprocess.SubprocessError):
         return None  # tmux missing / spawn failure — no verdict
     if proc.returncode != 0:
-        # ``list-panes`` errors when the session or the whole server is gone.
-        # Without remain-on-exit that IS the inner process having exited.
-        return False
+        stderr = proc.stderr.decode(errors="replace")
+        if _tmux_error_means_absent(stderr):
+            # The session/pane is genuinely gone. Without remain-on-exit that IS
+            # the inner process having exited.
+            return False
+        # LOCAL PATCH #6 (round 3): an unrecognised failure is an operational
+        # fault, not a death certificate. Stay inconclusive.
+        _logger.warning(
+            "qwen tmux liveness probe failed with an unrecognised error; treating it as "
+            "inconclusive rather than as a dead pane; rc=%s stderr=%r bridge_dir=%s",
+            proc.returncode,
+            stderr.strip()[:200],
+            bridge_dir,
+        )
+        return None
     panes = proc.stdout.decode(errors="replace").split()
     if not panes:
         return False
@@ -901,6 +958,11 @@ async def forward_qwen_events_to_session(
     """
     target = events_file or events_file_path(bridge_dir)
     state = _read_state(bridge_dir)
+    # What is actually ON DISK. The conditional write compares against THIS, not
+    # against the in-memory `state`: a write that fails must leave the cursor
+    # dirty so the next poll retries it, instead of the equality gate concluding
+    # "nothing changed" and never persisting the change at all.
+    persisted_state = state
     offset = state.offset
     seen = _new_seen(state.seen_uuids)
     # LOCAL PATCH #6: the process-exit fallback. `terminal_is_alive` is probed
@@ -960,6 +1022,12 @@ async def forward_qwen_events_to_session(
                             bridge_dir,
                         )
                         pane_dead = True
+                # `pane_dead` is the single source of truth for liveness. It is
+                # sampled TWICE per iteration, and the two samples are not
+                # interchangeable: here, BEFORE the read, to choose the drain
+                # mode; and again AFTER the read, to decide the terminal edge —
+                # because the read itself is fresh evidence that can invalidate
+                # this one.
                 alive = not pane_dead
                 # LOCAL PATCH #6: once the pane is gone, "wait for the newline"
                 # can never complete — drain a complete-but-unterminated final
@@ -987,9 +1055,9 @@ async def forward_qwen_events_to_session(
                 progressed = poll.offset != offset or bool(poll.items) or bool(poll.wakes)
                 if progressed:
                     exit_terminal_posted = False  # fresh activity re-arms it
-                    # Bytes arrived: something is alive. Clear BOTH the grace
-                    # clock and the latch, so a rewound/appended stream is not
-                    # judged by a stale verdict.
+                    # Records arrived: something is alive. Clear BOTH the grace
+                    # clock and the latch, so a relaunched or appended stream is
+                    # not judged by a stale verdict.
                     unknown_since = None
                     pane_dead = False
                 offset = poll.offset
@@ -1004,8 +1072,10 @@ async def forward_qwen_events_to_session(
                 # every `poll_interval_s` (0.4s by default) for the whole life of
                 # the session; writing unconditionally meant a temp-file write +
                 # fsync-ordered rename ~216k times a day per idle session.
-                if next_state != state:
-                    _write_state(bridge_dir, next_state)
+                if next_state != persisted_state:
+                    if _write_state(bridge_dir, next_state):
+                        persisted_state = next_state
+                    # else: persisted_state stays behind, so the next poll retries.
                 state = next_state
                 # LOCAL PATCH #6: the qwen process is gone and the drain above
                 # consumed its last bytes. If a turn was still in flight it will
@@ -1013,7 +1083,16 @@ async def forward_qwen_events_to_session(
                 # forever — post the terminal edge here instead. Deduplicated
                 # against the normal path by `turn_open`, which the message_stop
                 # / result / session_end branches clear.
-                if not alive and not exit_terminal_posted:
+                # LOCAL PATCH #6 (round 3): test `pane_dead` — the belief AFTER
+                # the read — not the `alive` snapshot taken before it. A read that
+                # progressed just cleared the latch, and the stale snapshot would
+                # still post `failed` over a turn that is demonstrably producing
+                # records (a relaunched pane on this same forwarder, or fresh
+                # records after a grace-expired latch). If the pane really is dead
+                # and those bytes were merely buffered, the next probe reconfirms
+                # within _TMUX_PROBE_INTERVAL_S and the edge fires then; a late
+                # `failed` is recoverable, a spurious one corrupts a live turn.
+                if pane_dead and not exit_terminal_posted:
                     if state.turn_open:
                         _logger.warning(
                             "qwen terminal exited with a turn still open; posting %r so the "
@@ -1032,8 +1111,10 @@ async def forward_qwen_events_to_session(
                         )
                         state = dataclasses.replace(state, turn_open=False)
                         # Explicit write: this one MUST land even though the poll
-                        # above may have found nothing to persist.
-                        _write_state(bridge_dir, state)
+                        # above may have found nothing to persist. If it fails,
+                        # persisted_state stays behind and the next poll retries.
+                        if _write_state(bridge_dir, state):
+                            persisted_state = state
                     exit_terminal_posted = True
             except asyncio.CancelledError:
                 raise

@@ -1254,12 +1254,13 @@ def test_tmux_probe_is_inconclusive_on_timeout(
     assert fwd._tmux_pane_is_alive(tmp_path) is None
 
 
-def _fake_tmux(returncode: int, stdout: bytes):
+def _fake_tmux(returncode: int, stdout: bytes, stderr: bytes = b""):
     class _Proc:
         pass
 
     _Proc.returncode = returncode
     _Proc.stdout = stdout
+    _Proc.stderr = stderr
     return lambda *_a, **_k: _Proc()
 
 
@@ -1268,7 +1269,11 @@ def test_tmux_probe_reports_dead_when_the_server_is_gone(
 ) -> None:
     """Default spec (no remain-on-exit): the process exit reaps the server."""
     write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
-    monkeypatch.setattr(fwd.subprocess, "run", _fake_tmux(1, b""))
+    monkeypatch.setattr(
+        fwd.subprocess,
+        "run",
+        _fake_tmux(1, b"", b"no server running on /tmp/sock"),
+    )
     assert fwd._tmux_pane_is_alive(tmp_path) is False
 
 
@@ -1749,6 +1754,279 @@ async def test_conclusive_alive_after_an_inconclusive_run_clears_the_clock(
 
     assert calls > 3, "the probe kept running"
     assert statuses == [], "a recovered probe must not inherit the blip's elapsed time"
+
+
+# --- ROUND 3 BLOCKING: the fallback must not read a STALE liveness verdict --
+
+
+async def test_relaunched_pane_does_not_get_a_SECOND_spurious_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-3 blocker, end to end.
+
+    `alive` was computed from `pane_dead` BEFORE the read, but a read that
+    progresses clears `pane_dead` AFTER it. The process-exit fallback then still
+    tested the stale snapshot, so the very poll that proved the stream was live
+    again would post a second `failed` over the freshly-opened turn.
+
+    Timeline exercised here, all on ONE forwarder:
+      1. a turn opens, the probe reports the pane dead -> `failed` fires (once),
+      2. the pane is relaunched and appends records that open a NEW turn; that
+         read progresses, so no edge may fire on it,
+      3. the next probe returns a fresh verdict (alive) and still none fires.
+
+    The probe is gated on `state.turn_open`, which the step-1 edge clears, so
+    step 2's read is guaranteed to run while the dead latch is still set --
+    which is precisely the stale-snapshot window.
+    """
+    monkeypatch.setattr(fwd, "_TMUX_PROBE_INTERVAL_S", 0.0)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    f = events_file_path(bridge)
+    # A turn that opens and never closes: message_start + a tool_use stop.
+    f.write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    statuses: list[str] = []
+    probe_calls = 0
+
+    def _dead_then_relaunched() -> bool | None:
+        nonlocal probe_calls
+        probe_calls += 1
+        return probe_calls != 1  # dead on the first verdict, alive after the relaunch
+
+    posted: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        posted.append(item.item_uuid)  # type: ignore[attr-defined]
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.005,
+            terminal_is_alive=_dead_then_relaunched,
+        )
+    )
+    # Step 1: wait for the legitimate process-exit edge.
+    for _ in range(400):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    assert statuses == [_STATUS_FAILED], "the dead pane must strand nothing"
+
+    # Step 2: the pane is relaunched and opens a NEW turn on the same file.
+    with open(f, "ab") as fh:
+        fh.write(
+            b"".join(
+                _ev_bytes(e)
+                for e in [
+                    _asst_ev("a9", [{"type": "text", "text": "back from the dead"}]),
+                    _msg_start("s2", "m2"),
+                    _asst_stop("m2", "tool_use"),
+                ]
+            )
+        )
+    # Step 3: let many polls run, past the fresh (alive) verdict.
+    for _ in range(400):
+        if "a9#0" in posted:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_FAILED], (
+        f"exactly one terminal edge; a second would be spurious. got {statuses}"
+    )
+    assert "a9#0" in posted, "the relaunched pane's records still mirror"
+    # A spurious second edge would also re-close `turn_open` and so gate the
+    # probe off, meaning the relaunch verdict is never even taken.
+    assert probe_calls >= 2, "the fresh (alive) verdict was actually reached"
+
+
+async def test_dead_pane_still_gets_its_edge_after_a_progressing_drain(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other side of the round-3 fix: deferring the edge must not LOSE it.
+
+    When the drain that follows a death actually yields records, the fix
+    suppresses the edge for that poll (the read is fresh evidence). The pane is
+    genuinely dead here and those bytes were merely buffered, so the next probe
+    must reconfirm and the edge must still fire — late, but exactly once.
+    """
+    monkeypatch.setattr(fwd, "_TMUX_PROBE_INTERVAL_S", 0.0)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    f = events_file_path(bridge)
+    f.write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    statuses: list[str] = []
+    keys: list[object] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(
+        _c: object, *, session_id: str, status: str, idempotency_key: object = None
+    ) -> None:
+        statuses.append(status)
+        keys.append(idempotency_key)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.005,
+            terminal_is_alive=lambda: False,  # dead, and stays dead
+        )
+    )
+    for _ in range(400):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)  # many further polls
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_FAILED], "fires, and only once"
+    assert keys == ["process-exit:m1"]
+
+
+# --- ROUND 3 NB1: a failed state write stays dirty and is retried -----------
+
+
+async def test_a_failed_state_write_is_retried_on_the_next_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """NB1. The conditional write compares against what is ON DISK. Comparing
+    against the in-memory state meant a transient write failure was never
+    retried: the next poll saw "no change" and the cursor never landed.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    real_write = fwd._write_state
+    attempts: list[int] = []
+
+    def _flaky_write(bd: Path, st: object) -> bool:
+        attempts.append(st.offset)  # type: ignore[attr-defined]
+        if len(attempts) <= 2:
+            return False  # transient failure, exactly as an OSError would report
+        return real_write(bd, st)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fwd, "_write_state", _flaky_write)
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.005,
+            terminal_is_alive=lambda: True,
+        )
+    )
+    for _ in range(400):
+        if len(attempts) >= 3:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.15)  # idle polls after the write finally succeeded
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert len(attempts) == 3, f"retried until durable, then stopped; got {attempts}"
+    assert len({*attempts}) == 1, "the same pending cursor each time"
+    assert _read_state(bridge).offset == attempts[0], "the cursor did land"
+
+
+# --- ROUND 3 NB2: tmux failures are classified, not all read as death -------
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        "no server running on /tmp/omnigent/sock",
+        "error connecting to /tmp/omnigent/sock (No such file or directory)",
+        "can't find window: qwen",
+        "can't find session: qwen",
+        "can't find pane: 3",
+        "session not found: qwen",
+        "no such session: qwen",
+    ],
+)
+def test_tmux_absent_errors_are_read_as_death(stderr: str) -> None:
+    """Measured against tmux 3.3a: these all mean the target is genuinely gone."""
+    assert fwd._tmux_error_means_absent(stderr) is True
+
+
+@pytest.mark.parametrize(
+    "stderr",
+    [
+        # The SAME message as the missing-socket case, different errno. This is
+        # the one that makes a bare "error connecting to" match wrong.
+        "error connecting to /tmp/omnigent/sock (Permission denied)",
+        "protocol version mismatch (client 8, server 7)",
+        "lost server",
+        "",
+        "something tmux has never printed before",
+    ],
+)
+def test_tmux_operational_errors_are_not_read_as_death(stderr: str) -> None:
+    """NB2. An operational fault must not forge a death certificate."""
+    assert fwd._tmux_error_means_absent(stderr) is False
+
+
+def test_tmux_probe_is_inconclusive_on_an_unrecognised_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A socket the forwarder may not open is NOT a dead qwen; it must fall to
+    the grace window rather than firing `failed` at the parent immediately.
+    """
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+    monkeypatch.setattr(
+        fwd.subprocess,
+        "run",
+        _fake_tmux(1, b"", b"error connecting to /tmp/sock (Permission denied)"),
+    )
+    assert fwd._tmux_pane_is_alive(tmp_path) is None
+
+
+def test_tmux_probe_reports_dead_when_the_session_is_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """tmux answers a missing session with "can't find window" (measured)."""
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+    monkeypatch.setattr(fwd.subprocess, "run", _fake_tmux(1, b"", b"can't find window: s"))
+    assert fwd._tmux_pane_is_alive(tmp_path) is False
 
 
 # --- D: `result` gated on turn_open ----------------------------------------
