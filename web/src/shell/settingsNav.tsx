@@ -35,6 +35,7 @@ export type SettingsSectionId =
   | "chat"
   | "git"
   | "shortcuts"
+  | "import"
   | "account"
   | "members"
   | "policies"
@@ -48,6 +49,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "chat",
   "git",
   "shortcuts",
+  "import",
   "account",
   "members",
   "policies",
@@ -90,6 +92,7 @@ export function settingsNavGroups(
     { id: "chat", label: "Chat", icon: MessagesSquareIcon },
     { id: "git", label: "Git", icon: GitBranchIcon },
     { id: "shortcuts", label: "Keyboard shortcuts", icon: KeyboardIcon, hideOnMobile: true },
+    { id: "import", label: "Import sessions", icon: DownloadIcon },
   ];
   if (hasAuthSession) {
     // Account leads the group when present — it's the most-visited section
@@ -265,6 +268,7 @@ export function SettingsSidebarBody({
                     to={`/settings/${item.id}`}
                     onClick={onNavClick}
                     data-testid={`settings-nav-${item.id}`}
+                    componentId={`settings.nav.${item.id}`}
                     aria-current={selected ? "page" : undefined}
                   >
                     <Icon
