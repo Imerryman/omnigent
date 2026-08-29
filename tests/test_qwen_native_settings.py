@@ -284,6 +284,92 @@ def test_unions_the_new_list_keys_too(tmp_path: Path) -> None:
     assert "*" in settings["mcp"]["excluded"]
 
 
+def _already_trimmed_with(disabled: object) -> dict:
+    """A file that matches the trim except for a hostile ``tools.disabled``.
+
+    The sibling keys have to match, or ``_satisfies`` short-circuits before it
+    ever looks at the list — which is what hid this class of bug.
+    """
+    settings = subagent_settings_overlay()
+    settings["tools"]["disabled"] = disabled
+    return settings
+
+
+@pytest.mark.parametrize(
+    ("label", "disabled"),
+    [
+        ("dict element", [{}]),
+        ("nested list", [["agent"]]),
+        ("non-string scalars", ["agent", 7, None, True]),
+        ("mixed", ["agent", {"x": 1}, ["y"]]),
+    ],
+)
+def test_unhashable_list_entries_do_not_abort_the_launch(
+    tmp_path: Path, label: str, disabled: object
+) -> None:
+    """``set([{}])`` raises TypeError, and this runs on the launch path.
+
+    A hand-edited (or future-qwen) file whose union list holds anything
+    unhashable must not cost the session. Non-string entries are dropped — these
+    lists hold names, so nothing meaningful is lost.
+    """
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_already_trimmed_with(disabled)), encoding="utf-8")
+
+    write_subagent_system_settings(tmp_path)  # must not raise
+
+    merged = _written(tmp_path)["tools"]["disabled"]
+    assert set(QWEN_SUBAGENT_DISABLED_TOOLS) <= set(merged)
+    assert all(isinstance(name, str) for name in merged), label
+
+
+def test_a_jsonc_string_containing_a_trailing_comma_pattern_survives(
+    tmp_path: Path,
+) -> None:
+    """The trailing-comma pass must be string-aware, or it edits user data.
+
+    ``"x,}"`` contains the exact ``,}`` shape a naive trailing-comma regex
+    strips, and a file with a comment takes the JSONC path where that pass runs.
+    """
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        """{
+  // a comment, which forces the JSONC path
+  "note": "x,}",
+  "closer": "ends with ]",
+  "url": "http://host//path?a=1,",
+  "block": "not /* a comment */ either",
+  "tools": { "disabled": ["enter_plan_mode"], },
+}""",
+        encoding="utf-8",
+    )
+
+    write_subagent_system_settings(tmp_path)
+
+    settings = _written(tmp_path)
+    # Byte-for-byte: nothing inside a string literal was rewritten.
+    assert settings["note"] == "x,}"
+    assert settings["closer"] == "ends with ]"
+    assert settings["url"] == "http://host//path?a=1,"
+    assert settings["block"] == "not /* a comment */ either"
+    # ... and the genuine trailing commas were still removed, so it parsed.
+    assert "enter_plan_mode" in settings["tools"]["disabled"]
+    assert settings["tools"]["toolSearch"]["threshold"] == 0
+
+
+def test_escaped_quotes_do_not_end_a_string_early(tmp_path: Path) -> None:
+    """``"a\"b,}"`` must be one literal, not two with a comma between."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{\n  // comment\n  "q": "a\\"b,}"\n}', encoding="utf-8")
+
+    write_subagent_system_settings(tmp_path)
+
+    assert _written(tmp_path)["q"] == 'a"b,}'
+
+
 def test_a_double_slash_inside_a_string_is_not_a_comment(tmp_path: Path) -> None:
     """The JSONC strip must skip string literals, or URLs lose their tail."""
     path = system_settings_path(tmp_path)

@@ -76,13 +76,15 @@ rather than the workspace; see :func:`omnigent.qwen_native_bridge.write_mcp_conf
 from __future__ import annotations
 
 import json
+import logging
 import os
-import re
 import secrets
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from omnigent.json_types import JsonObject as _JsonObject
+
+_logger = logging.getLogger(__name__)
 
 #: qwen-code env var naming the highest-precedence ("system") settings file.
 #: Set on the sub-agent's terminal process only.
@@ -279,13 +281,28 @@ def write_subagent_system_settings(settings_dir: Path | str) -> Path:
     """
     path = system_settings_path(settings_dir)
     path.parent.mkdir(parents=True, exist_ok=True)
-    existing = _read_settings(path)
     overlay = subagent_settings_overlay()
-    if _satisfies(existing, overlay):
-        # Already trimmed (typically: we wrote it, qwen booted and added
-        # ``$version``). Touching it would only fight qwen's own migration.
-        return path
-    merged = _merge_settings(existing, overlay)
+    try:
+        existing = _read_settings(path)
+        if _satisfies(existing, overlay):
+            # Already trimmed (typically: we wrote it, qwen booted and added
+            # ``$version``). Touching it would only fight qwen's own migration.
+            return path
+        merged = _merge_settings(existing, overlay)
+    except Exception:  # noqa: BLE001 - see below
+        # Preserving one odd file is never worth losing the trim: this runs on
+        # the launch path, so anything raised here would otherwise cost the
+        # session. The individual steps are written to be total, and this is the
+        # backstop for what they cannot anticipate (a pathologically nested
+        # document raising RecursionError inside json/merge, say). Degrade to
+        # the clean overlay — trimmed, which is the safer of the two outcomes.
+        _logger.warning(
+            "qwen-native: could not merge the existing settings at %s; "
+            "replacing it with the trim.",
+            path,
+            exc_info=True,
+        )
+        merged = overlay
     # Atomic replace so a qwen process reading the file mid-write never sees a
     # truncated document.
     tmp = path.with_name(f"{path.name}.{secrets.token_hex(8)}.tmp")
@@ -294,23 +311,76 @@ def write_subagent_system_settings(settings_dir: Path | str) -> Path:
     return path
 
 
-#: ``//`` and ``/* */`` comments outside string literals, plus trailing commas —
-#: the JSONC affordances qwen's own settings loader accepts and ``json.loads``
-#: rejects. The leading alternation consumes whole string literals so a ``//``
-#: inside one (a URL, a Windows path) is never mistaken for a comment.
-_JSONC_NOISE = re.compile(
-    r'"(?:\\.|[^"\\])*"'  # string literal — matched, then re-emitted verbatim
-    r"|//[^\n]*"  # line comment
-    r"|/\*.*?\*/",  # block comment
-    re.DOTALL,
-)
-_TRAILING_COMMA = re.compile(r",(\s*[}\]])")
-
-
 def _strip_jsonc(raw: str) -> str:
-    """Return *raw* with JSONC comments and trailing commas removed."""
-    without_comments = _JSONC_NOISE.sub(lambda m: m.group(0) if m.group(0)[0] == '"' else "", raw)
-    return _TRAILING_COMMA.sub(r"\1", without_comments)
+    """
+    Return *raw* with JSONC comments and trailing commas removed.
+
+    qwen's settings loader accepts both; ``json.loads`` accepts neither. A single
+    left-to-right scan does the work because both edits are only legal *outside*
+    string literals — a literal is copied through verbatim, so a ``//`` in a URL
+    or a ``,}`` in a message is never touched. (Two independent regex passes
+    cannot get this right: the second pass no longer knows where the strings
+    were.) Escapes are honoured, so ``"a\\"b"`` does not end early.
+    """
+    out: list[str] = []
+    i = 0
+    end = len(raw)
+    while i < end:
+        char = raw[i]
+        if char == '"':
+            close = _end_of_string_literal(raw, i)
+            out.append(raw[i:close])
+            i = close
+        elif raw.startswith("//", i):
+            newline = raw.find("\n", i)
+            i = end if newline < 0 else newline
+        elif raw.startswith("/*", i):
+            close = raw.find("*/", i + 2)
+            i = end if close < 0 else close + 2
+        elif char == "," and _next_significant(raw, i + 1) in "}]":
+            # Trailing comma: the next thing that is not whitespace or a comment
+            # closes the object/array.
+            i += 1
+        else:
+            out.append(char)
+            i += 1
+    return "".join(out)
+
+
+def _end_of_string_literal(raw: str, start: int) -> int:
+    """Return the index just past the string literal opening at *start*."""
+    i = start + 1
+    end = len(raw)
+    while i < end:
+        if raw[i] == "\\":
+            i += 2
+            continue
+        if raw[i] == '"':
+            return i + 1
+        i += 1
+    return end
+
+
+def _next_significant(raw: str, start: int) -> str:
+    """Return the next char after *start* that is not whitespace or a comment."""
+    i = start
+    end = len(raw)
+    while i < end:
+        if raw[i].isspace():
+            i += 1
+        elif raw.startswith("//", i):
+            newline = raw.find("\n", i)
+            if newline < 0:
+                return ""
+            i = newline + 1
+        elif raw.startswith("/*", i):
+            close = raw.find("*/", i + 2)
+            if close < 0:
+                return ""
+            i = close + 2
+        else:
+            return raw[i]
+    return ""
 
 
 def _read_settings(path: Path) -> _JsonObject:
@@ -342,6 +412,20 @@ def _read_settings(path: Path) -> _JsonObject:
 _UNION_LIST_KEYS = frozenset({"disabled", "disabledLevels", "excluded"})
 
 
+def _name_set(values: list[object]) -> set[str]:
+    """
+    Return the string entries of *values* as a set.
+
+    These lists hold tool / skill-level / server names, so anything that is not
+    a string is meaningless to qwen and is dropped rather than coerced. Dropping
+    also keeps the operation total: a ``dict`` or ``list`` element in a
+    hand-edited file is unhashable, and ``set(values)`` on one would raise
+    ``TypeError`` — from inside a launch path, where an exception costs the
+    session rather than the entry.
+    """
+    return {value for value in values if isinstance(value, str)}
+
+
 def _satisfies(existing: _JsonObject, overlay: _JsonObject) -> bool:
     """
     Report whether *existing* already declares everything in *overlay*.
@@ -356,7 +440,7 @@ def _satisfies(existing: _JsonObject, overlay: _JsonObject) -> bool:
             if not isinstance(current, dict) or not _satisfies(current, value):
                 return False
         elif key in _UNION_LIST_KEYS and isinstance(value, list):
-            if not isinstance(current, list) or not set(value) <= set(current):
+            if not isinstance(current, list) or not _name_set(value) <= _name_set(current):
                 return False
         elif current != value or type(current) is not type(value):
             return False
@@ -379,7 +463,7 @@ def _merge_settings(base: _JsonObject, overlay: _JsonObject) -> _JsonObject:
         elif key in _UNION_LIST_KEYS and isinstance(value, list) and isinstance(existing, list):
             # Union, not replace: anything already hidden stays hidden. Mirrors
             # how qwen itself merges these keys across settings scopes.
-            merged[key] = sorted({str(name) for name in [*existing, *value]})
+            merged[key] = sorted(_name_set([*existing, *value]))
         else:
             merged[key] = value
     return merged

@@ -18,16 +18,19 @@ runner materializes, and asserts both properties against reality.
 Behaviour with and without a live qwen
 --------------------------------------
 
+- **no qwen binary**: every test skips. That is the ONLY skip. The main suite
+  must not depend on a vendor CLI being installed.
 - **qwen on PATH** (or ``OMNIGENT_QWEN_PATH``): the probe runs and **fails
-  loudly** if the guardrail text is gone or if either tool reappears.
-- **no qwen binary**: every test skips. The main suite must not depend on a
-  vendor CLI being installed.
+  loudly** if the guardrail text is gone, if either tool reappears, or if qwen
+  does not produce both startup artifacts. A missing artifact is not an excuse
+  to skip — a qwen that stopped rendering its prompt or stopped announcing its
+  tools IS the regression this file exists to catch, and skipping there would
+  let a real one through as a green run.
 - **no model server**: still runs. The probe deliberately points the OpenAI-
   compatible base URL at a closed port — qwen writes the system prompt
   (``QWEN_WRITE_SYSTEM_MD``) and emits its ``init`` event with the resolved tool
   list *before* any completion request, so no LLM backend, credentials, or
-  network access is needed. A run that nevertheless produces neither artifact is
-  treated as an unusable environment and skips rather than fails.
+  network access is needed.
 """
 
 from __future__ import annotations
@@ -36,6 +39,7 @@ import json
 import os
 import shutil
 import subprocess
+from collections.abc import Iterator
 
 import pytest
 
@@ -59,6 +63,46 @@ def _qwen_binary() -> str | None:
     """Resolve the qwen CLI the runner would launch, or ``None``."""
     configured = os.environ.get("OMNIGENT_QWEN_PATH", "").strip()
     return shutil.which(configured or "qwen")
+
+
+# ---------------------------------------------------------------------------
+# Stream parsing. Pure, so these run with or without a qwen binary — and they
+# have to: a parser that quietly returns ``None`` would now turn every probe
+# into a hard failure, so its own robustness cannot rest on the probe passing.
+# ---------------------------------------------------------------------------
+
+_INIT_EVENT = '[{"type":"system","subtype":"init","tools":["read_file","edit"]}]'
+
+
+def test_tools_are_found_after_a_bracketed_log_line() -> None:
+    """A ``[INFO]``-style prefix must not capture the parse."""
+    stdout = f"[INFO] starting up\n[warn] not json either\n{_INIT_EVENT}\n"
+
+    assert _tools_from_stream(stdout) == ["read_file", "edit"]
+
+
+def test_tools_are_found_in_line_delimited_output() -> None:
+    """stream-json emits one event per line rather than a single array."""
+    stdout = (
+        "Warning: something\n"
+        '{"type":"system","subtype":"other"}\n'
+        '{"type":"system","subtype":"init","tools":["glob"]}\n'
+    )
+
+    assert _tools_from_stream(stdout) == ["glob"]
+
+
+def test_tools_are_found_after_a_decodable_but_wrong_payload() -> None:
+    """The first parseable JSON need not be the one carrying the init event."""
+    stdout = f'[1, 2, 3]\n{{"unrelated": true}}\n{_INIT_EVENT}'
+
+    assert _tools_from_stream(stdout) == ["read_file", "edit"]
+
+
+def test_no_init_event_reads_as_none() -> None:
+    """``None`` is the signal the fixture turns into a loud failure."""
+    assert _tools_from_stream("[INFO] nothing here\n[1,2,3]\n") is None
+    assert _tools_from_stream("") is None
 
 
 @pytest.fixture(scope="module")
@@ -94,32 +138,81 @@ def qwen_probe(tmp_path_factory: pytest.TempPathFactory) -> dict:
             timeout=_PROBE_TIMEOUT_S,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        pytest.skip(f"qwen could not be run in this environment: {exc}")
+        pytest.fail(f"qwen is installed at {binary} but could not be run: {exc}", pytrace=False)
 
     tools = _tools_from_stream(completed.stdout)
     prompt = system_md.read_text(encoding="utf-8") if system_md.is_file() else ""
-    if not prompt and tools is None:
-        pytest.skip(
-            "qwen produced neither a system-prompt dump nor an init event "
-            f"(exit {completed.returncode}); environment cannot run the probe"
+    missing = [
+        name
+        for name, present in (
+            ("system-prompt dump", bool(prompt)),
+            ("init event", tools is not None),
+        )
+        if not present
+    ]
+    if missing:
+        # Deliberately a failure, not a skip: both artifacts are produced during
+        # startup, before any model call, so their absence means qwen changed —
+        # exactly what this file watches for. Skipping here would retire the
+        # probe silently on the very upgrade it exists to catch.
+        pytest.fail(
+            f"qwen at {binary} produced no {' and no '.join(missing)} "
+            f"(exit {completed.returncode}). The conformance probe cannot verify "
+            "the sub-agent safety premises, so treat this as a qwen regression "
+            f"until proven otherwise.\nstderr tail: {completed.stderr[-800:]!r}",
+            pytrace=False,
         )
     return {"prompt": prompt, "tools": tools, "settings": overrides.env}
 
 
 def _tools_from_stream(stdout: str) -> list[str] | None:
-    """Pull the declared tool list out of qwen's ``system``/``init`` event."""
-    start = stdout.find("[")
-    if start < 0:
-        return None
-    try:
-        events = json.loads(stdout[start:])
-    except ValueError:
-        return None
-    for event in events if isinstance(events, list) else []:
-        if isinstance(event, dict) and event.get("subtype") == "init":
-            tools = event.get("tools")
-            if isinstance(tools, list):
-                return [t for t in tools if isinstance(t, str)]
+    """
+    Pull the declared tool list out of qwen's ``system``/``init`` event.
+
+    qwen may print warnings or log lines around its JSON, and one of those can
+    itself start with ``[`` (an ``[INFO]``-style prefix), so locking onto the
+    first bracket and giving up when it fails to parse would silently report
+    "no tools" — which now fails the suite rather than skipping it. Instead every
+    plausible JSON start is tried with ``raw_decode`` until one yields an init
+    event, and each line is also tried alone for stream-json output.
+
+    :returns: The declared tool names, or ``None`` if no init event was found.
+    """
+    for payload in _candidate_json_payloads(stdout):
+        tools = _tools_from_payload(payload)
+        if tools is not None:
+            return tools
+    return None
+
+
+def _candidate_json_payloads(stdout: str) -> Iterator[object]:
+    """Yield every JSON value decodable from *stdout*, junk lines tolerated."""
+    decoder = json.JSONDecoder()
+    for index, char in enumerate(stdout):
+        if char in "[{":
+            try:
+                value, _ = decoder.raw_decode(stdout, index)
+            except ValueError:
+                continue
+            yield value
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if stripped[:1] in ("[", "{"):
+            try:
+                yield json.loads(stripped)
+            except ValueError:
+                continue
+
+
+def _tools_from_payload(payload: object) -> list[str] | None:
+    """Return the tool names from an init event inside *payload*, if present."""
+    events = payload if isinstance(payload, list) else [payload]
+    for event in events:
+        if not isinstance(event, dict) or event.get("subtype") != "init":
+            continue
+        tools = event.get("tools")
+        if isinstance(tools, list):
+            return [name for name in tools if isinstance(name, str)]
     return None
 
 
@@ -130,11 +223,7 @@ def test_headless_prompt_still_forbids_asking_questions(qwen_probe: dict) -> Non
     removed: either re-anchor the assertion on the new wording, or add the
     instruction to ``QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND`` ourselves.
     """
-    prompt = qwen_probe["prompt"]
-    if not prompt:
-        pytest.skip("qwen did not write a system-prompt dump in this environment")
-
-    assert _NEVER_ASK in prompt.lower(), (
+    assert _NEVER_ASK in qwen_probe["prompt"].lower(), (
         "qwen's headless base prompt no longer tells the model never to ask a "
         "question. The qwen sub-agent trim relies on that guardrail."
     )
@@ -147,9 +236,6 @@ def test_the_trimmed_tool_set_excludes_agent_and_ask_user_question(qwen_probe: d
     ``QWEN_SUBAGENT_DISABLED_TOOLS``.
     """
     tools = qwen_probe["tools"]
-    if tools is None:
-        pytest.skip("qwen did not emit an init event in this environment")
-
     present = sorted(set(_FORBIDDEN_TOOLS) & set(tools))
     assert not present, (
         f"qwen registered {present} for a trimmed sub-agent. "
@@ -164,9 +250,6 @@ def test_the_trimmed_tool_set_excludes_agent_and_ask_user_question(qwen_probe: d
 def test_the_trim_survives_qwen_startup(qwen_probe: dict) -> None:
     """The knobs must still be honored at system scope after a real boot."""
     tools = qwen_probe["tools"]
-    if tools is None:
-        pytest.skip("qwen did not emit an init event in this environment")
-
     assert not [t for t in tools if t.startswith("computer_use__")]
     assert not [t for t in tools if t.startswith("mcp__")]
     assert not [t for t in tools if t in {"monitor", "create_sub_session", "enter_worktree"}]
