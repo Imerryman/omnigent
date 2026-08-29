@@ -41,7 +41,7 @@ const {
   normalizeUrl,
   normalizeRecentServers,
   expandDatabricksWorkspaceUrl,
-  stripApiMountFromServerUrl,
+  normalizeSavedServerUrl,
   fetchServerManifest,
   PRE_MANIFEST_BASELINE,
 } = require("./url");
@@ -392,65 +392,14 @@ function popupResponseHeadersHook(details) {
 }
 
 /**
- * Recover the desktop window when a top-level navigation lands on an HTTP 401
- * response whose body is JSON (application/json). This is the Databricks API
- * endpoint's unauthenticated-request shape — did-fail-load never fires for an
- * HTTP-level error because Chromium treats a 401 as a successful load. Redirect
- * the window to the setup page with an error message so the user can re-connect
- * instead of being stranded on the raw JSON body with no way back.
- *
- * Composed into the single onHeadersReceived registration (alongside
- * popupResponseHeadersHook) so it sees every main-frame response without a
- * second listener.
- *
- * @param {Electron.OnHeadersReceivedListenerDetails} details
- * @returns {null} Always null — the setup-page redirect is issued via
- *   win.loadFile so pinWindow can be called inline; the hook itself doesn't
- *   modify the response headers.
- */
-function json401ResponseHook(details) {
-  if (details.resourceType !== "mainFrame") return null;
-  if (details.statusCode !== 401) return null;
-  const ct = details.responseHeaders?.["content-type"]?.[0]
-    ?? details.responseHeaders?.["Content-Type"]?.[0]
-    ?? "";
-  if (!ct.toLowerCase().includes("json")) return null;
-  const win = windowForWebContentsId(details.webContentsId);
-  if (!win || win.isDestroyed()) return null;
-  // Only intercept navigations to the window's own pinned server — don't
-  // redirect a sub-resource or a window already on the setup page.
-  const state = windows.get(win);
-  if (!state?.origin) return null;
-  if (originOf(details.url) !== state.origin) return null;
-  // Async: redirect to setup with an error message. setImmediate keeps the
-  // onHeadersReceived callback synchronous (Electron requires it to return
-  // promptly) while still running before the renderer paints the 401 body.
-  setImmediate(() => {
-    if (win.isDestroyed()) return;
-    const params = new URLSearchParams({
-      error: "401 Unauthorized — session may have expired; connect again",
-      url: state.origin + "/",
-    });
-    if (state.ephemeral) params.set("ephemeral", "1");
-    pinWindow(win, null);
-    void win.loadFile(SETUP_PAGE, { search: params.toString() });
-  });
-  return null;
-}
-
-/**
  * Allow pages on trusted origins to call localhost services (auth helpers,
  * local runners) by injecting CORS/preflight headers on localhost responses
  * — see localhost_cors.js for the mechanism and isLocalhostTrustedOrigin
- * for the trust scope. The OAuth-popup COOP strip and JSON-401 recovery
- * compose in here because Electron allows one onHeadersReceived listener
- * per session.
+ * for the trust scope. The OAuth-popup COOP strip is passed through because
+ * Electron allows one onHeadersReceived listener per session.
  */
 function registerLocalhostAccess() {
-  function composedResponseHeadersHook(details) {
-    return popupResponseHeadersHook(details) ?? json401ResponseHook(details);
-  }
-  registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin, composedResponseHeadersHook);
+  registerLocalhostCors(session.defaultSession, isLocalhostTrustedOrigin, popupResponseHeadersHook);
 }
 
 // Per-window timestamp of the last expired-session reload, so a host whose SSO
@@ -663,21 +612,6 @@ function pinWindow(win, origin) {
     }
   }
   state.origin = origin;
-}
-
-/**
- * Find the main BrowserWindow whose webContents has the given id, or null.
- * Used to route session-level webRequest events (onHeadersReceived) back to
- * the window that owns them.
- *
- * @param {number} webContentsId
- * @returns {Electron.BrowserWindow | null}
- */
-function windowForWebContentsId(webContentsId) {
-  for (const win of windows.keys()) {
-    if (!win.isDestroyed() && win.webContents.id === webContentsId) return win;
-  }
-  return null;
 }
 
 /**
@@ -1285,10 +1219,8 @@ function createWindow(targetUrl, opts = {}) {
   });
   const explicit =
     typeof targetUrl === "string" && /^https?:\/\//i.test(targetUrl) ? targetUrl : undefined;
-  // A saved server_url that is the CLI's API endpoint
-  // (``<ws>/api/2.0/omnigent``) would navigate the window to a raw 401 JSON
-  // body with no way back; strip the API mount to the workspace root at boot.
-  const saved = stripApiMountFromServerUrl(loadSettings().server_url);
+  // CLI config stores the API mount; Electron boots the browser-facing SPA.
+  const saved = normalizeSavedServerUrl(loadSettings().server_url);
   // serverUrl: the window's server IDENTITY for host/server CLI commands
   // (``omnigent host --server``, ``omnigent login``, ``serverAuthed``) — the
   // origin or origin+mount, WITHOUT the conversation path. Prefer an explicit

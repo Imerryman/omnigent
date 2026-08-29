@@ -33,6 +33,8 @@ backend — no real provider creds.
 - `desktop_connect.e2e.js` — the reference test to **copy** for a desktop bug:
   launch → setup page → type URL → Connect → land in the shell. Its `.webm` is
   the desktop journey footage.
+- `desktop_api_url_recovery.e2e.js` — saved Databricks API URL normalization
+  and top-level HTTP-401 recovery through the real Electron navigation surface.
 
 ## Prerequisites
 

@@ -27,17 +27,25 @@ const vm = require("node:vm");
 const mainSource = readFileSync(path.join(__dirname, "../src/main.js"), "utf8");
 const preloadSource = readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 const setupSource = readFileSync(path.join(__dirname, "../setup/index.html"), "utf8");
+const urlHelpers = require("../src/url");
 
 // Strip block comments, then line comments (leaving `://` in URLs intact).
 const liveCode = mainSource.replace(/\/\*[\s\S]*?\*\//g, "").replace(/(^|[^:])\/\/.*$/gm, "$1");
 
 function loadNavigationHarness({
   serverUrl = "https://host.example/ml/omnigents",
+  savedServerUrl,
   registerFallbacks = true,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
+  if (savedServerUrl) {
+    fs.writeFileSync(
+      path.join(userData, "settings.json"),
+      JSON.stringify({ server_url: savedServerUrl }),
+    );
+  }
   const listeners = new Map();
-  const calls = { loadFile: [] };
+  const calls = { loadFile: [], loadURL: [] };
   const bannerCalls = { show: [], hide: 0 };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -68,7 +76,10 @@ function loadNavigationHarness({
       calls.loadFile.push(args);
       return Promise.resolve();
     },
-    loadURL: () => Promise.resolve(),
+    loadURL: (...args) => {
+      calls.loadURL.push(args);
+      return Promise.resolve();
+    },
   };
 
   function createDesktopUpdater() {
@@ -130,6 +141,7 @@ function loadNavigationHarness({
     },
     "./localhost_cors": { registerLocalhostCors: () => {} },
     "./url": {
+      ...urlHelpers,
       normalizeUrl: (url) => url,
       expandDatabricksWorkspaceUrl: async (url) => url,
       fetchServerManifest: async () => ({}),
@@ -441,6 +453,22 @@ describe("workspace chrome injection wiring (src/main.js)", () => {
 });
 
 describe("navigation fallback wiring (src/main.js)", () => {
+  it("boots a saved Databricks API URL on the UI mount without losing URL state", () => {
+    const saved = "https://workspace.cloud.databricks.com/api/2.0/omnigent/?o=123#conversation";
+    const harness = loadNavigationHarness({
+      savedServerUrl: saved,
+      registerFallbacks: false,
+    });
+
+    harness.api.createWindow();
+
+    assert.equal(
+      harness.calls.loadURL[0][0],
+      "https://workspace.cloud.databricks.com/omnigent?o=123#conversation",
+    );
+    harness.cleanup();
+  });
+
   it("registers navigation fallbacks when createWindow builds a window", () => {
     const harness = loadNavigationHarness({ registerFallbacks: false });
 
@@ -531,26 +559,16 @@ describe("OAuth popup localhost trust wiring (src/main.js)", () => {
 // window.opener, so every FIRST sign-in through such a provider fails and
 // only retries succeed.
 describe("OAuth popup COOP-strip wiring (src/main.js)", () => {
-  it("composes popupResponseHeadersHook into the localhost-CORS registration as live code", () => {
-    // popupResponseHeadersHook must be invoked inside the composed hook passed
-    // to registerLocalhostCors (the single onHeadersReceived owner). It may be
-    // wrapped in a composed function (e.g. composedResponseHeadersHook) or
-    // passed directly. Guard that it is reachable from registerLocalhostAccess.
+  it("passes popupResponseHeadersHook to the single response listener", () => {
     assert.match(
       liveCode,
-      /popupResponseHeadersHook\s*\(details\)/,
+      /registerLocalhostCors\s*\(\s*session\.defaultSession,\s*isLocalhostTrustedOrigin,\s*popupResponseHeadersHook\s*\)/,
       [
-        "registerLocalhostAccess no longer calls popupResponseHeadersHook.",
+        "registerLocalhostAccess no longer passes popupResponseHeadersHook",
+        "directly to registerLocalhostCors's single onHeadersReceived owner.",
         "The COOP strip for OAuth popup sign-ins must be composed into the",
-        "single onHeadersReceived handler (registerLocalhostCors's third arg)",
-        "or first-time OAuth sign-ins will fail. Restore the call.",
+        "single listener or first-time OAuth sign-ins will fail.",
       ].join(" "),
-    );
-    // Also verify registerLocalhostCors is still called on the default session.
-    assert.match(
-      liveCode,
-      /registerLocalhostCors\s*\(\s*session\.defaultSession,\s*isLocalhostTrustedOrigin,/,
-      "registerLocalhostAccess no longer calls registerLocalhostCors with the default session and trust predicate.",
     );
   });
 
@@ -797,6 +815,15 @@ describe("HTTP error status fallback (src/main.js)", () => {
 
     harness.emit("did-navigate", "https://host.example/ml/omnigents/", 200, "OK");
     harness.emit("did-navigate", "https://host.example/ml/omnigents/login", 302, "Found");
+
+    assert.deepEqual(harness.calls.loadFile, []);
+  });
+
+  it("does not let a cross-origin HTTP error replace the setup page", (t) => {
+    const harness = loadNavigationHarness();
+    t.after(harness.cleanup);
+
+    harness.emit("did-navigate", "https://other.example/unauthorized", 401, "Unauthorized");
 
     assert.deepEqual(harness.calls.loadFile, []);
   });

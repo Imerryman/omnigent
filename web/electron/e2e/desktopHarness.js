@@ -283,6 +283,7 @@ async function spawnServer(tmpDir) {
  *   this, so the shell auto-connects on launch.
  * @param {string} [opts.userDataDir] Override the isolated userData dir
  *   (defaults to a fresh temp dir).
+ * @param {string[]} [opts.launchArgs] Additional Chromium/Electron arguments.
  * @returns {Promise<{ electronApp: import("playwright").ElectronApplication,
  *   window: import("playwright").Page, userDataDir: string }>}
  */
@@ -298,7 +299,7 @@ async function launchDesktop(opts) {
   }
   fs.mkdirSync(opts.recordDir, { recursive: true });
 
-  const args = [APP_ROOT, `--user-data-dir=${userDataDir}`];
+  const args = [APP_ROOT, ...(opts.launchArgs ?? []), `--user-data-dir=${userDataDir}`];
   // Headless-Linux / CI hardening, gated on the same env var the Python e2e_ui
   // suite uses (conftest.browser_type_launch_args). Under xvfb — and especially
   // as root or in a container — Electron's Chromium refuses to start without

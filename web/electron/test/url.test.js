@@ -12,7 +12,7 @@ const {
   normalizeRecentServers,
   serverDisplayLabel,
   isPlainHttpRemote,
-  stripApiMountFromServerUrl,
+  normalizeSavedServerUrl,
   databricksWorkspaceUiUrl,
   expandDatabricksWorkspaceUrl,
   WORKSPACE_UI_PATH,
@@ -169,43 +169,56 @@ describe("isPlainHttpRemote", () => {
   });
 });
 
-describe("stripApiMountFromServerUrl", () => {
-  it("strips a trailing /api/2.0/omnigent to the workspace root", () => {
+describe("normalizeSavedServerUrl", () => {
+  it("maps the current Databricks API mount to the UI mount", () => {
     assert.equal(
-      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent"),
-      "https://ws.cloud.databricks.com",
+      normalizeSavedServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent"),
+      "https://ws.cloud.databricks.com/omnigent",
     );
   });
 
-  it("handles the trailing-slash variant", () => {
+  it("maps the legacy plural API mount to the current UI mount", () => {
     assert.equal(
-      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/api/2.0/omnigent/"),
-      "https://ws.cloud.databricks.com",
+      normalizeSavedServerUrl("https://ws.azuredatabricks.net/api/2.0/omnigents"),
+      "https://ws.azuredatabricks.net/omnigent",
     );
   });
 
-  it("leaves a URL already at the workspace root unchanged", () => {
+  it("handles trailing slashes while preserving port, query, and fragment", () => {
     assert.equal(
-      stripApiMountFromServerUrl("https://ws.cloud.databricks.com"),
-      "https://ws.cloud.databricks.com",
+      normalizeSavedServerUrl(
+        "https://ws.cloud.databricks.com:8443/api/2.0/omnigent/?o=123#conversation",
+      ),
+      "https://ws.cloud.databricks.com:8443/omnigent?o=123#conversation",
     );
-    assert.equal(
-      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/"),
+  });
+
+  it("leaves workspace roots and current or legacy UI mounts exact", () => {
+    for (const url of [
+      "https://ws.cloud.databricks.com",
       "https://ws.cloud.databricks.com/",
-    );
+      "https://ws.cloud.databricks.com/omnigent?o=123#state",
+      "https://ws.cloud.databricks.com/ml/omnigents",
+    ]) {
+      assert.equal(normalizeSavedServerUrl(url), url);
+    }
   });
 
-  it("leaves an unrelated mount (e.g. the SPA path) unchanged", () => {
-    assert.equal(
-      stripApiMountFromServerUrl("https://ws.cloud.databricks.com/ml/omnigents"),
-      "https://ws.cloud.databricks.com/ml/omnigents",
-    );
+  it("does not rewrite matching paths on non-workspace hosts or nested paths", () => {
+    for (const url of [
+      "https://example.com/api/2.0/omnigent",
+      "https://databricks.com.example.org/api/2.0/omnigent",
+      "https://ws.cloud.databricks.com/prefix/api/2.0/omnigent",
+      "ftp://ws.cloud.databricks.com/api/2.0/omnigent",
+    ]) {
+      assert.equal(normalizeSavedServerUrl(url), url);
+    }
   });
 
   it("returns empty/undefined/invalid input unchanged", () => {
-    assert.equal(stripApiMountFromServerUrl(""), "");
-    assert.equal(stripApiMountFromServerUrl(undefined), undefined);
-    assert.equal(stripApiMountFromServerUrl("not a url"), "not a url");
+    assert.equal(normalizeSavedServerUrl(""), "");
+    assert.equal(normalizeSavedServerUrl(undefined), undefined);
+    assert.equal(normalizeSavedServerUrl("not a url"), "not a url");
   });
 });
 
