@@ -1,5 +1,4 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
@@ -168,28 +167,6 @@ if (useAuth) {
 
 const proxyConfig = createProxyConfig(OMNIGENT_URL, useAuth);
 
-/**
- * Emit the tombstone `sw.js` for the standalone build (see `sw-src/sw.js`): the
- * retired PWA service worker's self-unregistering replacement. Registered ONLY
- * here (not in `vite.embed.config.ts`), so the embed island still ships no
- * service worker.
- *
- * @deprecated Delete this plugin together with `sw-src/sw.js` in 0.11.0, once
- * existing registrations have had time to unregister themselves.
- */
-function emitServiceWorkerTombstone(): Plugin {
-  return {
-    name: "emit-service-worker-tombstone",
-    generateBundle() {
-      this.emitFile({
-        type: "asset",
-        fileName: "sw.js",
-        source: readFileSync(path.resolve(__dirname, "sw-src/sw.js"), "utf8"),
-      });
-    },
-  };
-}
-
 // Safari < 16.4 cannot parse regex lookbehind; these dependency regexes would
 // otherwise throw there, at module scope during boot or on the first rendered
 // markdown message (#1978):
@@ -240,7 +217,7 @@ function safariLookbehindWorkarounds(): Plugin {
 }
 
 export default defineConfig({
-  plugins: [emitServiceWorkerTombstone(), safariLookbehindWorkarounds(), react(), tailwindcss()],
+  plugins: [safariLookbehindWorkarounds(), react(), tailwindcss()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -264,6 +241,11 @@ export default defineConfig({
         "src/**/*.test.{ts,tsx}",
         "src/**/*.d.ts",
         "src/test-setup.ts",
+        // Storybook-only modules are covered by the pinned visual snapshot suite.
+        "src/**/*.stories.{ts,tsx}",
+        "src/storybook/**",
+        "src/**/*storyFixtures.{ts,tsx}",
+        "src/**/*StoryFixtures.{ts,tsx}",
         // Vendored UI kit, not product code (see tests/e2e_ui/COVERAGE_GAPS.md).
         "src/components/ai-elements/**",
       ],

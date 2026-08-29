@@ -105,6 +105,7 @@ from omnigent.claude_native_state import (
     redirect_launch_state,
     write_launch_state,
 )
+from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.host.daemon_launch import (
@@ -134,6 +135,7 @@ from omnigent.native_terminal import (
 from omnigent.native_terminal import (
     terminal_attach_url as _attach_url,
 )
+from omnigent.process_logging import log_info_once
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -2510,7 +2512,7 @@ def _ucode_config_for_profile(
     if agent_state is None:
         raise click.ClickException(
             f"ucode state for profile {profile!r} does not include a Claude agent entry. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     base_url = agent_state.env.get(_UCODE_CLAUDE_BASE_URL_ENV) or agent_state.base_url
@@ -2520,12 +2522,12 @@ def _ucode_config_for_profile(
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude base URL "
             f"({_UCODE_CLAUDE_BASE_URL_ENV} / base_url). "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
     if not agent_state.auth_command:
         raise click.ClickException(
             f"ucode state for profile {profile!r} is missing Claude auth_command. "
-            "Run `omnigent setup --internal-beta` to refresh ucode configuration."
+            f"Run `{cli_invocation()} setup --internal-beta` to refresh ucode configuration."
         )
 
     refresh_interval_ms = (
@@ -2730,7 +2732,8 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
             entry.name,
         )
         return None
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2859,7 +2862,8 @@ def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcode
             "Bedrock account. Set models.default to a Bedrock inference-profile id.",
             entry.name,
         )
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: bedrock provider %r (base_url=%s, model=%s)",
         entry.name,
         family.base_url,
@@ -2916,9 +2920,11 @@ def _native_claude_config_from_entry(
     if entry.kind == BEDROCK_KIND:
         return _bedrock_config_for_native_claude(entry)
     if entry.kind == DATABRICKS_KIND:
-        _logger.info("native-claude routing: Databricks ucode profile %r", entry.profile)
+        log_info_once(_logger, "native-claude routing: Databricks ucode profile %r", entry.profile)
         return _ucode_config_for_profile(entry.profile, refresh_models=refresh_models)
-    _logger.info("native-claude routing: Claude CLI login (subscription provider %r)", entry.name)
+    log_info_once(
+        _logger, "native-claude routing: Claude CLI login (subscription provider %r)", entry.name
+    )
     return None
 
 
@@ -2990,10 +2996,11 @@ def resolve_native_claude_config(
     entry = default_provider_for_harness(effective_config_with_detected(explicit), "claude-sdk")
     if entry is not None:
         return _native_claude_config_from_entry(entry, refresh_models=refresh_models)
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-claude routing: Claude CLI login (no provider configured for the Claude "
         "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-        "through a provider."
+        "through a provider.",
     )
     return None
 
@@ -3047,6 +3054,37 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     }
     yaml_path.write_text(yaml.safe_dump(raw, sort_keys=False))
     return yaml_path
+
+
+def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
+    """Resolve raw author instructions from the wrapper's agent spec.
+
+    Reuses :func:`omnigent.spec.load` (the same loader
+    :func:`~omnigent.cli._bundle` and the server use for both an agent-image
+    directory and a standalone single-file YAML) so the value matches exactly
+    what ``AgentSpec.instructions`` resolves to — including the
+    ``instructions:`` file precedence over ``prompt:`` — rather than
+    re-reading the raw YAML ad hoc.
+
+    :param spec_path: The generated/current wrapper agent spec (a
+        standalone YAML file or an agent-image directory).
+    :returns: The verbatim instructions text, or ``None`` if unresolvable
+        or absent/whitespace-only. Best-effort: a malformed spec must not
+        block the terminal launch, so load failures degrade to ``None``.
+    """
+    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.spec import load as load_agent_spec
+
+    try:
+        spec = load_agent_spec(spec_path, expand_env=False)
+    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+        _logger.warning(
+            "Could not resolve raw instructions from wrapper spec %s",
+            spec_path,
+            exc_info=True,
+        )
+        return None
+    return raw_author_instructions(spec)
 
 
 def _run_with_local_server(
@@ -3148,6 +3186,7 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
+                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
                 )
             )
             _mark_startup_step(
@@ -4354,6 +4393,7 @@ async def _prepare_claude_terminal(
     claude_config: ClaudeNativeUcodeConfig | None = None,
     startup_profiler: StartupProfiler | None = None,
     startup_progress: RunnerStartupProgress | None = None,
+    append_system_prompt: str | None = None,
 ) -> PreparedClaudeTerminal:
     """
     Create/bind a session and launch its Claude terminal resource.
@@ -4371,6 +4411,10 @@ async def _prepare_claude_terminal(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
+    :param append_system_prompt: Raw author instructions for
+        ``--append-system-prompt``, applied on fresh launch and cold
+        resume only — the hot-reattach fast path below returns before
+        this is used, so it never relaunches or duplicates the flag.
     :returns: Prepared terminal details.
     :raises click.ClickException: If any server operation fails.
     """
@@ -4511,6 +4555,7 @@ async def _prepare_claude_terminal(
             command=command,
             bridge_dir=bridge_dir,
             claude_config=claude_config,
+            append_system_prompt=append_system_prompt,
         )
         _mark_startup_step(
             startup_profiler,
@@ -4554,7 +4599,7 @@ async def _fetch_claude_session_labels(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4598,7 +4643,7 @@ async def _resolve_cold_resume_args(
     if resp.status_code == 404:
         raise click.ClickException(
             f"Conversation {session_id!r} not found on the server. "
-            "Run `omnigent claude` (no --resume) to start a new session.",
+            f"Run `{cli_invocation()} claude` (no --resume) to start a new session.",
         )
     if resp.status_code >= 400:
         raise click.ClickException(
@@ -4616,7 +4661,7 @@ async def _resolve_cold_resume_args(
     if wrapper != _WRAPPER_LABEL_VALUE:
         raise click.ClickException(
             f"Conversation {session_id!r} is not a claude-native session "
-            f"(wrapper={wrapper!r}). Use `omnigent run --resume "
+            f"(wrapper={wrapper!r}). Use `{cli_invocation()} run --resume "
             f"{session_id}` to resume it through the right runtime.",
         )
     external_session_id = payload.get("external_session_id")
@@ -5436,8 +5481,9 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional framework-owned instructions for
-        this fresh native session.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) for this fresh native
+        session.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: Terminal resource id.
@@ -5599,8 +5645,9 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional framework-owned instructions to
-        append to Claude Code's system prompt.
+    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) to append to Claude
+        Code's system prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.

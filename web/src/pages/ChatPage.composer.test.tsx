@@ -9,6 +9,7 @@ import type { ReactElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import { clearSessionDrafts, hasSessionDraft } from "@/lib/sessionDrafts";
+import { setOmnigentHostConfig } from "@/lib/host";
 
 // Composer reads workspace files via a TanStack query hook (for "@"-file
 // mentions). These slash-command tests don't exercise that, so stub the hook
@@ -246,6 +247,7 @@ describe("Composer slash-command menu", () => {
   afterEach(() => {
     cleanup();
     vi.restoreAllMocks();
+    setOmnigentHostConfig({});
   });
 
   it("highlights the first match as soon as the menu opens", () => {
@@ -311,14 +313,35 @@ describe("Composer slash-command menu", () => {
     expect(activeRow()).toBeNull();
   });
 
-  it("Enter sends a normal (non-slash) message", () => {
+  it("Enter sends a normal (non-slash) message and reports the send to analytics", () => {
     const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
     render(<Composer {...composerProps({ onSend })} />);
     const ta = textarea();
     fireEvent.change(ta, { target: { value: "hello there" } });
 
     fireEvent.keyDown(ta, { key: "Enter" });
     expect(onSend).toHaveBeenCalledWith("hello there", undefined);
+    // Enter-key sends must emit the same telemetry as clicking Send.
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "chat.composer.send",
+      componentKind: "button",
+    });
+  });
+
+  it("Enter on an empty composer neither sends nor reports a send", () => {
+    const onSend = vi.fn();
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    render(<Composer {...composerProps({ onSend })} />);
+
+    // Empty draft: the Send button is disabled, so a click can't fire the
+    // event — the guarded Enter path must not fire it either.
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(onSend).not.toHaveBeenCalled();
+    expect(analytics).not.toHaveBeenCalled();
   });
 
   it("does not send when Enter confirms active IME composition", () => {
@@ -1419,7 +1442,7 @@ describe("Composer placeholder", () => {
 
   it("shows the normal placeholder when the runner is live", () => {
     render(<Composer {...composerProps({})} />);
-    expect(textarea().placeholder).toMatch(/ask the agent anything/i);
+    expect(textarea().placeholder).toMatch(/send a message/i);
   });
 
   it("a structural read-only reason wins over the normal placeholder", () => {
@@ -1429,17 +1452,8 @@ describe("Composer placeholder", () => {
     expect(textarea().placeholder).toBe("Mirrored transcript");
   });
 
-  it("runner_asleep (reconnectHint): enabled composer nudges the user to send", () => {
-    // Host online but runner offline — sending relaunches the runner, so the
-    // composer stays writable and the placeholder is the affordance.
-    render(<Composer {...composerProps({ reconnectHint: true })} />);
-    expect(textarea().placeholder).toBe("Send a message to reconnect this session");
-    expect(textarea().disabled).toBe(false);
-  });
-
-  it("streaming wins over the reconnect hint", () => {
-    // A queued follow-up message takes precedence over the asleep nudge.
-    render(<Composer {...composerProps({ reconnectHint: true, status: "streaming" })} />);
+  it("streaming shows the queued follow-up placeholder", () => {
+    render(<Composer {...composerProps({ status: "streaming" })} />);
     expect(textarea().placeholder).toMatch(/send a follow-up/i);
   });
 
@@ -1447,12 +1461,6 @@ describe("Composer placeholder", () => {
     // A message can't wake it, so the textarea is disabled and the banner
     // below is the only affordance.
     render(<Composer {...composerProps({ unreachable: true })} />);
-    expect(textarea().disabled).toBe(true);
-    expect(textarea().placeholder).toMatch(/reconnect below/i);
-  });
-
-  it("unreachable wins over the reconnect hint (both set defensively)", () => {
-    render(<Composer {...composerProps({ unreachable: true, reconnectHint: true })} />);
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });

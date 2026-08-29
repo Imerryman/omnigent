@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from omnigent.onboarding.provider_config import ProviderEntry
     from omnigent.spec.types import AgentSpec
 
+from omnigent.cli_invocation import cli_invocation
 from omnigent.codex_model_vocabulary import codex_spawn_model
 from omnigent.codex_native_bridge import write_policy_hook_config
 from omnigent.codex_native_process_registry import (
@@ -63,6 +64,7 @@ from omnigent.inner.codex_executor import (
     write_codex_hooks_file,
 )
 from omnigent.inner.databricks_executor import _databricks_gateway_host
+from omnigent.process_logging import log_info_once, log_once
 
 _logger = logging.getLogger(__name__)
 
@@ -331,17 +333,19 @@ def _sync_codex_developer_instructions(
     codex_home: Path,
     instructions: str | None,
 ) -> None:
-    """Synchronize framework instructions in the private Codex config.
+    """Synchronize the agent's authored instructions in the private Codex config.
 
     Codex's top-level ``developer_instructions`` setting is additive to its
     built-in operating instructions. The collaboration-mode field is not: a
     non-null value replaces the mode's defaults. The private session config
     therefore stores the user's original value in a sidecar, then derives the
-    active value from that base on every launch. Fresh sessions append the
-    framework directive; resumed sessions restore the unmodified base.
+    active value from that base on every launch. A launch that carries agent
+    instructions appends them to that base; a launch without them restores the
+    base alone.
 
     :param codex_home: Private per-session ``CODEX_HOME`` directory.
-    :param instructions: Framework instructions for this launch, or ``None``.
+    :param instructions: The agent's raw authored instructions
+        (``AgentSpec.instructions``) for this launch, or ``None``.
     :returns: None.
     """
     addition = instructions.strip() if instructions else ""
@@ -359,14 +363,14 @@ def _sync_codex_developer_instructions(
         document = tomlkit.parse(existing) if existing else tomlkit.document()
     except Exception:  # noqa: BLE001 - title metadata must never block Codex startup.
         _logger.warning(
-            "Could not synchronize native Codex framework instructions: invalid private config",
+            "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
         )
         return
     current = document.get("developer_instructions")
     if current is not None and not isinstance(current, str):
         _logger.warning(
-            "Could not synchronize native Codex framework instructions: "
+            "Could not synchronize native Codex agent instructions: "
             "developer_instructions is not a string"
         )
         return
@@ -374,8 +378,8 @@ def _sync_codex_developer_instructions(
         base = base_path.read_text(encoding="utf-8")
     else:
         base = current.strip() if isinstance(current, str) else ""
-        # A previous Omnigent build may have appended the same framework
-        # directive without writing the sidecar. Recover the user-authored
+        # A previous Omnigent build may have appended the same instructions
+        # without writing the sidecar. Recover the user-authored
         # prefix instead of permanently capturing the combined value as base.
         if addition and base == addition:
             base = ""
@@ -1028,7 +1032,9 @@ async def codex_launch_catalog(*, codex_path: str | None = None) -> list[_JsonOb
         try:
             return await probe_codex_model_options(codex_path=codex_path)
         except Exception:  # noqa: BLE001 — probe failure means "no catalog", never a crash
-            _logger.warning("codex catalog probe failed", exc_info=True)
+            # Best-effort probe re-run on every catalog fetch; log once so a
+            # persistently failing probe doesn't flood the logs.
+            log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
 
     return await model_catalog_store.ensure_catalog("codex-native", fingerprint, _probe)
@@ -1074,8 +1080,9 @@ class CodexNativeAppServer:
     :param codex_home: Private per-session ``CODEX_HOME`` path.
     :param env: Environment for the app-server subprocess.
     :param config_overrides: Codex ``-c`` config override values.
-    :param developer_instructions: Optional framework-owned instructions
-        appended to the private session config before app-server startup.
+    :param developer_instructions: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) appended to the private
+        session config before app-server startup.
     :param cwd: Working directory for the app-server process.
     :param bridge_dir: Native Codex bridge directory, e.g.
         ``Path("~/.omnigent/codex-native/<hash>")``. The policy hook
@@ -2162,8 +2169,9 @@ def build_codex_native_server(
     :param extra_config_overrides: Additional ``-c`` config overrides
         appended after Databricks routing overrides, e.g. MCP server
         registration for the Omnigent tool relay.
-    :param developer_instructions: Optional framework-owned instructions
-        appended to Codex's private per-session config.
+    :param developer_instructions: Optional raw ``AgentSpec.instructions``
+        (author-supplied, not framework-composed) appended to Codex's
+        private per-session config.
     :param bypass_sandbox: When ``True``, append config overrides that put
         the app-server's threads into the full-bypass stance
         (``approval_policy="never"`` + ``sandbox_mode="danger-full-access"``)
@@ -2615,7 +2623,8 @@ def _resolve_subscription_launch(
     # the exact auth.json the launched Codex process will use.
     real_codex_home = _codex_home_config_source_from_env()
     if codex_auth_has_credential(real_codex_home / "auth.json"):
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: Codex CLI login (subscription provider %r; Codex is logged in)",
             entry.name,
         )
@@ -2628,7 +2637,8 @@ def _resolve_subscription_launch(
     fallback = _first_routable_codex_provider(explicit, exclude=entry.name, model=model)
     if fallback is not None:
         return fallback
-    _logger.info(
+    log_info_once(
+        _logger,
         "native-codex routing: Codex CLI login (subscription provider %r has no usable "
         "Codex login and no alternative provider is configured)",
         entry.name,
@@ -2759,12 +2769,14 @@ def resolve_native_codex_launch(
             launch = _codex_provider_launch(spec_entry, model)
             if launch is not None:
                 if launch.profile is not None:
-                    _logger.info(
+                    log_info_once(
+                        _logger,
                         "native-codex routing: Databricks ucode profile %r (spec auth)",
                         launch.profile,
                     )
                 else:
-                    _logger.info(
+                    log_info_once(
+                        _logger,
                         "native-codex routing: provider %r (spec auth, model=%s)",
                         spec_entry.name,
                         launch.model,
@@ -2809,7 +2821,8 @@ def resolve_native_codex_launch(
         # This keeps rollout metadata, app-server, and remote TUI routing on
         # one immutable provider selection during cold resume.
         provider_id = config_detection.model_provider
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: config.toml provider %r (ambient fallback, model=%s)",
             provider_id,
             model,
@@ -2822,10 +2835,11 @@ def resolve_native_codex_launch(
         )
 
     if entry is None:
-        _logger.info(
+        log_info_once(
+            _logger,
             "native-codex routing: Codex CLI login (no provider configured for the Codex "
             "harness, no Databricks profile). Run `omnigent setup --no-internal-beta` to route "
-            "through a provider."
+            "through a provider.",
         )
         return NativeCodexLaunch(
             config_overrides=no_provider_overrides,
@@ -2834,8 +2848,8 @@ def resolve_native_codex_launch(
             summary=(
                 "Codex CLI login (no provider configured for the codex harness, no "
                 "Databricks profile) — the TUI likely renders the ChatGPT sign-in "
-                "screen and never starts a thread; run `omnigent setup` to route through "
-                "a provider"
+                f"screen and never starts a thread; run `{cli_invocation()} setup` "
+                "to route through a provider"
             ),
         )
     if entry.kind == SUBSCRIPTION_KIND:
@@ -2844,9 +2858,13 @@ def resolve_native_codex_launch(
     launch = _codex_provider_launch(entry, model)
     if launch is not None:
         if launch.profile is not None:
-            _logger.info("native-codex routing: Databricks ucode profile %r", launch.profile)
+            log_info_once(
+                _logger, "native-codex routing: Databricks ucode profile %r", launch.profile
+            )
         else:
-            _logger.info("native-codex routing: provider %r (model=%s)", entry.name, launch.model)
+            log_info_once(
+                _logger, "native-codex routing: provider %r (model=%s)", entry.name, launch.model
+            )
         return launch
     # Default provider can't route on its own (no openai surface / no usable
     # credential / unresolvable secret) → Codex's own login.

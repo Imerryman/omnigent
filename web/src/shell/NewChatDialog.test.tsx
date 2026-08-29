@@ -115,6 +115,9 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   // Empty projects list → no ?project= name resolves to an id, so the project
   // prefill stays inert and the generic host/workspace defaults under test apply.
   useProjects: () => ({ data: [] }),
+  // The landing reads useConversations for hasNoSessions; stub it so it doesn't
+  // fire an authenticatedFetch that skews create-POST call assertions.
+  useConversations: () => ({ data: undefined }),
 }));
 // The harness-label catalog is not under test here. Keep it synchronous so
 // create-session fetch assertions only observe the POST/PATCH calls they own.
@@ -987,13 +990,23 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(chip).toHaveTextContent("machine-2"));
   });
 
-  it("falls back after a fresh host list confirms the remembered host is gone", async () => {
+  it("does not silently replace an unavailable remembered host", async () => {
     localStorage.setItem("omnigent:last-host-choice", "host_2");
     mockHosts([host("online", 1)], { isFetching: false });
     renderLanding();
 
     await waitFor(() =>
-      expect(screen.getByTestId("new-chat-landing-host-chip")).not.toHaveTextContent("Choose host"),
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
+    );
+  });
+
+  it("does not replace an unavailable remembered host with the managed sandbox", async () => {
+    localStorage.setItem("omnigent:last-host-choice", "host_2");
+    mockHosts([host("online", 1)], { isFetching: false });
+    renderLanding({ managed_sandboxes_enabled: true });
+
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveTextContent("Choose host"),
     );
   });
 
@@ -1583,6 +1596,28 @@ describe("NewChatLandingScreen", () => {
     expect(body.model_override).toBe("databricks-gpt-5-6");
     expect(body.reasoning_effort).toBeUndefined();
     expect(useHostModelOptionsMock).toHaveBeenCalledWith("host_1", "codex-native", true);
+  });
+
+  it("reports start-session telemetry when a create is triggered with the Enter key", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const analytics = vi.fn();
+    setOmnigentHostConfig({ analytics });
+    renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "run the build" },
+    });
+    // Enter creates the session without going through the Start button, so the
+    // telemetry has to fire from handleCreate — not the Button's componentId.
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    expect(analytics).toHaveBeenCalledWith({
+      type: "click",
+      componentId: "new_chat.start_session",
+      componentKind: "button",
+    });
   });
 
   it("arms codex full bypass as a plain Approval option, with no warning banner", () => {
@@ -2510,6 +2545,46 @@ describe("NewChatLandingScreen", () => {
     expect(body.host_type).toBe("managed");
     expect("host_id" in body).toBe(false);
     expect("git" in body).toBe(false);
+  });
+
+  it("clears a drafted sandbox repository when remounting under another project", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    // Project Alpha's composer: stage a sandbox repo + branch, then navigate
+    // away (unmount parks them in the module-scoped landing draft).
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Alpha");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-repo-chip"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-input"), {
+      target: { value: "https://github.com/org/alpha-repo" },
+    });
+    fireEvent.change(screen.getByTestId("new-chat-landing-repo-branch-input"), {
+      target: { value: "alpha-main" },
+    });
+    // Unmount WITHOUT resetting the draft — the leak under test rides in it.
+    cleanup();
+
+    // Project Beta's composer: the repo inputs compose the managed create's
+    // workspace string, so Alpha's repo/branch must not survive — otherwise
+    // Beta's sandbox silently clones another project's repository.
+    renderLanding({ managed_sandboxes_enabled: true }, "/?project=Beta");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-repo-chip")).toHaveTextContent("Repository"),
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "start fresh" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const [, init] = authenticatedFetchMock.mock.calls[0];
+    const body = JSON.parse((init as RequestInit).body as string) as Record<string, unknown>;
+    expect(body.host_type).toBe("managed");
+    // Blank repo inputs compose to an omitted workspace (empty server-created
+    // one) — not Alpha's repo#branch.
+    expect(body.workspace).toBeUndefined();
   });
 
   it("carries the picked provider in the managed create when several are offered", async () => {

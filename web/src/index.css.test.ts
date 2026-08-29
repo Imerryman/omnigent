@@ -11,7 +11,9 @@ import { UI_FONT_SIZE_DEFAULT, UI_FONT_SIZE_MAX, UI_FONT_SIZE_MIN } from "./lib/
 
 // Relative to the vitest root (web/) — import.meta.url is not a file://
 // URL inside vitest's module graph, so it can't locate the file.
-const cssSource = readFileSync("src/index.css", "utf8");
+const indexCssSource = readFileSync("src/index.css", "utf8");
+const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
+const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 
 /* Regression test for the "transparent dropdown in prod" bug.
  *
@@ -253,9 +255,6 @@ describe("index.css sidebar canvas", () => {
   const omniDarkRule = cssSource.match(
     /\.dark:not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
-  const paletteRule = cssSource.match(
-    /:root:not\(\.dark\)\[data-theme\] \.conversations-sidebar,[^{]*\.dark\[data-theme\] \.conversations-sidebar \{[^}]*\}/,
-  )?.[0];
   const lightEdgeRule = cssSource.match(
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
@@ -264,13 +263,8 @@ describe("index.css sidebar canvas", () => {
     /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
   )?.[0];
 
-  it("uses the specified left-to-right gradient for Omnigent light only", () => {
-    expect(omniLightRule).toContain("background: #fffefe");
-    expect(omniLightRule).toContain(
-      "background: -webkit-linear-gradient(to right, #fffefe, #fcf6fa)",
-    );
-    expect(omniLightRule).toContain("background: linear-gradient(to right, #fffefe, #fcf6fa)");
-    expect(paletteRule).toContain("background: var(--sidebar)");
+  it("uses the specified left-to-right gradient for Omnigent light", () => {
+    expect(omniLightRule).toContain("background: linear-gradient(90deg, #fffefe, #fcf6fa)");
   });
 
   it("removes the dot-grid layer from both modes", () => {
@@ -453,14 +447,10 @@ describe("index.css mobile sidebar opacity", () => {
   it("declares it after the per-theme canvas rules so it wins the cascade", () => {
     // Matching specificity — the shorthand in the theme rules would otherwise
     // keep background-color transparent.
-    const light = cssSource.indexOf(":root:not(.dark):not([data-theme]) .conversations-sidebar {");
-    const dark = cssSource.indexOf(".dark:not([data-theme]) .conversations-sidebar {");
-    const palette = cssSource.indexOf(":root:not(.dark)[data-theme] .conversations-sidebar,");
+    const palette = generatedPaletteCssSource.lastIndexOf(".conversations-sidebar {");
     const mobile = cssSource.indexOf(mobileRule!);
-    expect(light).toBeGreaterThan(-1);
-    expect(dark).toBeGreaterThan(-1);
     expect(palette).toBeGreaterThan(-1);
-    expect(mobile).toBeGreaterThan(Math.max(light, dark, palette));
+    expect(mobile).toBeGreaterThan(palette);
     // Every palette/mode selector must be covered, or one can go transparent.
     expect(mobileRule).toContain(":root:not(.dark):not([data-theme]) .conversations-sidebar");
     expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");
@@ -643,6 +633,70 @@ describe("index.css electron-mac sidebar header", () => {
         );
       }
     }
+  });
+});
+
+/* Regression test for the "maximized rail tabs float in the middle when the
+ * sidebar is reopened" bug on the macOS desktop shell.
+ *
+ * A maximized workspace rail breaks out to the window's top-left corner, so its
+ * tab strip is padded 10.5rem to clear the traffic lights and the title-bar
+ * cluster. Maximizing normally collapses the sidebar, but the user can reopen
+ * it (⌘⌥[ / the title-bar toggle) over the still-maximized rail. The sidebar
+ * (z above the rail) then covers that corner — the lights sit over IT, and the
+ * strip starts to the sidebar's right with nothing to clear — so the clearance
+ * must drop, or the padding shoves the tabs into the middle. The rule keys off
+ * `data-sidebar-open` on the app shell (set by AppShell) to do this; asserted at
+ * the CSS level because the lights are painted by macOS OUTSIDE the page, so no
+ * DOM test or screenshot can see them. This selector IS the alignment.
+ */
+describe("index.css maximized workspace rail traffic-light clearance", () => {
+  const rule = (cssSource.match(/[^{}]+\{[^{}]*\}/g) ?? []).find(
+    (block) => block.includes(".workspace-tab-strip") && /padding-left/.test(block),
+  );
+  const selector = (rule ?? "")
+    .slice(0, rule ? rule.indexOf("{") : 0)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .trim();
+
+  function makeStrip(shellAttrs: Record<string, string>): HTMLElement {
+    const shell = document.createElement("div");
+    shell.className = "app-shell";
+    for (const [k, v] of Object.entries(shellAttrs)) shell.setAttribute(k, v);
+    const rail = document.createElement("aside");
+    rail.setAttribute("aria-label", "Workspace");
+    rail.setAttribute("data-maximized", "true");
+    const strip = document.createElement("div");
+    strip.className = "workspace-tab-strip";
+    rail.appendChild(strip);
+    shell.appendChild(rail);
+    document.body.appendChild(shell);
+    return strip;
+  }
+
+  it("has the clearance rule this test exists to protect", () => {
+    expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
+    expect(rule).toMatch(/padding-left:\s*10\.5rem/);
+  });
+
+  it("clears the lights on the mac shell while the sidebar is collapsed", () => {
+    const strip = makeStrip({ "data-electron-mac": "true" });
+    expect(strip.matches(selector)).toBe(true);
+    strip.closest(".app-shell")?.remove();
+  });
+
+  it("drops the clearance once the sidebar is reopened over the maximized rail", () => {
+    // The exact bug: sidebar open covers the window corner, so the 10.5rem
+    // padding has nothing to clear and would push the tabs into the middle.
+    const strip = makeStrip({ "data-electron-mac": "true", "data-sidebar-open": "true" });
+    expect(strip.matches(selector)).toBe(false);
+    strip.closest(".app-shell")?.remove();
+  });
+
+  it("never clears in a plain browser (no lights to avoid)", () => {
+    const strip = makeStrip({});
+    expect(strip.matches(selector)).toBe(false);
+    strip.closest(".app-shell")?.remove();
   });
 });
 

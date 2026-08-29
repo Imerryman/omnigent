@@ -3,12 +3,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
+import { BubbleView } from "./ChatPage";
 import {
-  BubbleView,
   ConnectionIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
-} from "./ChatPage";
+} from "./ChatIndicators";
 
 // Render-level coverage for the chat surface's status bands and bubble
 // dispatcher. These exercise the branches that the pure-helper tests can't:
@@ -358,7 +358,7 @@ describe("BubbleView dispatch", () => {
     // under an answered turn.
     render(<BubbleView bubble={foldOnlyBubble([toolItem("c4")])} />);
     const bubble = screen.getByTestId("message-bubble");
-    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,28vw,64rem)]");
+    expect(bubble).toHaveClass("max-w-3xl", "min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]");
     expect(bubble.firstElementChild).toHaveClass("w-full");
     expect(bubble.firstElementChild).not.toHaveClass("w-fit");
   });
