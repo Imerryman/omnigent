@@ -202,7 +202,7 @@ def subagent_settings_overlay() -> _JsonObject:
     """
     Build the qwen-code settings the sub-agent's system scope declares.
 
-    :returns: The four-knob trim described in the module docstring, shaped as
+    :returns: The six-knob trim described in the module docstring, shaped as
         qwen-code's settings schema.
     """
     return {

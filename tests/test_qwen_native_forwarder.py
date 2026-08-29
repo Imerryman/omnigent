@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -1224,12 +1225,12 @@ async def test_status_post_without_a_key_is_unchanged() -> None:
 # --- liveness probe fail-safety --------------------------------------------
 
 
-def test_tmux_probe_assumes_alive_when_target_unadvertised(tmp_path: Path) -> None:
-    """A false "dead" would wake the parent mid-turn, so uncertainty means alive."""
-    assert fwd._tmux_pane_is_alive(tmp_path) is True
+def test_tmux_probe_is_inconclusive_when_target_unadvertised(tmp_path: Path) -> None:
+    """No tmux.json is not evidence of death -- it is no verdict at all."""
+    assert fwd._tmux_pane_is_alive(tmp_path) is None
 
 
-def test_tmux_probe_assumes_alive_when_tmux_errors(
+def test_tmux_probe_is_inconclusive_when_tmux_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
@@ -1238,18 +1239,67 @@ def test_tmux_probe_assumes_alive_when_tmux_errors(
         raise OSError("tmux missing")
 
     monkeypatch.setattr(fwd.subprocess, "run", _boom)
-    assert fwd._tmux_pane_is_alive(tmp_path) is True
+    assert fwd._tmux_pane_is_alive(tmp_path) is None
 
 
-def test_tmux_probe_reports_dead_on_nonzero_exit(
+def test_tmux_probe_is_inconclusive_on_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
 
-    class _Proc:
-        returncode = 1
+    def _slow(*_a: object, **_k: object) -> object:
+        raise subprocess.TimeoutExpired(cmd="tmux", timeout=5.0)
 
-    monkeypatch.setattr(fwd.subprocess, "run", lambda *_a, **_k: _Proc())
+    monkeypatch.setattr(fwd.subprocess, "run", _slow)
+    assert fwd._tmux_pane_is_alive(tmp_path) is None
+
+
+def _fake_tmux(returncode: int, stdout: bytes):
+    class _Proc:
+        pass
+
+    _Proc.returncode = returncode
+    _Proc.stdout = stdout
+    return lambda *_a, **_k: _Proc()
+
+
+def test_tmux_probe_reports_dead_when_the_server_is_gone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default spec (no remain-on-exit): the process exit reaps the server."""
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+    monkeypatch.setattr(fwd.subprocess, "run", _fake_tmux(1, b""))
+    assert fwd._tmux_pane_is_alive(tmp_path) is False
+
+
+def test_tmux_probe_reports_dead_on_pane_dead_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """remain-on-exit: the session SURVIVES, so only ``#{pane_dead}`` is truth.
+
+    Verified live on this host: with ``keep_alive_after_exit=True`` a
+    ``has-session`` probe still returns rc=0 after the inner process exits,
+    while ``list-panes -F '#{pane_dead}'`` returns ``1``. A has-session probe
+    would report a dead pane as alive forever and the fallback would never fire.
+    """
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+    monkeypatch.setattr(fwd.subprocess, "run", _fake_tmux(0, b"1\n"))
+    assert fwd._tmux_pane_is_alive(tmp_path) is False
+
+
+def test_tmux_probe_reports_alive_on_live_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+    monkeypatch.setattr(fwd.subprocess, "run", _fake_tmux(0, b"0\n"))
+    assert fwd._tmux_pane_is_alive(tmp_path) is True
+
+
+def test_tmux_probe_reports_dead_when_no_panes_listed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    write_tmux_target(tmp_path, socket_path=tmp_path / "sock", tmux_target="s:0.0")
+    monkeypatch.setattr(fwd.subprocess, "run", _fake_tmux(0, b"\n"))
     assert fwd._tmux_pane_is_alive(tmp_path) is False
 
 
@@ -1278,3 +1328,625 @@ def test_forward_state_from_a_pre_patch_file_reads_cold_defaults(tmp_path: Path)
     assert state.pending_window_id is None
     assert state.pending_stop_reason is None
     assert state.turn_open is False
+
+
+# --------------------------------------------------------------------------
+# Second review round: final-drain gap, state-write churn, and the remaining
+# non-blocking items.
+# --------------------------------------------------------------------------
+
+
+# --- BLOCKING A: complete-but-unterminated final record --------------------
+
+
+def test_unterminated_final_record_is_left_alone_on_a_normal_poll(tmp_path: Path) -> None:
+    """Normal polls keep the old discipline: never classify on a partial tail."""
+    events = _fixture_events("tool_loop_session.ndjson")
+    f = tmp_path / "events.ndjson"
+    body = b"".join(_ev_bytes(e) for e in events[:-1])
+    f.write_bytes(body + json.dumps(events[-1]).encode())  # no trailing newline
+
+    result = _poll(f)  # final_drain defaults to False
+    assert result.wakes == [], "the unterminated stop must not be consumed yet"
+    assert result.offset == len(body)
+
+
+def test_final_drain_consumes_a_complete_unterminated_record(tmp_path: Path) -> None:
+    """BLOCKING A. Once the pane is dead nothing will ever append the newline,
+    so a COMPLETE final record must still be read -- otherwise a real turn-end
+    ``message_stop`` is discarded and the fallback posts ``failed`` instead of
+    ``idle``.
+    """
+    f = _FIXTURES / "tool_loop_unterminated_stop.ndjson"
+    assert not f.read_bytes().endswith(b"\n"), "fixture must lack the terminator"
+
+    without = _read_new_events_raw(f, 0, set(), _AGENT, _ForwardState(), False)
+    assert without.wakes == [], "precondition: the newline-gated read misses it"
+    assert without.turn_open is True
+
+    drained = _read_new_events_raw(f, 0, set(), _AGENT, _ForwardState(), True)
+    assert [w.status for w in drained.wakes] == [_STATUS_IDLE]
+    assert drained.turn_open is False
+    assert drained.offset == f.stat().st_size, "the whole file is consumed"
+
+
+def test_final_drain_leaves_a_genuinely_truncated_record(tmp_path: Path) -> None:
+    """A record cut mid-write is NOT complete: leave it, stay turn_open."""
+    events = _fixture_events("tool_loop_session.ndjson")
+    f = tmp_path / "events.ndjson"
+    body = b"".join(_ev_bytes(e) for e in events[:-1])
+    truncated = json.dumps(events[-1]).encode()[:40]  # sliced mid-object
+    f.write_bytes(body + truncated)
+
+    drained = _read_new_events_raw(f, 0, set(), _AGENT, _ForwardState(), True)
+    assert drained.wakes == []
+    assert drained.turn_open is True
+    assert drained.offset == len(body), "the malformed tail is retained"
+
+
+def test_is_complete_json_object() -> None:
+    assert fwd._is_complete_json_object(b'{"a": 1}') is True
+    assert fwd._is_complete_json_object(b'{"a": 1') is False
+    assert fwd._is_complete_json_object(b"[1, 2]") is False  # not an object
+    assert fwd._is_complete_json_object(b"\xff\xfe") is False
+
+
+async def test_process_exit_with_unterminated_stop_posts_idle_not_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKING A, end to end: exactly one ``idle``, zero ``failed``."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        (_FIXTURES / "tool_loop_unterminated_stop.ndjson").read_bytes()
+    )
+
+    statuses: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: False,
+        )
+    )
+    for _ in range(300):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.15)  # let more polls run
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_IDLE]
+    assert _STATUS_FAILED not in statuses
+
+
+# --- BLOCKING B: no state write when nothing changed -----------------------
+
+
+async def test_idle_polls_perform_zero_state_writes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """BLOCKING B. The loop runs every poll_interval_s for the life of the
+    session; an unconditional _write_state was ~216k temp-file write+renames a
+    day per idle session.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    writes: list[int] = []
+    real_write = fwd._write_state
+
+    def _counting_write(bd: Path, st: object) -> bool:
+        writes.append(st.offset)  # type: ignore[attr-defined]
+        return real_write(bd, st)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fwd, "_write_state", _counting_write)
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: True,
+        )
+    )
+    for _ in range(300):
+        if writes:
+            break
+        await asyncio.sleep(0.01)
+    writes_after_first_change = len(writes)
+    await asyncio.sleep(0.3)  # ~30 further polls with nothing new
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert writes_after_first_change == 1, "the real change is persisted once"
+    assert len(writes) == 1, f"idle polls must not write state; got {len(writes)}"
+
+
+async def test_state_is_written_again_when_new_events_arrive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The suppression must not stop a genuine change from being persisted."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    f = events_file_path(bridge)
+    f.write_bytes(_ev_bytes(_user_ev("u1", "one")))
+
+    writes: list[int] = []
+    real_write = fwd._write_state
+
+    def _counting_write(bd: Path, st: object) -> bool:
+        writes.append(st.offset)  # type: ignore[attr-defined]
+        return real_write(bd, st)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fwd, "_write_state", _counting_write)
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: True,
+        )
+    )
+    for _ in range(200):
+        if writes:
+            break
+        await asyncio.sleep(0.01)
+    with open(f, "ab") as fh:
+        fh.write(_ev_bytes(_user_ev("u2", "two")))
+    for _ in range(200):
+        if len(writes) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert len(writes) == 2, "one write per real change"
+    assert writes[1] > writes[0]
+
+
+# --- C: inconclusive liveness must not delay the wake forever --------------
+
+
+async def test_indefinitely_inconclusive_probe_eventually_fires_the_terminal_edge(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unreachable tmux must not strand the parent. After the grace window
+    with a silent stream, the pane is treated as dead.
+    """
+    monkeypatch.setattr(fwd, "_LIVENESS_UNKNOWN_GRACE_S", 0.05)
+    monkeypatch.setattr(fwd, "_TMUX_PROBE_INTERVAL_S", 0.0)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    statuses: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: None,  # never a verdict
+        )
+    )
+    for _ in range(400):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_FAILED], "the grace expired, so the edge fired"
+
+
+async def test_inconclusive_probe_holds_alive_inside_the_grace_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Inside the grace window an inconclusive probe must NOT wake the parent."""
+    monkeypatch.setattr(fwd, "_LIVENESS_UNKNOWN_GRACE_S", 3600.0)
+    monkeypatch.setattr(fwd, "_TMUX_PROBE_INTERVAL_S", 0.0)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    statuses: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: None,
+        )
+    )
+    await asyncio.sleep(0.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [], "no spurious wake while the verdict is merely unknown"
+
+
+async def test_grace_expires_even_though_the_probe_is_THROTTLED(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """C, regression. The two tests above pin the throttle to 0.0, so every poll
+    re-probes and the inconclusive verdict is refreshed continuously. In
+    PRODUCTION the probe is throttled to _TMUX_PROBE_INTERVAL_S (5s) while the
+    loop polls every poll_interval_s (0.4s), so ~12 of every 13 polls run no
+    probe at all. Those polls must leave the grace clock ALONE. An earlier cut
+    defaulted the verdict to True on them, which cleared `unknown_since` and
+    restarted the window before it could ever elapse -- an unreachable tmux then
+    held "alive" forever and the parent was never woken.
+
+    Here the throttle (0.05s) is deliberately SHORTER than the grace (0.25s), so
+    the run necessarily contains throttled polls, and the edge must still fire.
+    """
+    monkeypatch.setattr(fwd, "_LIVENESS_UNKNOWN_GRACE_S", 0.25)
+    monkeypatch.setattr(fwd, "_TMUX_PROBE_INTERVAL_S", 0.05)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    statuses: list[str] = []
+    probes = 0
+
+    def _never_a_verdict() -> bool | None:
+        nonlocal probes
+        probes += 1
+        return None
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.005,  # << the 0.05s throttle: most polls do not probe
+            terminal_is_alive=_never_a_verdict,
+        )
+    )
+    for _ in range(400):
+        if statuses:
+            break
+        await asyncio.sleep(0.01)
+    polls_ran = probes
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert statuses == [_STATUS_FAILED], "the grace must elapse across throttled polls"
+    # Sanity: the throttle really was in force, i.e. this is not the 0.0 case
+    # dressed up. ~0.25s of grace at a 0.05s throttle is a handful of probes,
+    # nowhere near the ~50 polls that elapsed.
+    assert probes <= 15, f"probe should have been throttled; ran {polls_ran} times"
+
+
+async def test_conclusive_alive_after_an_inconclusive_run_clears_the_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The clock is cleared by a CONCLUSIVE verdict, so a tmux that answers
+    again after a blip does not carry its earlier inconclusive time forward.
+    """
+    monkeypatch.setattr(fwd, "_LIVENESS_UNKNOWN_GRACE_S", 0.2)
+    monkeypatch.setattr(fwd, "_TMUX_PROBE_INTERVAL_S", 0.0)
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    statuses: list[str] = []
+    calls = 0
+
+    def _blip_then_alive() -> bool | None:
+        nonlocal calls
+        calls += 1
+        return None if calls <= 3 else True  # brief blip, then tmux answers
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(_c: object, *, session_id: str, status: str, **_kw: object) -> None:
+        statuses.append(status)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.005,
+            terminal_is_alive=_blip_then_alive,
+        )
+    )
+    await asyncio.sleep(0.5)  # well past the 0.2s grace
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert calls > 3, "the probe kept running"
+    assert statuses == [], "a recovered probe must not inherit the blip's elapsed time"
+
+
+# --- D: `result` gated on turn_open ----------------------------------------
+
+
+def test_message_stop_then_result_yields_one_wake(tmp_path: Path) -> None:
+    """D. A trailing ``result`` after a turn-end ``message_stop`` must not
+    double-wake -- the same gate ``session_end`` already had.
+    """
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _msg_start("s1", "m1"),
+            _asst_stop("m1", None),
+            _msg_stop("t1"),
+            {"type": "result", "uuid": "r1", "parent_tool_use_id": None, "subtype": "success"},
+        ],
+    )
+    result = _poll(f)
+    assert [w.uuid for w in result.wakes] == ["t1"], "one wake, from the message_stop"
+
+
+# --- E: the live seen mapping is bounded -----------------------------------
+
+
+def test_live_seen_mapping_evicts_beyond_the_dedup_window() -> None:
+    """E. _write_state capped only what it SERIALISED; the live mapping grew
+    for the lifetime of the process and was copied with list(seen) every poll.
+    """
+    seen = _new_seen()
+    for i in range(_DEDUP_WINDOW * 3):
+        fwd._remember_seen(seen, f"item-{i}")
+        assert len(seen) <= _DEDUP_WINDOW
+    assert len(seen) == _DEDUP_WINDOW
+    # Oldest evicted, newest retained.
+    assert "item-0" not in seen
+    assert f"item-{_DEDUP_WINDOW * 3 - 1}" in seen
+
+
+def test_new_seen_caps_an_oversized_seed() -> None:
+    seen = _new_seen([f"u{i}" for i in range(_DEDUP_WINDOW * 2)])
+    assert len(seen) == _DEDUP_WINDOW
+    assert f"u{_DEDUP_WINDOW * 2 - 1}" in seen
+    assert "u0" not in seen
+
+
+async def test_forward_loop_keeps_seen_bounded_over_many_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bound holds through the real loop, not just the helper."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    n = _DEDUP_WINDOW + 200
+    events_file_path(bridge).write_bytes(
+        b"".join(_ev_bytes(_user_ev(f"u{i}", f"m{i}")) for i in range(n))
+    )
+
+    posted: list[str] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        posted.append(item.item_uuid)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: True,
+        )
+    )
+    for _ in range(600):
+        if len(posted) >= n:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert len(posted) == n
+    assert len(_read_state(bridge).seen_uuids or []) <= _DEDUP_WINDOW
+
+
+# --- F: the process-exit edge carries a deterministic key ------------------
+
+
+async def test_process_exit_terminal_carries_a_deterministic_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """F. The normal terminals already send one; so must the fallback."""
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(
+        b"".join(_ev_bytes(e) for e in [_msg_start("s1", "m1"), _asst_stop("m1", "tool_use")])
+    )
+
+    keys: list[object] = []
+
+    async def _fake_item(_c: object, *, session_id: str, item: object) -> None:
+        return None
+
+    async def _fake_status(
+        _c: object, *, session_id: str, status: str, idempotency_key: object = None
+    ) -> None:
+        keys.append(idempotency_key)
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
+    monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.01,
+            terminal_is_alive=lambda: False,
+        )
+    )
+    for _ in range(300):
+        if keys:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        _ = await task
+
+    assert keys == ["process-exit:m1"], "keyed on the turn window it terminates"
+
+
+# --- G: the legacy bare-uuid fallback is narrowed to solo items ------------
+
+
+def test_legacy_bare_uuid_closes_a_single_item_event() -> None:
+    """A pre-patch build only marked the event uuid AFTER a successful POST, so
+    for a one-item event that uuid does prove delivery.
+    """
+    items = _event_to_items(_asst_ev("a1", [{"type": "text", "text": "hi"}]), _AGENT)
+    assert len(items) == 1
+    assert _item_already_seen(items[0], {"a1"}, solo=True) is True
+
+
+def test_legacy_bare_uuid_does_not_close_a_MULTI_item_event() -> None:
+    """G. The pre-patch build marked the event uuid after the FIRST item, so a
+    bare uuid does NOT prove the later items were ever delivered. Honouring it
+    would permanently suppress an item that never reached the server.
+    """
+    items = _event_to_items(
+        _asst_ev(
+            "a1",
+            [
+                {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
+                {"type": "text", "text": "prose"},
+            ],
+        ),
+        _AGENT,
+    )
+    assert len(items) == 2
+    for item in items:
+        assert _item_already_seen(item, {"a1"}, solo=False) is False
+    # The per-item ids still suppress correctly.
+    assert _item_already_seen(items[0], {"a1#0"}, solo=False) is True
+    assert _item_already_seen(items[1], {"a1#0"}, solo=False) is False
+
+
+def test_legacy_state_replays_a_multi_item_event_rather_than_dropping_it(
+    tmp_path: Path,
+) -> None:
+    """End to end through the reader: legacy state must not silently swallow
+    the undelivered items of a multi-item event.
+    """
+    f = tmp_path / "events.ndjson"
+    _write_events(
+        f,
+        [
+            _asst_ev(
+                "a1",
+                [
+                    {"type": "tool_use", "id": "c1", "name": "read", "input": {}},
+                    {"type": "text", "text": "prose that was never delivered"},
+                ],
+            )
+        ],
+    )
+    legacy_seen = _new_seen(["a1"])  # written by the pre-patch build
+    result = _poll(f, 0, legacy_seen, _AGENT, _ForwardState())
+    assert [i.item_uuid for i in result.items] == ["a1#0", "a1#1"]
+    assert any("never delivered" in str(i.item_data) for i in result.items)
+
+
+def test_legacy_state_still_suppresses_a_solo_event(tmp_path: Path) -> None:
+    f = tmp_path / "events.ndjson"
+    _write_events(f, [_user_ev("u1", "already mirrored")])
+    result = _poll(f, 0, _new_seen(["u1"]), _AGENT, _ForwardState())
+    assert result.items == [], "a one-item event is genuinely closed by its uuid"
