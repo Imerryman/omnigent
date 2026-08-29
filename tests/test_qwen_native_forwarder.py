@@ -34,17 +34,43 @@ from omnigent.qwen_native_bridge import (
 from omnigent.qwen_native_forwarder import (
     _DEDUP_WINDOW,
     _compaction_status_from_record,
-    _event_to_item,
+    _event_to_items,
     _ForwardState,
     _new_seen,
     _read_new_compaction_statuses,
-    _read_new_events,
     _read_state,
     _write_state,
     clear_qwen_bridge_state,
 )
+from omnigent.qwen_native_forwarder import (
+    _read_new_events as _read_new_events_raw,
+)
 
 _AGENT = "qwen-native-ui"
+
+
+def _event_to_item(event: dict, agent_name: str) -> fwd._MirrorItem | None:
+    """Single-item view of :func:`_event_to_items` for the prose-only cases below.
+
+    ``_event_to_items`` returns a list because one event can now also yield
+    ``function_call`` / ``function_call_output`` items; every event these tests
+    feed it is prose-only, so it collapses to at most one item.
+    """
+    items = _event_to_items(event, agent_name)
+    assert len(items) <= 1, items
+    return items[0] if items else None
+
+
+def _read_new_events(f: Path, offset: int, seen, agent_name: str) -> tuple[list, int]:
+    """``(items, new_offset)`` view of the 4-tuple ``_read_new_events`` returns.
+
+    The turn-end uuids and threaded ``last_stop_reason`` are the parent-wake
+    plumbing; the tests below assert only on mirrored items and the offset.
+    """
+    items, _turn_end_uuids, new_offset, _last_stop_reason = _read_new_events_raw(
+        f, offset, seen, agent_name
+    )
+    return items, new_offset
 
 
 def _user_ev(uuid: str, text: str) -> dict:

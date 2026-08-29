@@ -184,73 +184,185 @@ def _text_from_content(content: object) -> str:
     return "".join(parts).strip()
 
 
-def _event_to_item(event: dict[str, object], agent_name: str) -> _MirrorItem | None:
-    """Convert one qwen stream-json event to a mirror item, or ``None`` to skip it."""
+def _tool_result_output(block: dict[str, object]) -> str:
+    """Return the UI-facing output string for a ``tool_result`` block.
+
+    Mirrors :func:`omnigent.claude_native_bridge._tool_result_output` minus the
+    Claude-transcript ``toolUseResult`` fallback qwen's stream does not carry:
+    ``str`` content passes through, other non-null content is compact-JSON
+    encoded, and missing content becomes ``""``.
+    """
+    # LOCAL PATCH #5: mirror tool_use/tool_result as function_call/function_call_output
+    content = block.get("content")
+    if isinstance(content, str):
+        return content
+    if content is not None:
+        return json.dumps(content, separators=(",", ":"))
+    return ""
+
+
+def _event_to_items(event: dict[str, object], agent_name: str) -> list[_MirrorItem]:
+    """Convert one qwen stream-json event to mirror items (empty list to skip it).
+
+    A ``user`` event yields one ``function_call_output`` item per ``tool_result``
+    block, then the prose ``message`` item (if any text). An ``assistant`` event
+    yields one ``function_call`` item per ``tool_use`` block, then the prose
+    ``message`` item. All items from one event share that event's uuid and
+    ``response_id``, so the existing per-uuid dedupe skips a whole already-seen
+    event exactly as the old single-item form did. The ``function_call`` /
+    ``function_call_output`` item shapes match claude-/hermes-native. Ordering
+    invariant: tool items precede prose within an event, and stream order puts
+    the assistant ``tool_use`` event before the user ``tool_result`` event, so a
+    ``function_call`` always posts before its ``function_call_output``.
+    """
+    # LOCAL PATCH #5: mirror tool_use/tool_result as function_call/function_call_output
     etype = event.get("type")
     if etype not in ("user", "assistant"):
         # control_request / control_response (the permission control plane) carry
         # no transcript prose; the tool-approval mirror
         # (omnigent.qwen_native_permissions) owns them off the same stream.
-        return None
+        return []
     uuid = event.get("uuid")
     if not isinstance(uuid, str) or not uuid:
-        return None
+        return []
     message = event.get("message")
     if not isinstance(message, dict):
-        return None
-    text = _ATTACHMENT_MARKER_RE.sub("", _text_from_content(message.get("content"))).strip()
-    if not text:
-        return None  # tool-only / thinking-only turn with no prose
+        return []
     response_id = f"qwen:{uuid}"
+    content = message.get("content")
+    blocks = [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
+    items: list[_MirrorItem] = []
     if etype == "user":
-        return _MirrorItem(
+        for block in blocks:
+            if block.get("type") != "tool_result":
+                continue
+            call_id = block.get("tool_use_id")
+            if not isinstance(call_id, str) or not call_id:
+                continue
+            items.append(
+                _MirrorItem(
+                    uuid=uuid,
+                    item_type="function_call_output",
+                    item_data={"call_id": call_id, "output": _tool_result_output(block)},
+                    response_id=response_id,
+                )
+            )
+    else:
+        for block in blocks:
+            if block.get("type") != "tool_use":
+                continue
+            tool_id = block.get("id")
+            name = block.get("name")
+            if not isinstance(tool_id, str) or not tool_id:
+                continue
+            if not isinstance(name, str) or not name:
+                continue
+            arguments = block.get("input")
+            if not isinstance(arguments, dict):
+                arguments = {}
+            items.append(
+                _MirrorItem(
+                    uuid=uuid,
+                    item_type="function_call",
+                    item_data={
+                        "agent": agent_name,
+                        "name": name,
+                        "arguments": json.dumps(arguments, separators=(",", ":")),
+                        "call_id": tool_id,
+                    },
+                    response_id=response_id,
+                )
+            )
+    text = _ATTACHMENT_MARKER_RE.sub("", _text_from_content(content)).strip()
+    if not text:
+        return items  # tool-only / thinking-only step with no prose
+    if etype == "user":
+        items.append(
+            _MirrorItem(
+                uuid=uuid,
+                item_type="message",
+                item_data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+                response_id=response_id,
+            )
+        )
+        return items
+    items.append(
+        _MirrorItem(
             uuid=uuid,
             item_type="message",
-            item_data={"role": "user", "content": [{"type": "input_text", "text": text}]},
+            item_data={
+                "role": "assistant",
+                "agent": agent_name,
+                "content": [{"type": "output_text", "text": text}],
+            },
             response_id=response_id,
         )
-    return _MirrorItem(
-        uuid=uuid,
-        item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": agent_name,
-            "content": [{"type": "output_text", "text": text}],
-        },
-        response_id=response_id,
     )
+    return items
+
+
+def _turn_end_uuid(event: dict[str, object]) -> str | None:
+    """Return the envelope uuid of a top-level ``message_stop`` event, else ``None``.
+
+    A turn-end candidate is a ``stream_event`` whose nested ``event`` has
+    ``type=="message_stop"`` and whose ``parent_tool_use_id`` is null — the
+    ``parent_tool_use_id is None`` guard excludes any nested sub-tool turn-end.
+    """
+    # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
+    if event.get("type") != "stream_event":
+        return None
+    if event.get("parent_tool_use_id") is not None:
+        return None
+    inner = event.get("event")
+    if not isinstance(inner, dict) or inner.get("type") != "message_stop":
+        return None
+    uuid = event.get("uuid")
+    if isinstance(uuid, str) and uuid:
+        return uuid
+    return None
 
 
 def _read_new_events(
-    events_file: Path, offset: int, seen: Container[str], agent_name: str
-) -> tuple[list[_MirrorItem], int]:
-    """Read NDJSON lines past *offset*, returning new mirror items + the new offset.
+    events_file: Path,
+    offset: int,
+    seen: Container[str],
+    agent_name: str,
+    last_stop_reason: str | None = None,
+) -> tuple[list[_MirrorItem], list[str], int, str | None]:
+    """Read NDJSON lines past *offset*, returning new mirror items, turn-end
+    uuids, the new offset, and the threaded ``last_stop_reason``.
 
     Detects a truncated/recreated event file (``size < offset``) and rewinds to 0.
     Only fully terminated lines (ending in ``\\n``) are consumed; a trailing
     partial line is left for the next poll by not advancing past it.
     """
+    # LOCAL PATCH #4: `last_stop_reason` (param + 4th return element) threads the
+    # most recent consolidated assistant `message.stop_reason` across poll
+    # batches, so a tool_use step whose message_stop lands in a LATER batch is
+    # still recognised as intermediate (cross-poll carry).
     try:
         size = events_file.stat().st_size
     except OSError:
-        return [], offset
+        return [], [], offset, last_stop_reason
     if size < offset:
         offset = 0  # file truncated by a relaunched terminal
     if size == offset:
-        return [], offset
+        return [], [], offset, last_stop_reason
     try:
         with open(events_file, "rb") as fh:
             fh.seek(offset)
             data = fh.read(size - offset)
     except OSError:
-        return [], offset
+        return [], [], offset, last_stop_reason
     # Only consume up to the last newline; keep any trailing partial line.
     last_nl = data.rfind(b"\n")
     if last_nl == -1:
-        return [], offset  # no complete line yet
+        return [], [], offset, last_stop_reason  # no complete line yet
     consumed = data[: last_nl + 1]
     new_offset = offset + len(consumed)
     items: list[_MirrorItem] = []
+    # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
+    turn_end_uuids: list[str] = []
     for raw in consumed.split(b"\n"):
         raw = raw.strip()
         if not raw:
@@ -261,10 +373,26 @@ def _read_new_events(
             continue  # tolerate a malformed line rather than stalling the tail
         if not isinstance(event, dict):
             continue
-        item = _event_to_item(event, agent_name)
-        if item is not None and item.uuid not in seen:
-            items.append(item)
-    return items, new_offset
+        # LOCAL PATCH #4: record each consolidated assistant event's stop_reason.
+        # A message_stop only closes a user-facing turn when the assistant message
+        # it closes did NOT stop for tool_use (mid-loop, auto-continuing).
+        if event.get("type") == "assistant":
+            message = event.get("message")
+            if isinstance(message, dict):
+                stop_reason = message.get("stop_reason")
+                last_stop_reason = stop_reason if isinstance(stop_reason, str) else None
+        te_uuid = _turn_end_uuid(event)
+        if te_uuid is not None and te_uuid not in seen:
+            # LOCAL PATCH #4: skip a tool_use-step message_stop (not a turn-end).
+            if last_stop_reason != "tool_use":
+                turn_end_uuids.append(te_uuid)
+        # LOCAL PATCH #5: one event can now yield several items (tool items then
+        # prose); all share the event uuid, so dedupe-by-uuid skips whole events.
+        for item in _event_to_items(event, agent_name):
+            if item.uuid not in seen:
+                items.append(item)
+    # LOCAL PATCH #4: return last_stop_reason so the caller threads it across polls.
+    return items, turn_end_uuids, new_offset, last_stop_reason
 
 
 async def _post_conversation_item(
@@ -281,6 +409,29 @@ async def _post_conversation_item(
                 "response_id": item.response_id,
             },
         },
+    )
+    resp.raise_for_status()
+
+
+async def _post_external_session_status(
+    client: httpx.AsyncClient, *, session_id: str, status: str
+) -> None:
+    """POST one ``external_session_status`` event to the Sessions API.
+
+    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
+    completion that wakes the parent orchestrator's inbox — the SAME contract
+    claude-/codex-/cursor-/hermes-native use (see their
+    ``_post_external_session_status`` / ``_post_status``). The runner's
+    PTY-activity watcher edge is a UI signal only and never wakes a parent,
+    which is why this explicit post off the stream's ``message_stop`` turn-end
+    marker is required.
+
+    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+    """
+    # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": {"status": status}},
     )
     resp.raise_for_status()
 
@@ -317,19 +468,32 @@ async def forward_qwen_events_to_session(
     persisted = _read_state(bridge_dir)
     offset = persisted.offset
     seen = _new_seen(persisted.seen_uuids)
+    # LOCAL PATCH #4: cross-poll carry of the last consolidated assistant
+    # stop_reason (a tool_use step and its message_stop can land in different
+    # poll batches).
+    last_stop_reason: str | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
-                items, new_offset = await asyncio.to_thread(
-                    _read_new_events, target, offset, seen, agent_name
+                # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
+                items, turn_end_uuids, new_offset, last_stop_reason = await asyncio.to_thread(
+                    _read_new_events, target, offset, seen, agent_name, last_stop_reason
                 )
                 for item in items:
                     await _post_conversation_item(client, session_id=session_id, item=item)
                     seen[item.uuid] = None
-                if new_offset != offset or items:
+                # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
+                # Post the parent-waking idle edge AFTER the batch's mirrored
+                # items, so the reply content is in the store before the wake.
+                for te_uuid in turn_end_uuids:
+                    await _post_external_session_status(
+                        client, session_id=session_id, status="idle"
+                    )
+                    seen[te_uuid] = None
+                if new_offset != offset or items or turn_end_uuids:
                     offset = new_offset
                     _write_state(
                         bridge_dir,
