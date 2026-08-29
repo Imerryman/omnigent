@@ -26,6 +26,20 @@ Four knobs cut it (see :func:`subagent_settings_overlay`):
 - ``tools.disabled`` — :data:`QWEN_SUBAGENT_DISABLED_TOOLS`, so orchestration
   tools are never *registered* (unlike ``permissions.deny``, which only blocks
   the call), and ``tool_search`` cannot surface them either.
+- ``skills.disabledLevels`` — every discovery level, dropping qwen's bundled
+  skills catalogue (measured −1,034 tokens). The implementer is handed its
+  assignment by the orchestrator; it does not go shopping for skills.
+- ``mcp.excluded: ["*"]`` — no MCP server is connected, dropping the deferred
+  MCP tool summary (measured −291 tokens). A deliberate trade: a qwen sub-agent
+  cannot reach MCP tools (e.g. a web-search server). Correct for an implementer
+  profile; if qwen is ever wanted as a research/explorer role this is the first
+  knob to reconsider.
+
+``tool_search`` is deliberately NOT disabled. It looks like 344 tokens of dead
+weight once nothing else is deferred, but removing it measured **+666 tokens**
+(10,674 → 11,340, reproduced three times): with no discovery path left, qwen
+stops deferring and pays for the reminder up front. Keeping it is the cheaper
+arm.
 
 Delivery: an EPHEMERAL per-session file, never the workspace
 ---------------------------------------------------------
@@ -65,6 +79,7 @@ import json
 import os
 import re
 import secrets
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from omnigent.json_types import JsonObject as _JsonObject
@@ -142,6 +157,44 @@ QWEN_SUBAGENT_DISABLED_TOOLS: tuple[str, ...] = (
     "update_goal",
 )
 
+#: Every skill-discovery level qwen supports, so none is scanned and the bundled
+#: catalogue never reaches the prompt. Merged as a union across scopes, so this
+#: is additive to whatever a user or operator already suppressed.
+QWEN_SUBAGENT_DISABLED_SKILL_LEVELS: tuple[str, ...] = (
+    "project",
+    "user",
+    "extension",
+    "bundled",
+)
+
+#: Appended to qwen's built-in system prompt on a sub-agent launch, via
+#: ``--append-system-prompt``. qwen assembles the prompt as
+#: base -> context files (``QWEN.md``) -> this -> git status, so an append lands
+#: after every other instruction layer and wins on recency.
+#:
+#: It exists to correct two headless-base-prompt prescriptions that misfire for
+#: an orchestrator-dispatched implementer. qwen's "Executing actions with care"
+#: section withholds shared-state actions (push, PR comments) "unless authorized
+#: in advance in durable instructions like QWEN.md files" — an Omnigent dispatch
+#: IS that durable authorization, but qwen cannot know it, so it would report a
+#: premature blocker instead of doing the work. And its "Preserve Existing Work"
+#: guidance says to stop and clarify on conflicting changes, which in a
+#: single-turn headless run means aborting with no channel to clarify on.
+#:
+#: Scoped narrowly on purpose: it pre-authorizes only the actions a dispatch
+#: names, on this worktree's branch. qwen's base prompt — including the
+#: never-ask-a-question headless guardrail and its destructive-action care — is
+#: kept in full; ``QWEN_SYSTEM_MD`` (whole-prompt replacement) is deliberately
+#: not used.
+QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND = (
+    "Operating as a scoped implementer dispatched by an orchestrator. Treat this "
+    "dispatch as durable pre-authorization for the actions it names, including git "
+    "operations on this worktree's branch; do not withhold them pending confirmation. "
+    "Proceed on reasonable assumptions when the worktree contains unrelated but "
+    "non-conflicting changes rather than stopping to clarify. Do not delegate to "
+    "subagents; complete the task yourself."
+)
+
 
 def subagent_settings_overlay() -> _JsonObject:
     """
@@ -159,6 +212,9 @@ def subagent_settings_overlay() -> _JsonObject:
             "disabled": sorted(QWEN_SUBAGENT_DISABLED_TOOLS),
         },
         "memory": {"enableManagedAutoMemory": False},
+        "skills": {"disabledLevels": list(QWEN_SUBAGENT_DISABLED_SKILL_LEVELS)},
+        # Glob denylist; ``*`` excludes every configured server.
+        "mcp": {"excluded": ["*"]},
     }
 
 
@@ -167,18 +223,38 @@ def system_settings_path(settings_dir: Path | str) -> Path:
     return Path(settings_dir) / SYSTEM_SETTINGS_FILE
 
 
-def subagent_launch_env(settings_dir: Path | str) -> dict[str, str]:
+@dataclass(frozen=True)
+class QwenSubagentLaunch:
+    """Launch overrides that scope a qwen process to the implementer profile.
+
+    :param env: Environment additions for the sub-agent's process.
+    :param args: qwen CLI arguments to splice into the sub-agent's argv.
     """
-    Materialize the trim and return the env that points qwen at it.
+
+    env: dict[str, str] = field(default_factory=dict)
+    args: list[str] = field(default_factory=list)
+
+
+def subagent_launch_overrides(settings_dir: Path | str) -> QwenSubagentLaunch:
+    """
+    Materialize the trim and return everything a sub-agent launch needs.
+
+    The settings trim rides in a file (pointed at by env); the system-prompt
+    append has no settings key in qwen — only the ``--append-system-prompt``
+    flag — so it rides in argv. Both are per-process, so neither reaches the
+    interactive TUI or any other qwen on the box.
 
     :param settings_dir: Session-private directory to write the trim into (the
         qwen bridge dir in production) — never the launch cwd.
-    :returns: ``{QWEN_CODE_SYSTEM_SETTINGS_PATH: <path>}`` to merge into the
-        sub-agent terminal's environment.
+    :returns: Env and argv overrides for the sub-agent's qwen process.
     :raises OSError: If the trim cannot be written; the caller decides how to
         degrade (the launch should proceed untrimmed rather than fail).
     """
-    return {QWEN_SYSTEM_SETTINGS_ENV_VAR: str(write_subagent_system_settings(settings_dir))}
+    settings_path = write_subagent_system_settings(settings_dir)
+    return QwenSubagentLaunch(
+        env={QWEN_SYSTEM_SETTINGS_ENV_VAR: str(settings_path)},
+        args=["--append-system-prompt", QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND],
+    )
 
 
 def write_subagent_system_settings(settings_dir: Path | str) -> Path:
@@ -259,6 +335,13 @@ def _read_settings(path: Path) -> _JsonObject:
     return {}
 
 
+#: Settings list keys qwen merges as a union across scopes rather than
+#: replacing (``tools.disabled``, ``skills.disabledLevels``, ``mcp.excluded``).
+#: Mirrored here so re-applying the trim never drops an entry the file already
+#: had, and so the already-satisfied check reads them as supersets.
+_UNION_LIST_KEYS = frozenset({"disabled", "disabledLevels", "excluded"})
+
+
 def _satisfies(existing: _JsonObject, overlay: _JsonObject) -> bool:
     """
     Report whether *existing* already declares everything in *overlay*.
@@ -272,7 +355,7 @@ def _satisfies(existing: _JsonObject, overlay: _JsonObject) -> bool:
         if isinstance(value, dict):
             if not isinstance(current, dict) or not _satisfies(current, value):
                 return False
-        elif key == "disabled" and isinstance(value, list):
+        elif key in _UNION_LIST_KEYS and isinstance(value, list):
             if not isinstance(current, list) or not set(value) <= set(current):
                 return False
         elif current != value or type(current) is not type(value):
@@ -293,8 +376,9 @@ def _merge_settings(base: _JsonObject, overlay: _JsonObject) -> _JsonObject:
         existing = merged.get(key)
         if isinstance(value, dict) and isinstance(existing, dict):
             merged[key] = _merge_settings(existing, value)
-        elif key == "disabled" and isinstance(value, list) and isinstance(existing, list):
-            # Union, not replace: anything already hidden stays hidden.
+        elif key in _UNION_LIST_KEYS and isinstance(value, list) and isinstance(existing, list):
+            # Union, not replace: anything already hidden stays hidden. Mirrors
+            # how qwen itself merges these keys across settings scopes.
             merged[key] = sorted({str(name) for name in [*existing, *value]})
         else:
             merged[key] = value

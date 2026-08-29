@@ -34,6 +34,7 @@ if TYPE_CHECKING:
     from omnigent.opencode_native_app_server import OpenCodeNativeServer
     from omnigent.opencode_native_client import OpenCodeClient, OpenCodeSession
     from omnigent.opencode_native_forwarder import OpenCodeNativeForwarder
+    from omnigent.qwen_native_settings import QwenSubagentLaunch
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -3299,51 +3300,57 @@ async def _build_qwen_fork_recording(
     return qwen_session_id
 
 
-def _qwen_subagent_trim_env(
+def _qwen_subagent_launch_overrides(
     session_id: str,
     launch_config: _PiNativeLaunchConfig,
     bridge_dir: Path,
-) -> dict[str, str]:
+) -> QwenSubagentLaunch:
     """
-    Build the env that trims a qwen SUB-AGENT's tool surface, if this is one.
+    Build the env + argv that scope a qwen SUB-AGENT to the implementer profile.
 
     A qwen sub-agent — a ``qwen-native`` child session dispatched by an Omnigent
     orchestrator — otherwise boots with qwen's full built-in registry declared
-    upfront (67 tools, a ~47.7k-token turn-1 prefill before it does any work).
-    The trim is written into this session's bridge dir and handed over via
-    ``QWEN_CODE_SYSTEM_SETTINGS_PATH``, qwen's highest-precedence settings scope;
-    see :mod:`omnigent.qwen_native_settings`.
+    upfront (67 tools, a ~47.7k-token turn-1 prefill before it does any work) and
+    with base-prompt guidance written for a human-driven session. Two per-process
+    overrides fix that, both from :mod:`omnigent.qwen_native_settings`:
 
-    Nothing is written into the launch cwd, and the variable is set on this
-    terminal's process only. That is the point: a workspace
-    ``.qwen/settings.json`` is persistent project config, and a sub-agent with no
-    explicit workspace falls back to ``OMNIGENT_RUNNER_WORKSPACE`` — the user's
-    real checkout — so a file-based trim would leak into every later interactive
-    ``omnigent qwen`` run in that directory. The interactive TUI keeps the full
-    surface: a human at the terminal is the orchestrator there.
+    - the settings trim, written into this session's bridge dir and handed over
+      via ``QWEN_CODE_SYSTEM_SETTINGS_PATH`` (qwen's highest-precedence scope);
+    - ``--append-system-prompt``, which qwen assembles after every other
+      instruction layer, telling the implementer that its dispatch is the durable
+      authorization qwen's base prompt asks for.
+
+    Nothing is written into the launch cwd, and neither override leaves this
+    terminal's process. That is the point: a workspace ``.qwen/settings.json`` is
+    persistent project config, and a sub-agent with no explicit workspace falls
+    back to ``OMNIGENT_RUNNER_WORKSPACE`` — the user's real checkout — so a
+    file-based trim would leak into every later interactive ``omnigent qwen`` run
+    in that directory. The interactive TUI keeps qwen's full surface and
+    unmodified prompt: a human at the terminal is the orchestrator there.
 
     The gate is the session snapshot's ``parent_session_id`` (``kind ==
     "sub_agent"``), not the ``omnigent.ui`` label — the server stamps that on
     native sub-agents too, so it cannot tell the two apart.
 
-    Best-effort: a bridge dir that cannot be written costs the trim, not the
-    session, so the launch continues with the untrimmed surface.
+    Best-effort: a bridge dir that cannot be written costs the overrides, not the
+    session, so the launch continues with qwen's defaults.
 
     :param session_id: Session/conversation identifier, for the log lines.
     :param launch_config: Session snapshot config; read for the parent link.
     :param bridge_dir: This session's private bridge dir.
-    :returns: Env overrides for the qwen terminal; empty for a top-level session
-        or when the trim could not be materialized.
+    :returns: Env and argv overrides; empty for a top-level session or when the
+        trim could not be materialized.
     """
-    if launch_config.parent_session_id is None:
-        return {}
     from omnigent.qwen_native_settings import (
         QWEN_SYSTEM_SETTINGS_ENV_VAR,
-        subagent_launch_env,
+        QwenSubagentLaunch,
+        subagent_launch_overrides,
     )
 
+    if launch_config.parent_session_id is None:
+        return QwenSubagentLaunch()
     try:
-        env = subagent_launch_env(bridge_dir)
+        overrides = subagent_launch_overrides(bridge_dir)
     except OSError:
         _logger.warning(
             "qwen-native: could not materialize the sub-agent tool-surface trim in %s; "
@@ -3352,13 +3359,13 @@ def _qwen_subagent_trim_env(
             session_id,
             exc_info=True,
         )
-        return {}
+        return QwenSubagentLaunch()
     _logger.info(
-        "qwen-native: trimmed the sub-agent tool surface for %s via %s",
+        "qwen-native: scoped the sub-agent tool surface for %s via %s",
         session_id,
-        env[QWEN_SYSTEM_SETTINGS_ENV_VAR],
+        overrides.env[QWEN_SYSTEM_SETTINGS_ENV_VAR],
     )
-    return env
+    return overrides
 
 
 async def _auto_create_qwen_terminal(
@@ -3421,7 +3428,7 @@ async def _auto_create_qwen_terminal(
         server_client=server_client,
     )
     workspace = os.path.realpath(str(launch_config.workspace))
-    qwen_env = _qwen_subagent_trim_env(session_id, launch_config, bridge_dir)
+    subagent_overrides = _qwen_subagent_launch_overrides(session_id, launch_config, bridge_dir)
     qwen_command = resolve_qwen_executable()
     # Resume the qwen TUI's own history on re-launch (resume / runner restart) so
     # the embedded pane shows the prior conversation, not a blank prompt. Uses the
@@ -3519,6 +3526,9 @@ async def _auto_create_qwen_terminal(
         *(launch_config.terminal_launch_args or []),
         *resume_args,
         *mcp_args,
+        # Empty for a top-level (interactive) session — see
+        # ``_qwen_subagent_launch_overrides``.
+        *subagent_overrides.args,
         "--input-file",
         str(in_path),
         "--json-file",
@@ -3533,9 +3543,7 @@ async def _auto_create_qwen_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=qwen_command,
             args=qwen_args,
-            # Empty for a top-level (interactive) session — see
-            # ``_qwen_subagent_trim_env``.
-            env=qwen_env,
+            env=subagent_overrides.env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,

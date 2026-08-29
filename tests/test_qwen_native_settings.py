@@ -16,9 +16,11 @@ import pytest
 
 from omnigent.qwen_native_settings import (
     QWEN_SUBAGENT_CORE_TOOLS,
+    QWEN_SUBAGENT_DISABLED_SKILL_LEVELS,
     QWEN_SUBAGENT_DISABLED_TOOLS,
+    QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND,
     QWEN_SYSTEM_SETTINGS_ENV_VAR,
-    subagent_launch_env,
+    subagent_launch_overrides,
     subagent_settings_overlay,
     system_settings_path,
     write_subagent_system_settings,
@@ -46,6 +48,17 @@ def test_writes_the_four_trim_keys(tmp_path: Path) -> None:
     assert settings["tools"]["computerUse"]["enabled"] is False
     assert settings["memory"]["enableManagedAutoMemory"] is False
     assert settings["tools"]["disabled"] == sorted(QWEN_SUBAGENT_DISABLED_TOOLS)
+    # No skill level is scanned, so the bundled catalogue never reaches the
+    # prompt (-1,034 tokens measured on qwen v0.22.0).
+    assert settings["skills"]["disabledLevels"] == list(QWEN_SUBAGENT_DISABLED_SKILL_LEVELS)
+    assert set(settings["skills"]["disabledLevels"]) == {
+        "project",
+        "user",
+        "extension",
+        "bundled",
+    }
+    # No MCP server connects, dropping the deferred MCP tool summary (-291).
+    assert settings["mcp"]["excluded"] == ["*"]
 
 
 def test_disables_orchestration_tools_only(tmp_path: Path) -> None:
@@ -89,25 +102,51 @@ def test_overlay_is_a_fresh_object() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_launch_env_points_qwen_at_the_written_file(tmp_path: Path) -> None:
-    env = subagent_launch_env(tmp_path)
+def test_launch_overrides_point_qwen_at_the_written_file(tmp_path: Path) -> None:
+    overrides = subagent_launch_overrides(tmp_path)
 
-    assert env == {QWEN_SYSTEM_SETTINGS_ENV_VAR: str(system_settings_path(tmp_path))}
+    assert overrides.env == {QWEN_SYSTEM_SETTINGS_ENV_VAR: str(system_settings_path(tmp_path))}
     assert _written(tmp_path)["tools"]["toolSearch"]["threshold"] == 0
+
+
+def test_launch_overrides_append_the_implementer_prompt(tmp_path: Path) -> None:
+    """qwen exposes no settings key for this — only the CLI flag."""
+    overrides = subagent_launch_overrides(tmp_path)
+
+    assert overrides.args == ["--append-system-prompt", QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND]
+    # The two base-prompt prescriptions this exists to correct.
+    assert "durable pre-authorization" in QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND
+    assert "rather than stopping to clarify" in QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND
+    # It must not try to replace qwen's base prompt.
+    assert "--system-prompt" not in overrides.args
+
+
+def test_tool_search_is_kept(tmp_path: Path) -> None:
+    """Disabling it looks free and is not.
+
+    Measured on qwen v0.22.0 with skills + MCP already excluded: removing
+    ``tool_search`` moved the prefill from 10,674 to 11,340 tokens (+666,
+    reproduced three times). With no discovery path left qwen stops deferring
+    and pays for the reminder upfront, so keeping it is the cheaper arm.
+    """
+    write_subagent_system_settings(tmp_path)
+
+    assert "tool_search" not in _written(tmp_path)["tools"]["disabled"]
+    assert "tool_search" in QWEN_SUBAGENT_CORE_TOOLS
 
 
 def test_creates_the_settings_dir_when_absent(tmp_path: Path) -> None:
     """The bridge dir may not exist yet on a first launch."""
     settings_dir = tmp_path / "bridge" / "nested"
 
-    subagent_launch_env(settings_dir)
+    subagent_launch_overrides(settings_dir)
 
     assert system_settings_path(settings_dir).is_file()
 
 
 def test_accepts_a_string_settings_dir(tmp_path: Path) -> None:
     """The runner may hand over a ``str`` rather than a ``Path``."""
-    subagent_launch_env(str(tmp_path))
+    subagent_launch_overrides(str(tmp_path))
 
     assert _written(tmp_path)["tools"]["computerUse"]["enabled"] is False
 
@@ -118,7 +157,7 @@ def test_writes_nothing_outside_the_settings_dir(tmp_path: Path) -> None:
     workspace.mkdir()
     settings_dir = tmp_path / "bridge"
 
-    subagent_launch_env(settings_dir)
+    subagent_launch_overrides(settings_dir)
 
     assert list(workspace.iterdir()) == []
     assert [p.name for p in settings_dir.iterdir()] == ["qwen_system_settings.json"]
@@ -132,7 +171,7 @@ def test_raises_when_the_settings_dir_cannot_be_made(tmp_path: Path) -> None:
     occupied.write_text("", encoding="utf-8")
 
     with pytest.raises(OSError):
-        subagent_launch_env(occupied)
+        subagent_launch_overrides(occupied)
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +261,29 @@ def test_preserves_a_jsonc_file_with_comments(tmp_path: Path) -> None:
     assert settings["tools"]["toolSearch"]["threshold"] == 0
 
 
+def test_unions_the_new_list_keys_too(tmp_path: Path) -> None:
+    """``skills.disabledLevels`` and ``mcp.excluded`` merge as unions, like qwen's."""
+    path = system_settings_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "skills": {"disabledLevels": ["some-future-level"]},
+                "mcp": {"excluded": ["a-named-server"]},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    write_subagent_system_settings(tmp_path)
+
+    settings = _written(tmp_path)
+    assert "some-future-level" in settings["skills"]["disabledLevels"]
+    assert set(QWEN_SUBAGENT_DISABLED_SKILL_LEVELS) <= set(settings["skills"]["disabledLevels"])
+    assert "a-named-server" in settings["mcp"]["excluded"]
+    assert "*" in settings["mcp"]["excluded"]
+
+
 def test_a_double_slash_inside_a_string_is_not_a_comment(tmp_path: Path) -> None:
     """The JSONC strip must skip string literals, or URLs lose their tail."""
     path = system_settings_path(tmp_path)
@@ -272,6 +334,6 @@ def test_a_json_array_reads_as_empty_rather_than_crashing(tmp_path: Path) -> Non
 
 def test_leaves_no_temp_files_behind(tmp_path: Path) -> None:
     """The atomic write replaces in place rather than littering the dir."""
-    subagent_launch_env(tmp_path)
+    subagent_launch_overrides(tmp_path)
 
     assert [p.name for p in tmp_path.iterdir()] == ["qwen_system_settings.json"]
