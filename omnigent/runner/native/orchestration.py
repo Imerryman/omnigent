@@ -501,6 +501,14 @@ class _PiNativeLaunchConfig:
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
+    :param parent_session_id: Owning parent conversation id when this session
+        is a sub-agent child (``kind == "sub_agent"``), else ``None`` for a
+        top-level session. The snapshot's authoritative sub-agent
+        discriminator — the ``omnigent.ui`` / ``omnigent.wrapper``
+        presentation labels are stamped on native sub-agents too, so they
+        cannot tell the two apart. Consumed by the qwen-native launch to
+        decide whether to trim the sub-agent's tool surface; ignored by
+        pi-/cursor-native.
     """
 
     workspace: Path
@@ -512,6 +520,7 @@ class _PiNativeLaunchConfig:
     fork_carry_history: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
+    parent_session_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -921,6 +930,7 @@ async def _pi_native_launch_config(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
     reasoning_effort = snapshot.get("reasoning_effort")
+    parent_session_id = snapshot.get("parent_session_id") or None
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -933,6 +943,7 @@ async def _pi_native_launch_config(
         reasoning_effort=reasoning_effort
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
+        parent_session_id=parent_session_id if isinstance(parent_session_id, str) else None,
     )
 
 
@@ -3288,6 +3299,58 @@ async def _build_qwen_fork_recording(
     return qwen_session_id
 
 
+def _trim_qwen_subagent_tool_surface(
+    session_id: str,
+    launch_config: _PiNativeLaunchConfig,
+    workspace: str,
+) -> None:
+    """
+    Materialize the tool-surface trim for a qwen SUB-AGENT launch.
+
+    A qwen sub-agent — a ``qwen-native`` child session dispatched by an Omnigent
+    orchestrator, launched headless with ``cwd`` = its worktree — boots with the
+    full 63-tool built-in registry declared upfront (~35.5k prefill tokens before
+    it does any work, 72% of it tool schemas). Writing the workspace-scope
+    ``.qwen/settings.json`` cuts that to ~11.1k and takes qwen's orchestration
+    tools off the table, which belong to the parent session anyway. See
+    :mod:`omnigent.qwen_native_settings`.
+
+    Deliberately NOT applied to a top-level session: ``omnigent qwen`` is a human
+    driving the TUI, who is the orchestrator and keeps the whole surface. The
+    discriminator is the snapshot's ``parent_session_id`` (``kind ==
+    "sub_agent"``), not the ``omnigent.ui`` label — the server stamps that on
+    native sub-agents too.
+
+    Best-effort: a workspace that cannot be written (read-only mount, a
+    permissions surprise) costs the trim, not the session, so the launch
+    continues with the untrimmed surface rather than failing.
+
+    :param session_id: Session/conversation identifier, for the warning path.
+    :param launch_config: Session snapshot config; read for the parent link.
+    :param workspace: Realpath'd cwd the qwen process will launch in.
+    """
+    if launch_config.parent_session_id is None:
+        return
+    from omnigent.qwen_native_settings import write_subagent_workspace_settings
+
+    try:
+        settings_path = write_subagent_workspace_settings(Path(workspace))
+    except OSError:
+        _logger.warning(
+            "qwen-native: could not write the sub-agent tool-surface trim under %s; "
+            "session %s launches with qwen's full tool registry.",
+            workspace,
+            session_id,
+            exc_info=True,
+        )
+        return
+    _logger.info(
+        "qwen-native: trimmed the sub-agent tool surface for %s via %s",
+        session_id,
+        settings_path,
+    )
+
+
 async def _auto_create_qwen_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -3348,6 +3411,7 @@ async def _auto_create_qwen_terminal(
         server_client=server_client,
     )
     workspace = os.path.realpath(str(launch_config.workspace))
+    _trim_qwen_subagent_tool_surface(session_id, launch_config, workspace)
     qwen_command = resolve_qwen_executable()
     # Resume the qwen TUI's own history on re-launch (resume / runner restart) so
     # the embedded pane shows the prior conversation, not a blank prompt. Uses the

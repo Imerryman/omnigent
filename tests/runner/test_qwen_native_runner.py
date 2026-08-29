@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
 from omnigent import qwen_native_bridge as qnb
+from omnigent.qwen_native_settings import QWEN_SUBAGENT_DISABLED_TOOLS
 from omnigent.runner.app import _build_qwen_fork_recording, _persist_qwen_external_session_id
+from omnigent.runner.native.orchestration import (
+    _pi_native_launch_config,
+    _PiNativeLaunchConfig,
+    _trim_qwen_subagent_tool_surface,
+)
 
 
 class _RecordingClient:
@@ -146,3 +154,132 @@ async def test_build_qwen_fork_recording_does_not_clobber_existing(
     # Returns the id to resume, and the live recording is untouched.
     assert returned == qsid
     assert recording.read_text() == sentinel
+
+
+# ---------------------------------------------------------------------------
+# Sub-agent tool-surface trim (``_trim_qwen_subagent_tool_surface``)
+#
+# A qwen sub-agent boots with qwen-code's whole 63-tool registry declared
+# upfront; the runner materializes a workspace ``.qwen/settings.json`` at launch
+# to cut that to the implementer's coding tools. Gated to sub-agent sessions:
+# ``omnigent qwen`` (the interactive TUI, where the human is the orchestrator)
+# must keep the full surface.
+# ---------------------------------------------------------------------------
+
+
+def _qwen_launch_config(workspace: Path, *, parent_session_id: str | None) -> Any:
+    """Build the snapshot-derived launch config the qwen launch path reads."""
+    return _PiNativeLaunchConfig(
+        workspace=workspace,
+        server_url="http://localhost:6767",
+        terminal_launch_args=None,
+        external_session_id=None,
+        parent_session_id=parent_session_id,
+    )
+
+
+def _trim_settings(workspace: Path) -> dict:
+    return json.loads((workspace / ".qwen" / "settings.json").read_text(encoding="utf-8"))
+
+
+def test_subagent_launch_writes_the_trimmed_workspace_settings(tmp_path: Path) -> None:
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+
+    _trim_qwen_subagent_tool_surface(
+        "conv_child",
+        _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+        str(workspace),
+    )
+
+    settings = _trim_settings(workspace)
+    assert settings["tools"]["toolSearch"]["threshold"] == 0
+    assert settings["tools"]["computerUse"]["enabled"] is False
+    assert settings["memory"]["enableManagedAutoMemory"] is False
+    assert set(QWEN_SUBAGENT_DISABLED_TOOLS) <= set(settings["tools"]["disabled"])
+
+
+def test_interactive_launch_leaves_the_workspace_untouched(tmp_path: Path) -> None:
+    """No parent session → ``omnigent qwen``'s TUI, which keeps every tool."""
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    _trim_qwen_subagent_tool_surface(
+        "conv_top_level",
+        _qwen_launch_config(workspace, parent_session_id=None),
+        str(workspace),
+    )
+
+    assert list(workspace.iterdir()) == []
+
+
+def test_subagent_launch_merges_an_existing_workspace_settings_file(tmp_path: Path) -> None:
+    """A worktree carrying the user's own ``.qwen/settings.json`` keeps it."""
+    workspace = tmp_path / "worktree"
+    (workspace / ".qwen").mkdir(parents=True)
+    (workspace / ".qwen" / "settings.json").write_text(
+        json.dumps({"ui": {"theme": "Default"}, "tools": {"approvalMode": "yolo"}}),
+        encoding="utf-8",
+    )
+
+    _trim_qwen_subagent_tool_surface(
+        "conv_child",
+        _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+        str(workspace),
+    )
+
+    settings = _trim_settings(workspace)
+    assert settings["ui"] == {"theme": "Default"}
+    assert settings["tools"]["approvalMode"] == "yolo"
+    assert settings["tools"]["toolSearch"]["threshold"] == 0
+
+
+def test_subagent_launch_survives_an_unwritable_workspace(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Losing the trim must not fail the launch — qwen still starts, untrimmed."""
+    workspace = tmp_path / "worktree"
+    workspace.mkdir()
+    (workspace / ".qwen").write_text("", encoding="utf-8")
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.runner.native.orchestration"):
+        _trim_qwen_subagent_tool_surface(
+            "conv_child",
+            _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+            str(workspace),
+        )
+
+    assert "full tool registry" in caplog.text
+
+
+async def test_launch_config_reads_parent_session_id_from_the_snapshot() -> None:
+    """The sub-agent discriminator comes off ``GET /v1/sessions/{id}``."""
+
+    class _Snapshot:
+        def __init__(self, payload: dict) -> None:
+            self.status_code = 200
+            self._payload = payload
+
+        def json(self) -> dict:
+            return self._payload
+
+    class _Client:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        async def get(self, url: str, timeout: float | None = None) -> _Snapshot:
+            del url, timeout
+            return _Snapshot(self._payload)
+
+    child = await _pi_native_launch_config(
+        session_id="conv_child",
+        server_client=_Client({"workspace": "/ws", "parent_session_id": "conv_parent"}),  # type: ignore[arg-type]
+    )
+    assert child.parent_session_id == "conv_parent"
+
+    # Top-level sessions report it absent (or null); both read as "not a child".
+    top = await _pi_native_launch_config(
+        session_id="conv_top",
+        server_client=_Client({"workspace": "/ws"}),  # type: ignore[arg-type]
+    )
+    assert top.parent_session_id is None
