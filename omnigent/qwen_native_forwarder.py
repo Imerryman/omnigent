@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
+import itertools
 import json
 import logging
 import os
@@ -70,10 +71,17 @@ _DEFAULT_POLL_INTERVAL_S = 0.4
 _POST_TIMEOUT_S = 30.0
 # Liveness probe budget; a hung tmux answers "assume alive" rather than blocking.
 _TMUX_PROBE_TIMEOUT_S = 5.0
-# Minimum gap between liveness probes. The probe spawns a `tmux has-session`
+# Minimum gap between liveness probes. The probe spawns a `tmux list-panes`
 # subprocess, so it must not ride the sub-second poll cadence; this bounds the
 # fallback wake latency after a process death to roughly this interval.
 _TMUX_PROBE_INTERVAL_S = 5.0
+# How long an INCONCLUSIVE liveness verdict (no tmux.json, tmux missing, probe
+# timeout) may persist alongside a silent event stream before the pane is
+# treated as dead. Deliberately biased toward eventually firing the terminal
+# edge: a parent orchestrator stalled forever is worse than a late `failed`.
+# Any new stream bytes reset the clock, and a live qwen mid-turn is never
+# silent for this long (311k of 319k recorded events are content_block_delta).
+_LIVENESS_UNKNOWN_GRACE_S = 300.0
 
 # Supervisor backoff (mirrors goose_native_forwarder.supervise_goose_forwarder).
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
@@ -100,8 +108,38 @@ _DEDUP_WINDOW = 512
 
 
 def _new_seen(uuids: Iterable[str] | None = None) -> dict[str, None]:
-    """Build the insertion-ordered dedup set (``dict`` used as an ordered set)."""
-    return dict.fromkeys(uuids or [])
+    """Build the insertion-ordered dedup set (``dict`` used as an ordered set).
+
+    Seeded content is capped to the most recent :data:`_DEDUP_WINDOW` entries,
+    so a state file written by an older build (or hand-edited) cannot start the
+    process off with an oversized live mapping.
+    """
+    seen = dict.fromkeys(uuids or [])
+    _evict_seen(seen)
+    return seen
+
+
+def _evict_seen(seen: dict[str, None]) -> None:
+    """Trim *seen* in place to the most recent :data:`_DEDUP_WINDOW` entries.
+
+    LOCAL PATCH #6. ``_write_state`` capped only what it SERIALISED; the live
+    mapping grew for the lifetime of the process, and ``list(seen)`` was rebuilt
+    from it on every poll. Over a long session that is an unbounded dict plus an
+    unbounded list allocation several times a second. Eviction is oldest-first,
+    which is the correct direction: the ids a truncation rewind can re-offer are
+    the recent ones.
+    """
+    excess = len(seen) - _DEDUP_WINDOW
+    if excess <= 0:
+        return
+    for key in list(itertools.islice(seen, excess)):
+        del seen[key]
+
+
+def _remember_seen(seen: dict[str, None], key: str) -> None:
+    """Record *key* as posted, evicting the oldest entries past the window."""
+    seen[key] = None
+    _evict_seen(seen)
 
 
 # The executor injects ``[Attached: <path>]`` (or the could-not-load marker
@@ -240,15 +278,29 @@ class _MirrorItem:
         return f"{self.uuid}#{self.index}"
 
 
-def _item_already_seen(item: _MirrorItem, seen: Container[str]) -> bool:
+def _item_already_seen(item: _MirrorItem, seen: Container[str], *, solo: bool = True) -> bool:
     """Whether *item* has already been posted.
 
-    Checks the per-item id first, then falls back to the bare event uuid so
-    state written by a pre-patch build (which recorded whole events) still
-    suppresses history instead of re-posting it after an upgrade.
+    Checks the per-item id first. The bare event uuid — how a pre-patch build
+    recorded a whole event — is honoured ONLY for *solo* items, i.e. events that
+    yield exactly one item.
+
+    That asymmetry is the point. The pre-patch build marked the event uuid after
+    the FIRST item of a multi-item event succeeded, so a bare uuid in legacy
+    state does NOT prove the rest of that event was ever delivered. Treating it
+    as complete would permanently suppress an item that never reached the
+    server. For a single-item event the bare uuid does prove delivery, so it is
+    still honoured there and an upgrade does not re-post history.
+
+    The cost is that a multi-item event straddling the upgrade may re-post its
+    first item once. That is the safe direction: a duplicate bubble is visible
+    and harmless, a silently dropped tool call or reply is neither.
     """
-    # LOCAL PATCH #6: per-item dedup, with backward-compatible event-uuid fallback.
-    return item.item_uuid in seen or item.uuid in seen
+    # LOCAL PATCH #6: per-item dedup; the legacy event-uuid fallback is narrowed
+    # to events that only ever produced one item.
+    if item.item_uuid in seen:
+        return True
+    return solo and item.uuid in seen
 
 
 def _text_from_content(content: object) -> str:
@@ -297,9 +349,10 @@ def _event_to_items(event: dict[str, object], agent_name: str) -> list[_MirrorIt
     A ``user`` event yields one ``function_call_output`` item per ``tool_result``
     block, then the prose ``message`` item (if any text). An ``assistant`` event
     yields one ``function_call`` item per ``tool_use`` block, then the prose
-    ``message`` item. All items from one event share that event's uuid and
-    ``response_id``, so the existing per-uuid dedupe skips a whole already-seen
-    event exactly as the old single-item form did. The ``function_call`` /
+    ``message`` item. Items from one event share that event's uuid and
+    ``response_id`` but each carries its own ``index``, so dedup is PER ITEM
+    (``_MirrorItem.item_uuid``) — a failed POST on one item of an event replays
+    only that item, instead of the whole event being suppressed as seen. The ``function_call`` /
     ``function_call_output`` item shapes match claude-/hermes-native. Ordering
     invariant: tool items precede prose within an event, and stream order puts
     the assistant ``tool_use`` event before the user ``tool_result`` event, so a
@@ -393,6 +446,19 @@ def _event_to_items(event: dict[str, object], agent_name: str) -> list[_MirrorIt
         )
     )
     return items
+
+
+def _is_complete_json_object(raw: bytes) -> bool:
+    """Whether *raw* is exactly one complete JSON object.
+
+    Used only by the final drain, to tell "qwen wrote the whole record and died
+    before the newline" (consume it) from "qwen died mid-record" (leave it).
+    """
+    # LOCAL PATCH #6: final-drain completeness test.
+    try:
+        return isinstance(json.loads(raw.decode("utf-8")), dict)
+    except (ValueError, UnicodeDecodeError):
+        return False
 
 
 def _stream_inner(event: dict[str, object]) -> dict[str, object] | None:
@@ -530,6 +596,7 @@ def _read_new_events(
     seen: Container[str],
     agent_name: str,
     state: _ForwardState | None = None,
+    final_drain: bool = False,
 ) -> _PollResult:
     """Read NDJSON lines past *offset* into a :class:`_PollResult`.
 
@@ -537,6 +604,16 @@ def _read_new_events(
     Only fully terminated lines (ending in ``\\n``) are consumed; a trailing
     partial line is left for the next poll by not advancing past it — so a wake
     is never decided on a half-written record.
+
+    *final_drain* is for the last read after the pane is known dead, where "wait
+    for the newline" is a deadlock: nothing will ever append it. qwen writes the
+    record and the newline in separate steps, so a process killed in between
+    leaves a COMPLETE final JSON object with no terminator — and if that record
+    is the turn's ``message_stop``, discarding it turns a clean ``idle`` into a
+    spurious ``failed``. Under *final_drain* the trailing segment is parsed: it
+    is consumed only if it is one complete JSON object, and left alone (so the
+    caller still classifies it as an unterminated turn) if it is genuinely
+    truncated mid-record.
 
     *state* threads the turn classification across poll batches AND across
     forwarder restarts (it is persisted); pass ``None`` for a cold read.
@@ -572,10 +649,16 @@ def _read_new_events(
     except OSError:
         return _result([], [], offset)
     # Only consume up to the last newline; keep any trailing partial line.
+    # LOCAL PATCH #6: except on the final drain, where a complete-but-
+    # unterminated record must still be read (see the docstring).
     last_nl = data.rfind(b"\n")
-    if last_nl == -1:
+    tail = data[last_nl + 1 :]
+    if final_drain and tail.strip() and _is_complete_json_object(tail):
+        consumed = data
+    elif last_nl == -1:
         return _result([], [], offset)  # no complete line yet
-    consumed = data[: last_nl + 1]
+    else:
+        consumed = data[: last_nl + 1]
     new_offset = offset + len(consumed)
     items: list[_MirrorItem] = []
     wakes: list[_Wake] = []
@@ -626,7 +709,10 @@ def _read_new_events(
             se_uuid = _session_end_uuid(event)
             if result_terminal is not None:
                 r_uuid, r_status = result_terminal
-                if r_uuid not in seen:
+                # LOCAL PATCH #6: gated on `turn_open` exactly like session_end.
+                # A `result` that trails a message_stop which already woke the
+                # parent must not wake it a second time.
+                if turn_open and r_uuid not in seen:
                     wakes.append(_Wake(uuid=r_uuid, status=r_status))
                 turn_open = False
                 window_id = None
@@ -642,8 +728,10 @@ def _read_new_events(
 
         # LOCAL PATCH #5: one event can yield several items (tool items then
         # prose); LOCAL PATCH #6 dedupes them per ITEM, not per event.
-        for item in _event_to_items(event, agent_name):
-            if not _item_already_seen(item, seen):
+        event_items = _event_to_items(event, agent_name)
+        solo = len(event_items) == 1
+        for item in event_items:
+            if not _item_already_seen(item, seen, solo=solo):
                 items.append(item)
     return _result(items, wakes, new_offset)
 
@@ -711,29 +799,67 @@ async def _post_external_session_status(
     resp.raise_for_status()
 
 
-def _tmux_pane_is_alive(bridge_dir: Path) -> bool:
-    """Whether the qwen terminal's tmux pane still exists.
+def _tmux_pane_is_alive(bridge_dir: Path) -> bool | None:
+    """Whether the qwen terminal's PANE PROCESS is still running.
 
-    Fail-SAFE: any uncertainty (no advertised ``tmux.json``, tmux missing, the
-    command erroring) answers ``True`` — "assume alive". A false ``False`` would
-    post a spurious terminal edge and wake the parent mid-turn, which is exactly
-    the failure this module exists to prevent; a false ``True`` merely leaves the
-    fallback to a later poll.
+    Tri-state: ``True`` alive, ``False`` definitively dead, ``None``
+    inconclusive (no advertised ``tmux.json``, tmux missing, probe timeout).
+    The caller decides what an extended run of ``None`` means — see
+    ``_LIVENESS_UNKNOWN_GRACE_S`` in :func:`forward_qwen_events_to_session`.
+
+    Probes ``list-panes -F '#{pane_dead}'``, NOT ``has-session``. Measured on
+    this host through the real terminal-launch path:
+
+    =========================  ==============  ==============  ============
+    inner process              has-session     ``pane_dead``   truth
+    =========================  ==============  ==============  ============
+    running                    rc=0            ``0``           alive
+    exited, default spec       rc=1            (server gone)   dead
+    exited, keep_alive_after_exit=True  rc=0   ``1``           **dead**
+    =========================  ==============  ==============  ============
+
+    That last row is why ``has-session`` is not enough. The qwen terminal does
+    not currently set ``keep_alive_after_exit`` (see the ``TerminalEnvSpec`` in
+    ``runner/native/orchestration.py``), so ``has-session`` happens to flip
+    today — but claude-native opted into ``remain-on-exit`` for #540, and the
+    day qwen does the same a ``has-session`` probe would silently report a dead
+    pane as alive forever and the parent-wake fallback would never fire. The
+    pane-dead probe is correct under BOTH configurations, and mirrors the
+    existing check in :func:`omnigent.terminals.ws_bridge`.
     """
     # LOCAL PATCH #6: liveness signal behind the process-exit wake fallback.
     info = read_tmux_info(bridge_dir)
     if info is None:
-        return True
+        return None  # target not advertised (yet) — no verdict
     try:
         proc = subprocess.run(
-            ["tmux", "-S", info["socket_path"], "has-session", "-t", info["tmux_target"]],
+            [
+                "tmux",
+                "-S",
+                info["socket_path"],
+                "list-panes",
+                "-t",
+                info["tmux_target"],
+                "-F",
+                "#{pane_dead}",
+            ],
             check=False,
             capture_output=True,
             timeout=_TMUX_PROBE_TIMEOUT_S,
         )
+    except subprocess.TimeoutExpired:
+        return None  # tmux wedged — no verdict
     except (OSError, subprocess.SubprocessError):
-        return True
-    return proc.returncode == 0
+        return None  # tmux missing / spawn failure — no verdict
+    if proc.returncode != 0:
+        # ``list-panes`` errors when the session or the whole server is gone.
+        # Without remain-on-exit that IS the inner process having exited.
+        return False
+    panes = proc.stdout.decode(errors="replace").split()
+    if not panes:
+        return False
+    # remain-on-exit keeps a dead pane around and flags it "1".
+    return "1" not in panes
 
 
 async def forward_qwen_events_to_session(
@@ -746,7 +872,7 @@ async def forward_qwen_events_to_session(
     events_file: Path | None = None,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
-    terminal_is_alive: Callable[[], bool] | None = None,
+    terminal_is_alive: Callable[[], bool | None] | None = None,
 ) -> None:
     """Tail qwen's ``--json-file`` and mirror new messages into the AP session.
 
@@ -763,10 +889,14 @@ async def forward_qwen_events_to_session(
     :param events_file: qwen ``--json-file`` path; defaults to the bridge dir's.
     :param poll_interval_s: Seconds between event-file polls.
     :param auth: Optional refresh-capable httpx Auth for remote deployments.
-    :param terminal_is_alive: Liveness predicate for the qwen terminal; defaults
-        to a tmux-pane probe over the bridge dir. When it answers ``False`` the
-        stream is drained one last time and, if a turn was still open, a terminal
-        edge is posted so the parent is not stranded (see LOCAL PATCH #6).
+    :param terminal_is_alive: Tri-state liveness predicate for the qwen terminal
+        (``True`` alive / ``False`` dead / ``None`` inconclusive); defaults to
+        :func:`_tmux_pane_is_alive` over the bridge dir. On ``False`` the stream
+        is drained one last time — including a complete-but-unterminated final
+        record — and, if a turn was still open, a terminal edge is posted so the
+        parent is not stranded. ``None`` holds "alive" only until
+        :data:`_LIVENESS_UNKNOWN_GRACE_S` elapses with a silent stream, so an
+        unreachable tmux cannot delay the wake indefinitely (see LOCAL PATCH #6).
     :returns: Never normally returns; cancel the task to stop it.
     """
     target = events_file or events_file_path(bridge_dir)
@@ -779,6 +909,11 @@ async def forward_qwen_events_to_session(
     is_alive = terminal_is_alive or (lambda: _tmux_pane_is_alive(bridge_dir))
     exit_terminal_posted = False
     last_probe_at = 0.0
+    # When the probe first went INCONCLUSIVE with nothing arriving on the
+    # stream. Reset by any new bytes or a conclusive verdict; once it exceeds
+    # _LIVENESS_UNKNOWN_GRACE_S the pane is treated as dead so the terminal edge
+    # eventually fires rather than the parent hanging forever.
+    unknown_since: float | None = None
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
@@ -792,21 +927,38 @@ async def forward_qwen_events_to_session(
                 # nothing to strand, and a stream still producing bytes is
                 # self-evidently alive.
                 now = _supervisor_monotonic()
+                verdict: bool | None = True
                 if state.turn_open and now - last_probe_at >= _TMUX_PROBE_INTERVAL_S:
                     last_probe_at = now
-                    alive = await asyncio.to_thread(is_alive)
+                    verdict = await asyncio.to_thread(is_alive)
+                if verdict is None:
+                    # Inconclusive. Hold "alive" only until the grace expires.
+                    if unknown_since is None:
+                        unknown_since = now
+                    alive = (now - unknown_since) < _LIVENESS_UNKNOWN_GRACE_S
+                    if not alive:
+                        _logger.warning(
+                            "qwen liveness probe inconclusive for %.0fs with a silent stream; "
+                            "treating the pane as dead; session=%s bridge_dir=%s",
+                            now - unknown_since,
+                            session_id,
+                            bridge_dir,
+                        )
                 else:
-                    alive = True
-                # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
+                    unknown_since = None
+                    alive = verdict
+                # LOCAL PATCH #6: once the pane is gone, "wait for the newline"
+                # can never complete — drain a complete-but-unterminated final
+                # record too, so a real message_stop still yields `idle`.
                 poll = await asyncio.to_thread(
-                    _read_new_events, target, offset, seen, agent_name, state
+                    _read_new_events, target, offset, seen, agent_name, state, not alive
                 )
                 for item in poll.items:
                     await _post_conversation_item(client, session_id=session_id, item=item)
                     # LOCAL PATCH #6: mark the ITEM, not its event. A failure on a
                     # later item of the same event now re-posts only that item on
                     # the next poll instead of being suppressed as "seen".
-                    seen[item.item_uuid] = None
+                    _remember_seen(seen, item.item_uuid)
                 # LOCAL PATCH #3: qwen message_stop -> external_session_status wake
                 # Post the parent-waking terminal edge AFTER the batch's mirrored
                 # items, so the reply content is in the store before the wake.
@@ -817,18 +969,26 @@ async def forward_qwen_events_to_session(
                         status=wake.status,
                         idempotency_key=wake.uuid,
                     )
-                    seen[wake.uuid] = None
-                if poll.offset != offset or poll.items or poll.wakes:
+                    _remember_seen(seen, wake.uuid)
+                progressed = poll.offset != offset or bool(poll.items) or bool(poll.wakes)
+                if progressed:
                     exit_terminal_posted = False  # fresh activity re-arms it
+                    unknown_since = None  # bytes arrived: something is alive
                 offset = poll.offset
-                state = _ForwardState(
+                next_state = _ForwardState(
                     offset=offset,
                     seen_uuids=list(seen),
                     pending_window_id=poll.pending_window_id,
                     pending_stop_reason=poll.pending_stop_reason,
                     turn_open=poll.turn_open,
                 )
-                _write_state(bridge_dir, state)
+                # LOCAL PATCH #6: only persist on an actual change. This loop runs
+                # every `poll_interval_s` (0.4s by default) for the whole life of
+                # the session; writing unconditionally meant a temp-file write +
+                # fsync-ordered rename ~216k times a day per idle session.
+                if next_state != state:
+                    _write_state(bridge_dir, next_state)
+                state = next_state
                 # LOCAL PATCH #6: the qwen process is gone and the drain above
                 # consumed its last bytes. If a turn was still in flight it will
                 # never get its own message_stop, so the parent would wait
@@ -845,9 +1005,16 @@ async def forward_qwen_events_to_session(
                             bridge_dir,
                         )
                         await _post_external_session_status(
-                            client, session_id=session_id, status=_STATUS_FAILED
+                            client,
+                            session_id=session_id,
+                            status=_STATUS_FAILED,
+                            # LOCAL PATCH #6: deterministic key for the fallback
+                            # edge too, naming the turn it terminates.
+                            idempotency_key=f"process-exit:{state.pending_window_id}",
                         )
                         state = dataclasses.replace(state, turn_open=False)
+                        # Explicit write: this one MUST land even though the poll
+                        # above may have found nothing to persist.
                         _write_state(bridge_dir, state)
                     exit_terminal_posted = True
             except asyncio.CancelledError:
@@ -881,7 +1048,7 @@ async def supervise_qwen_forwarder(
     events_file: Path | None = None,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
-    terminal_is_alive: Callable[[], bool] | None = None,
+    terminal_is_alive: Callable[[], bool | None] | None = None,
 ) -> None:
     """Run :func:`forward_qwen_events_to_session` under a restart supervisor.
 

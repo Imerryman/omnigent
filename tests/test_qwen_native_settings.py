@@ -1,6 +1,6 @@
 """Tests for the qwen sub-agent tool-surface trim.
 
-Covers :mod:`omnigent.qwen_native_settings` — the four settings knobs that take a
+Covers :mod:`omnigent.qwen_native_settings` — the six settings knobs that take a
 qwen implementer sub-agent from qwen-code's whole built-in registry (67 declared
 tools, ~47.7k prefill tokens) down to its coding tools (~12.0k), delivered as an
 ephemeral per-session file via ``QWEN_CODE_SYSTEM_SETTINGS_PATH`` rather than a
