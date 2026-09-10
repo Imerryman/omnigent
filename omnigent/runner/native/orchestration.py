@@ -3927,6 +3927,7 @@ def _qwen_subagent_launch_overrides(
     session_id: str,
     launch_config: _PiNativeLaunchConfig,
     bridge_dir: Path,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> QwenSubagentLaunch:
     """
     Build the env + argv that scope a qwen SUB-AGENT to the implementer profile.
@@ -3964,6 +3965,9 @@ def _qwen_subagent_launch_overrides(
     :param session_id: Session/conversation identifier, for the log lines.
     :param launch_config: Session snapshot config; read for the parent link.
     :param bridge_dir: This session's private bridge dir.
+    :param agent_spec: The sub-agent's resolved spec, for its authored
+        instructions (joined ahead of the fixed implementer append); None
+        when unavailable.
     :returns: Env and argv overrides; empty for a top-level session or when the
         trim could not be materialized.
     """
@@ -3976,7 +3980,10 @@ def _qwen_subagent_launch_overrides(
     if launch_config.parent_session_id is None:
         return QwenSubagentLaunch()
     try:
-        overrides = subagent_launch_overrides(bridge_dir)
+        overrides = subagent_launch_overrides(
+            bridge_dir,
+            author_instructions=_native_startup_raw_instructions_from_spec(agent_spec),
+        )
     except Exception:  # noqa: BLE001 - the launch must survive any failure here
         _logger.warning(
             "qwen-native: could not materialize the sub-agent tool-surface trim in %s; "
@@ -4001,6 +4008,7 @@ async def _auto_create_qwen_terminal(
     *,
     server_client: httpx.AsyncClient | None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the qwen TUI terminal for a qwen-native session.
@@ -4054,7 +4062,9 @@ async def _auto_create_qwen_terminal(
         server_client=server_client,
     )
     workspace = os.path.realpath(str(launch_config.workspace))
-    subagent_overrides = _qwen_subagent_launch_overrides(session_id, launch_config, bridge_dir)
+    subagent_overrides = _qwen_subagent_launch_overrides(
+        session_id, launch_config, bridge_dir, agent_spec
+    )
     qwen_command = resolve_qwen_executable()
     # Resume the qwen TUI's own history on re-launch (resume / runner restart) so
     # the embedded pane shows the prior conversation, not a blank prompt. Uses the
@@ -4128,11 +4138,13 @@ async def _auto_create_qwen_terminal(
     # server INCLUDING this CLI-provided one (verified — qwen lists ``omnigent``
     # as ``disconnected`` and registers none of its tools), so preparing it would
     # write a relay token and spawn ``serve-mcp`` for a connection qwen declines.
-    # The comment relay itself still starts below; only the MCP wiring is dropped.
+    # The comment relay is likewise skipped below (gated on ``mcp_enabled``): with
+    # no MCP client qwen never consumes ``tool_relay.json``, so starting the relay
+    # would only leave an idle localhost server.
     mcp_enabled = (
         server_client is not None
         and ensure_comment_relay is not None
-        and not subagent_overrides.env
+        and not subagent_overrides.excludes_mcp
     )
     mcp_args: list[str] = []
     if mcp_enabled:
@@ -4221,7 +4233,7 @@ async def _auto_create_qwen_terminal(
 
     qwen_recording_path = qwen_session_recording_path(qwen_session_id, workspace)
 
-    if server_client is not None and ensure_comment_relay is not None:
+    if mcp_enabled:
         await ensure_comment_relay(
             session_id,
             explicit_bridge_dir=bridge_dir,
@@ -8931,6 +8943,7 @@ async def _launch_qwen(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 
