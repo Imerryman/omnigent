@@ -231,13 +231,21 @@ class QwenSubagentLaunch:
 
     :param env: Environment additions for the sub-agent's process.
     :param args: qwen CLI arguments to splice into the sub-agent's argv.
+    :param excludes_mcp: Whether this launch's settings overlay excludes every
+        MCP server (``mcp.excluded: ["*"]``). The authoritative signal for the
+        caller's MCP-wiring gate: a bare ``QwenSubagentLaunch()`` (top-level
+        session, or a trim that could not be materialized) leaves it ``False`` so
+        MCP wiring stays on, exactly matching the untrimmed fallback.
     """
 
     env: dict[str, str] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
+    excludes_mcp: bool = False
 
 
-def subagent_launch_overrides(settings_dir: Path | str) -> QwenSubagentLaunch:
+def subagent_launch_overrides(
+    settings_dir: Path | str, *, author_instructions: str | None = None
+) -> QwenSubagentLaunch:
     """
     Materialize the trim and return everything a sub-agent launch needs.
 
@@ -248,14 +256,27 @@ def subagent_launch_overrides(settings_dir: Path | str) -> QwenSubagentLaunch:
 
     :param settings_dir: Session-private directory to write the trim into (the
         qwen bridge dir in production) — never the launch cwd.
+    :param author_instructions: The sub-agent's authored ``AgentSpec.instructions``
+        (verbatim), or ``None``. Prepended to the fixed implementer append so a
+        dispatched qwen sub-agent keeps its author's instructions — parity with
+        claude-native, which flows the same text into ``--append-system-prompt``.
     :returns: Env and argv overrides for the sub-agent's qwen process.
     :raises OSError: If the trim cannot be written; the caller decides how to
         degrade (the launch should proceed untrimmed rather than fail).
     """
     settings_path = write_subagent_system_settings(settings_dir)
+    append = QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND
+    if author_instructions and author_instructions.strip():
+        # Author instructions FIRST, the fixed implementer policy LAST so the
+        # policy wins on recency (qwen assembles the append after every other
+        # layer). The policy only reinforces "proceed on reasonable assumptions"
+        # / "do not delegate"; it never replaces qwen's base prompt or the
+        # headless never-ask guardrail.
+        append = f"{author_instructions.strip()}\n\n{QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND}"
     return QwenSubagentLaunch(
         env={QWEN_SYSTEM_SETTINGS_ENV_VAR: str(settings_path)},
-        args=["--append-system-prompt", QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND],
+        args=["--append-system-prompt", append],
+        excludes_mcp=True,
     )
 
 
