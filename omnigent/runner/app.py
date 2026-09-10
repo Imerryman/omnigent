@@ -2021,6 +2021,55 @@ def create_runner_app(
         # A dead required terminal cannot still be working a turn.
         _native_pane_status.pop(event.session_id, None)
 
+        if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
+            # A qwen/antigravity SUB-AGENT (a child a native orchestrator
+            # dispatched) that dies mid-turn -- crash, auth failure, the OOM this
+            # box has seen -- emits no forwarder terminal edge: the forwarder
+            # posts ``completed``/``failed`` only from a real ``result`` or
+            # ``message_stop`` (qwen_native/forwarder.py), and its clean-completion
+            # ``idle`` edge is what the ``external_session_status`` handler turns
+            # into the parent wake. With neither, the parent is never told and its
+            # dispatch hangs forever. ``session_was_idle`` cannot discriminate here
+            # -- qwen's "powering down" redraw leaves the exit memo on ``running``
+            # even on a clean quit (see the clean-quit test) -- so key off delivery
+            # state instead: an UNDELIVERED sub-agent-work entry means no terminal
+            # result ever reached the parent, i.e. the exit is a death. Fail it and
+            # wake the parent, reusing the required-terminal error. A clean
+            # completion already marked the entry terminal (skipped here); an
+            # interactive top-level quit has no work entry at all (untouched).
+            pending = get_subagent_work(event.session_id)
+            if pending is not None and pending.status not in _SUBAGENT_TERMINAL_STATUSES:
+                # v0.21 moved the shared diagnosis below the clean-exit branch; build it here.
+                diagnosis = classify_terminal_failure(
+                    command=event.command,
+                    exit_status=event.exit_status,
+                    output=event.last_output,
+                )
+                if diagnosis is None and event.closed_outside_omnigent:
+                    diagnosis = TERMINAL_CLOSED_OUTSIDE_OMNIGENT
+                error = _build_required_terminal_error(event, diagnosis)
+                _logger.error(
+                    "qwen-native sub-agent %s exited mid-turn with no terminal "
+                    "result; failing it and waking parent %s: %s",
+                    event.session_id,
+                    pending.parent_session_id,
+                    error.get("message"),
+                    extra={"session_id": event.session_id},
+                )
+                _publish_event(
+                    event.session_id,
+                    {"type": "session.status", "status": "failed", "error": error},
+                )
+                _mark_subagent_terminal_and_wake(
+                    event.session_id,
+                    status="failed",
+                    output=error["message"],
+                )
+                _release_required_terminal_session(event.session_id)
+                return
+            # v0.21 port: a clean qwen/antigravity exit falls through to the combined
+            # clean-exit branch below (#12527 bookkeeping), which publishes idle.
+
         # A claude /exit or /quit prints this banner and exits 0. Printing it
         # can flip the idle memo back to "running" before pane death, so treat
         # a banner exit as a clean stop rather than a failure.
