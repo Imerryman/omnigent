@@ -155,6 +155,15 @@ _PROVIDER_RESOLUTION_HARNESS: dict[str, _ProviderHarness] = {
     # models: map from the resolved entry (see acp_curated_models).
     "acp": "acp",
     "qwen": "qwen",
+    # LOCAL PATCH (2026-08-24): stock upstream (v0.11.0) registers only the bare "qwen"
+    # key, but the launchable harness id is "qwen-native" (harness_plugins.py
+    # QWEN_NATIVE_CODING_AGENT). Without these aliases, _resolve_model_provider
+    # short-circuits to "no model-provider resolution" (source=none) before it
+    # can reach the agent's auth: provider (aibox_qwen_coder). Every other
+    # native harness (claude/codex/kimi/antigravity) already carries its
+    # -native / native- aliases; this restores parity for qwen.
+    "qwen-native": "qwen",
+    "native-qwen": "qwen",
     # The native agy TUI bridge resolves its provider via the SDK sibling,
     # mirroring the claude-native -> claude-sdk rule above.
     "antigravity-native": "antigravity",
