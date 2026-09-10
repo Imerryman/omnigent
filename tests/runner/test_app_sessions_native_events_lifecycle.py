@@ -4149,3 +4149,190 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
         f"No session.status: idle should be enqueued when kill_session failed; "
         f"got {status_idle!r}."
     )
+
+
+@pytest.mark.parametrize("terminal_name", ["qwen", "antigravity"])
+@pytest.mark.asyncio
+async def test_qwen_subagent_dies_midturn_wakes_parent_failed(
+    terminal_name: str,
+) -> None:
+    """A qwen/antigravity SUB-AGENT that exits mid-turn wakes its parent FAILED.
+
+    A headless sub-agent that dies mid-turn (crash / auth failure / OOM) emits
+    no forwarder terminal edge, so nothing marks its work terminal and the
+    parent dispatch would otherwise hang forever. The terminal-exit watcher must
+    detect the still-undelivered sub-agent-work entry, fail it, deliver a
+    ``failed`` payload to the parent inbox, and clear the child spinner with a
+    ``failed`` status instead of a stuck ``idle``. Regression guard for concern H
+    of the v0.13.0 port (the forwarder was taken 0.13-verbatim, which never wakes
+    the parent on a mid-turn death).
+
+    :param terminal_name: The native sub-agent terminal that died mid-turn.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    parent_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
+    parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    runner_app._session_inboxes_ref[parent_id] = parent_inbox
+    runner_app.register_child_session(
+        conv_id,
+        parent_session_id=parent_id,
+        title=f"{terminal_name}:main",
+        tool=terminal_name,
+        session_name="main",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=conv_id,
+        agent=terminal_name,
+        title="main",
+    )
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id=f"terminal_{terminal_name}_main",
+                terminal_name=terminal_name,
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                # A clean quit ALSO reports False here (qwen's "powering down"
+                # redraw), so the fix must not rely on it -- it keys off the
+                # undelivered work entry, which keeps this a death.
+                session_was_idle=False,
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_subagent_work(conv_id)
+        runner_app.unregister_child_session(conv_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    # The child spinner clears with a FAILED status, not a stuck idle...
+    failed_events = [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ]
+    assert len(failed_events) == 1, f"expected one failed status, got {queued_events!r}"
+    assert failed_events[0]["error"]["code"] == "required_terminal_exited"
+    assert (
+        event_idle := [
+            event
+            for event in queued_events
+            if event.get("type") == "session.status" and event.get("status") == "idle"
+        ]
+    ) == [], f"a died sub-agent must not publish idle, got {event_idle!r}"
+    # ...and the parent is woken with a terminal FAILED sub-agent payload.
+    inbox_item = parent_inbox.get_nowait()
+    assert inbox_item["type"] == "sub_agent"
+    assert inbox_item["status"] == "failed"
+    assert inbox_item["conversation_id"] == conv_id
+    assert inbox_item["output"] == failed_events[0]["error"]["message"]
+    assert parent_inbox.empty()
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_qwen_subagent_clean_completion_exit_does_not_refail() -> None:
+    """A qwen sub-agent whose turn already completed is not re-failed on exit.
+
+    The forwarder's clean-completion ``idle`` edge already marked the work
+    ``completed`` and woke the parent. The subsequent pane exit must publish a
+    plain ``idle`` and deliver NO second (failed) payload -- otherwise the fix
+    for a mid-turn death would launder a genuine success into a spurious failure.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    parent_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
+    parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    runner_app._session_inboxes_ref[parent_id] = parent_inbox
+    runner_app.register_child_session(
+        conv_id,
+        parent_session_id=parent_id,
+        title="qwen:main",
+        tool="qwen",
+        session_name="main",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=conv_id,
+        agent="qwen",
+        title="main",
+    )
+    # Simulate the forwarder's clean-completion delivery (idle -> completed).
+    ack = runner_app.mark_subagent_work_terminal(conv_id, status="completed", output="done")
+    assert ack.delivered_now
+    completion_item = parent_inbox.get_nowait()
+    assert completion_item["status"] == "completed"
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    try:
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_qwen_main",
+                terminal_name="qwen",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                session_was_idle=False,
+            )
+        )
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(1000):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            if pm.released:
+                break
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_subagent_work(conv_id)
+        runner_app.unregister_child_session(conv_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    assert {"type": "session.status", "status": "idle"} in queued_events
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
+    # No second (failed) payload laundered the completed result.
+    assert parent_inbox.empty()
+    assert pm.released == [conv_id]

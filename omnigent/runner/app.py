@@ -3346,6 +3346,43 @@ def create_runner_app(
         _background_tasks.add(_teardown_task)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
+            # A qwen/antigravity SUB-AGENT (a child a native orchestrator
+            # dispatched) that dies mid-turn -- crash, auth failure, the OOM this
+            # box has seen -- emits no forwarder terminal edge: the forwarder
+            # posts ``completed``/``failed`` only from a real ``result`` or
+            # ``message_stop`` (qwen_native/forwarder.py), and its clean-completion
+            # ``idle`` edge is what the ``external_session_status`` handler turns
+            # into the parent wake. With neither, the parent is never told and its
+            # dispatch hangs forever. ``session_was_idle`` cannot discriminate here
+            # -- qwen's "powering down" redraw leaves the exit memo on ``running``
+            # even on a clean quit (see the clean-quit test) -- so key off delivery
+            # state instead: an UNDELIVERED sub-agent-work entry means no terminal
+            # result ever reached the parent, i.e. the exit is a death. Fail it and
+            # wake the parent, reusing the required-terminal error. A clean
+            # completion already marked the entry terminal (skipped here); an
+            # interactive top-level quit has no work entry at all (untouched).
+            pending = get_subagent_work(event.session_id)
+            if pending is not None and pending.status not in _SUBAGENT_TERMINAL_STATUSES:
+                error = _build_required_terminal_error(event)
+                _logger.error(
+                    "qwen-native sub-agent %s exited mid-turn with no terminal "
+                    "result; failing it and waking parent %s: %s",
+                    event.session_id,
+                    pending.parent_session_id,
+                    error.get("message"),
+                    extra={"session_id": event.session_id},
+                )
+                _publish_event(
+                    event.session_id,
+                    {"type": "session.status", "status": "failed", "error": error},
+                )
+                _mark_subagent_terminal_and_wake(
+                    event.session_id,
+                    status="failed",
+                    output=error["message"],
+                )
+                _release_required_terminal_session(event.session_id)
+                return
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
             return
