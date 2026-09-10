@@ -376,3 +376,57 @@ async def test_launch_config_reads_parent_session_id_from_the_snapshot() -> None
         server_client=_Client({"workspace": "/ws"}),  # type: ignore[arg-type]
     )
     assert top.parent_session_id is None
+
+
+def test_subagent_launch_threads_authored_instructions(tmp_path: Path) -> None:
+    """Item-4 wiring: a dispatched qwen sub-agent's authored AgentSpec.instructions
+    reach its ``--append-system-prompt`` (joined ahead of the fixed policy),
+    matching claude-native. Without this, authored instructions were silently
+    dropped for qwen sub-agents.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    spec = AgentSpec(
+        spec_version=1,
+        name="impl",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "qwen-native"}),
+        instructions="Use tabs, not spaces. Never touch CHANGELOG.md.",
+    )
+
+    overrides = _qwen_subagent_launch_overrides(
+        "conv_child",
+        _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+        tmp_path / "bridge",
+        spec,
+    )
+
+    assert overrides.args[0] == "--append-system-prompt"
+    append = overrides.args[1]
+    assert "Use tabs, not spaces. Never touch CHANGELOG.md." in append
+    assert QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND in append
+    # Author text FIRST, fixed policy LAST (wins on recency).
+    assert append.index("Use tabs") < append.index(QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND)
+
+
+def test_subagent_launch_flags_and_unflags_mcp_exclusion(tmp_path: Path) -> None:
+    """Item-3: a scoped child reports ``excludes_mcp`` True; an interactive
+    top-level launch reports False so its MCP wiring is preserved.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    child = _qwen_subagent_launch_overrides(
+        "conv_child",
+        _qwen_launch_config(workspace, parent_session_id="conv_parent"),
+        tmp_path / "bridge_child",
+    )
+    assert child.excludes_mcp is True
+
+    top_level = _qwen_subagent_launch_overrides(
+        "conv_top_level",
+        _qwen_launch_config(workspace, parent_session_id=None),
+        tmp_path / "bridge_top",
+    )
+    assert top_level.excludes_mcp is False

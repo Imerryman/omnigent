@@ -20,6 +20,7 @@ from omnigent.harnesses.qwen_native.settings import (
     QWEN_SUBAGENT_DISABLED_TOOLS,
     QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND,
     QWEN_SYSTEM_SETTINGS_ENV_VAR,
+    QwenSubagentLaunch,
     subagent_launch_overrides,
     subagent_settings_overlay,
     system_settings_path,
@@ -423,3 +424,28 @@ def test_leaves_no_temp_files_behind(tmp_path: Path) -> None:
     subagent_launch_overrides(tmp_path)
 
     assert [p.name for p in tmp_path.iterdir()] == ["qwen_system_settings.json"]
+
+
+def test_launch_overrides_flag_mcp_exclusion(tmp_path: Path) -> None:
+    """A materialized trim reports ``excludes_mcp`` (its overlay carries
+    ``mcp.excluded:["*"]``) so the caller drops MCP wiring; a bare launch (the
+    top-level / could-not-materialize fallback) leaves it False so MCP stays on.
+    """
+    assert subagent_launch_overrides(tmp_path).excludes_mcp is True
+    assert QwenSubagentLaunch().excludes_mcp is False
+
+
+def test_launch_overrides_prepend_authored_instructions(tmp_path: Path) -> None:
+    """Authored instructions ride FIRST, the fixed implementer policy LAST."""
+    author = "Use tabs, not spaces. Never touch CHANGELOG.md."
+    overrides = subagent_launch_overrides(tmp_path, author_instructions=author)
+    assert overrides.args == [
+        "--append-system-prompt",
+        f"{author}\n\n{QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND}",
+    ]
+
+
+def test_launch_overrides_ignore_blank_authored_instructions(tmp_path: Path) -> None:
+    """Whitespace-only authored instructions collapse to the policy append."""
+    overrides = subagent_launch_overrides(tmp_path, author_instructions="   \n  ")
+    assert overrides.args == ["--append-system-prompt", QWEN_SUBAGENT_SYSTEM_PROMPT_APPEND]
