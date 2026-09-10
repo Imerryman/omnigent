@@ -169,7 +169,7 @@ def _string_mapping(value: object) -> dict[str, str] | None:
     }
 
 
-_INBOX_OUTPUT_MAX_CHARS = 12000
+_INBOX_OUTPUT_MAX_CHARS = 30000
 _OS_ENV_SHELL_DEFAULT_TIMEOUT_S = 120.0
 _RUNNER_EXECUTION_TIMEOUT_S = 7200.0
 _SUBAGENT_POLICY_STATUSES = frozenset({"completed", "failed"})
