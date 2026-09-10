@@ -4326,19 +4326,22 @@ async def test_events_stop_session_on_kiro_native_503_when_kill_fails(
 @pytest.mark.asyncio
 async def test_qwen_subagent_dies_midturn_wakes_parent_failed(
     terminal_name: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A qwen/antigravity SUB-AGENT that exits mid-turn wakes its parent FAILED.
+    """A qwen/antigravity SUB-AGENT that dies mid-turn wakes its parent FAILED.
 
-    A headless sub-agent that dies mid-turn (crash / auth failure / OOM) emits
-    no forwarder terminal edge, so nothing marks its work terminal and the
-    parent dispatch would otherwise hang forever. The terminal-exit watcher must
-    detect the still-undelivered sub-agent-work entry, fail it, deliver a
+    A headless sub-agent that dies mid-turn (crash / auth failure / OOM) emits no
+    forwarder terminal edge, so nothing marks its work terminal and the parent
+    dispatch would otherwise hang forever. The terminal-exit watcher must, after a
+    bounded grace with no terminal edge, fail the still-undelivered work, deliver a
     ``failed`` payload to the parent inbox, and clear the child spinner with a
-    ``failed`` status instead of a stuck ``idle``. Regression guard for concern H
-    of the v0.13.0 port (the forwarder was taken 0.13-verbatim, which never wakes
-    the parent on a mid-turn death).
+    ``failed`` status instead of a stuck ``idle``. Regression guard for concern H of
+    the v0.13.0 port (the forwarder was taken 0.13-verbatim, which never wakes the
+    parent on a mid-turn death). Grace is set to ``0`` so the death is decided on
+    the next loop tick.
 
     :param terminal_name: The native sub-agent terminal that died mid-turn.
+    :param monkeypatch: Sets the exit-grace to zero for a deterministic tick.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
@@ -4347,6 +4350,7 @@ async def test_qwen_subagent_dies_midturn_wakes_parent_failed(
         TerminalLifecycle,
     )
 
+    monkeypatch.setenv("OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S", "0")
     parent_id = uuid.uuid4().hex
     conv_id = uuid.uuid4().hex
     parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -4388,11 +4392,14 @@ async def test_qwen_subagent_dies_midturn_wakes_parent_failed(
             )
         )
         queued_events: list[dict[str, Any]] = []
-        for _ in range(1000):
+        for _ in range(4000):
             queued_events.extend(
                 _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
             )
-            if pm.released:
+            if any(
+                e.get("type") == "session.status" and e.get("status") == "failed"
+                for e in queued_events
+            ):
                 break
             await asyncio.sleep(0)
     finally:
@@ -4409,13 +4416,12 @@ async def test_qwen_subagent_dies_midturn_wakes_parent_failed(
     ]
     assert len(failed_events) == 1, f"expected one failed status, got {queued_events!r}"
     assert failed_events[0]["error"]["code"] == "required_terminal_exited"
-    assert (
-        event_idle := [
-            event
-            for event in queued_events
-            if event.get("type") == "session.status" and event.get("status") == "idle"
-        ]
-    ) == [], f"a died sub-agent must not publish idle, got {event_idle!r}"
+    idle_events = [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "idle"
+    ]
+    assert idle_events == [], f"a died sub-agent must not publish idle, got {idle_events!r}"
     # ...and the parent is woken with a terminal FAILED sub-agent payload.
     inbox_item = parent_inbox.get_nowait()
     assert inbox_item["type"] == "sub_agent"
@@ -4427,13 +4433,17 @@ async def test_qwen_subagent_dies_midturn_wakes_parent_failed(
 
 
 @pytest.mark.asyncio
-async def test_qwen_subagent_clean_completion_exit_does_not_refail() -> None:
+async def test_qwen_subagent_clean_completion_exit_does_not_refail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A qwen sub-agent whose turn already completed is not re-failed on exit.
 
     The forwarder's clean-completion ``idle`` edge already marked the work
-    ``completed`` and woke the parent. The subsequent pane exit must publish a
-    plain ``idle`` and deliver NO second (failed) payload -- otherwise the fix
-    for a mid-turn death would launder a genuine success into a spurious failure.
+    ``completed`` and woke the parent BEFORE the pane exit. The exit path must
+    deliver NO second (failed) payload -- otherwise the mid-turn-death fix would
+    launder a genuine success into a spurious failure.
+
+    :param monkeypatch: Sets the exit-grace to zero for a deterministic tick.
     """
     from omnigent.runner import app as runner_app
     from omnigent.runner.app import _session_event_queues_ref
@@ -4442,6 +4452,7 @@ async def test_qwen_subagent_clean_completion_exit_does_not_refail() -> None:
         TerminalLifecycle,
     )
 
+    monkeypatch.setenv("OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S", "0")
     parent_id = uuid.uuid4().hex
     conv_id = uuid.uuid4().hex
     parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
@@ -4485,12 +4496,10 @@ async def test_qwen_subagent_clean_completion_exit_does_not_refail() -> None:
             )
         )
         queued_events: list[dict[str, Any]] = []
-        for _ in range(1000):
+        for _ in range(200):
             queued_events.extend(
                 _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
             )
-            if pm.released:
-                break
             await asyncio.sleep(0)
     finally:
         _session_event_queues_ref.pop(conv_id, None)
@@ -4498,12 +4507,107 @@ async def test_qwen_subagent_clean_completion_exit_does_not_refail() -> None:
         runner_app.unregister_child_session(conv_id)
         runner_app._session_inboxes_ref.pop(parent_id, None)
 
-    assert {"type": "session.status", "status": "idle"} in queued_events
     assert [
         event
         for event in queued_events
         if event.get("type") == "session.status" and event.get("status") == "failed"
     ] == []
     # No second (failed) payload laundered the completed result.
+    assert parent_inbox.empty()
+    assert pm.released == [conv_id]
+
+
+@pytest.mark.asyncio
+async def test_qwen_subagent_success_racing_pane_exit_not_failed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A success whose pane exits BEFORE the forwarder POST is not failed.
+
+    The dangerous order (codex finding): terminal exit fires while the work is
+    still ``running``, and only AFTER does the forwarder's ``idle`` -> ``completed``
+    edge land. The bounded exit-grace must drain this: the exit schedules a
+    deferred re-check, the completion arrives during the grace, and the re-check
+    sees a terminal entry and does NOT fail. Without the grace (the prior
+    inline-fail version) this would record a spurious ``failed`` and
+    ``mark_subagent_work_terminal`` would then keep it over the trailing
+    ``completed``.
+
+    Grace is ``0``: the exit schedules the deferred task, the test lands the
+    completion synchronously before yielding, then the task runs and finds the
+    entry already terminal.
+
+    :param monkeypatch: Sets the exit-grace to zero for a deterministic tick.
+    """
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.resource_registry import (
+        TerminalExitEvent,
+        TerminalLifecycle,
+    )
+
+    monkeypatch.setenv("OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S", "0")
+    parent_id = uuid.uuid4().hex
+    conv_id = uuid.uuid4().hex
+    parent_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    resource_registry = app.state.session_resource_registry
+    runner_app._session_inboxes_ref[parent_id] = parent_inbox
+    runner_app.register_child_session(
+        conv_id,
+        parent_session_id=parent_id,
+        title="qwen:main",
+        tool="qwen",
+        session_name="main",
+    )
+    runner_app.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=conv_id,
+        agent="qwen",
+        title="main",
+    )
+    publish_exit = resource_registry._terminal_exit_publisher
+    assert callable(publish_exit)
+    try:
+        # 1) Pane exits while the turn is still `running` (no forwarder edge yet).
+        publish_exit(
+            TerminalExitEvent(
+                session_id=conv_id,
+                terminal_id="terminal_qwen_main",
+                terminal_name="qwen",
+                session_key="main",
+                lifecycle=TerminalLifecycle.REQUIRED,
+                session_was_idle=False,
+            )
+        )
+        # 2) The forwarder's real completion lands DURING the grace (before the
+        #    deferred re-check runs, which needs an event-loop tick).
+        ack = runner_app.mark_subagent_work_terminal(conv_id, status="completed", output="done")
+        assert ack.delivered_now
+        completion_item = parent_inbox.get_nowait()
+        assert completion_item["status"] == "completed"
+        # 3) Let the deferred grace task run; it must find a terminal entry.
+        queued_events: list[dict[str, Any]] = []
+        for _ in range(200):
+            queued_events.extend(
+                _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+            )
+            await asyncio.sleep(0)
+    finally:
+        _session_event_queues_ref.pop(conv_id, None)
+        runner_app.unregister_subagent_work(conv_id)
+        runner_app.unregister_child_session(conv_id)
+        runner_app._session_inboxes_ref.pop(parent_id, None)
+
+    # The success is preserved: no spurious failed status, no failed payload.
+    assert [
+        event
+        for event in queued_events
+        if event.get("type") == "session.status" and event.get("status") == "failed"
+    ] == []
     assert parent_inbox.empty()
     assert pm.released == [conv_id]

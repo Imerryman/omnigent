@@ -2220,6 +2220,26 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
     )
 
 
+def _qwen_subagent_exit_grace_s() -> float:
+    """Grace before failing a qwen/antigravity sub-agent that exited with
+    undelivered work.
+
+    Must exceed a couple of forwarder poll intervals (~0.4s;
+    ``harnesses/qwen_native/forwarder.py``) plus POST latency so a SUCCESS whose
+    pane exited just before the forwarder's asynchronous ``idle`` -> ``completed``
+    edge landed is not falsely failed. Override with
+    ``OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S`` (tests set ``0``).
+    """
+    raw = os.environ.get("OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S")
+    if raw is None:
+        return 3.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3.0
+    return value if value >= 0.0 else 3.0
+
+
 def reap_stalled_subagent_launches(
     *,
     now: float | None = None,
@@ -3469,6 +3489,44 @@ def create_runner_app(
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
 
+    async def _qwen_subagent_exit_grace(event: TerminalExitEvent) -> None:
+        """Fail a qwen/antigravity sub-agent that exited without a terminal edge.
+
+        Runs after a bounded grace so a SUCCESS whose pane raced ahead of the
+        forwarder's asynchronous ``idle`` -> ``completed`` POST is NOT failed: if
+        the forwarder delivered any terminal status during the grace, the work
+        entry is terminal and this returns. Only a still-undelivered entry -- a
+        genuine mid-turn death -- is failed and its parent woken.
+        """
+        await asyncio.sleep(_qwen_subagent_exit_grace_s())
+        entry = get_subagent_work(event.session_id)
+        if entry is None or entry.status in _SUBAGENT_TERMINAL_STATUSES:
+            return
+        error = _build_required_terminal_error(event)
+        _logger.error(
+            "qwen-native sub-agent %s exited mid-turn with no terminal result "
+            "within the %.1fs grace; failing it and waking parent %s: %s",
+            event.session_id,
+            _qwen_subagent_exit_grace_s(),
+            entry.parent_session_id,
+            error.get("message"),
+            extra={"session_id": event.session_id},
+        )
+        _publish_event(
+            event.session_id,
+            {"type": "session.status", "status": "failed", "error": error},
+        )
+        _mark_subagent_terminal_and_wake(
+            event.session_id,
+            status="failed",
+            output=error["message"],
+        )
+
+    def _schedule_qwen_subagent_exit_grace(event: TerminalExitEvent) -> None:
+        task = asyncio.create_task(_qwen_subagent_exit_grace(event))
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
         _publish_event(
             event.session_id,
@@ -3517,24 +3575,16 @@ def create_runner_app(
             # interactive top-level quit has no work entry at all (untouched).
             pending = get_subagent_work(event.session_id)
             if pending is not None and pending.status not in _SUBAGENT_TERMINAL_STATUSES:
-                error = _build_required_terminal_error(event)
-                _logger.error(
-                    "qwen-native sub-agent %s exited mid-turn with no terminal "
-                    "result; failing it and waking parent %s: %s",
-                    event.session_id,
-                    pending.parent_session_id,
-                    error.get("message"),
-                    extra={"session_id": event.session_id},
-                )
-                _publish_event(
-                    event.session_id,
-                    {"type": "session.status", "status": "failed", "error": error},
-                )
-                _mark_subagent_terminal_and_wake(
-                    event.session_id,
-                    status="failed",
-                    output=error["message"],
-                )
+                # Undelivered SUB-AGENT work at exit is EITHER a mid-turn death
+                # (no forwarder terminal edge will ever come) OR a success whose
+                # pane exited in the gap before the forwarder's asynchronous
+                # ``idle`` -> ``completed`` POST landed (it polls the event file
+                # every ~0.4s). Failing inline would lock in a FALSE failure on
+                # that race -- ``mark_subagent_work_terminal`` keeps a recorded
+                # ``failed`` over a trailing ``completed``. So drain the race:
+                # schedule a bounded grace re-check and fail + wake ONLY if the
+                # work is still undelivered afterwards.
+                _schedule_qwen_subagent_exit_grace(event)
                 _release_required_terminal_session(event.session_id)
                 return
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
