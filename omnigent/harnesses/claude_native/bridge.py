@@ -227,7 +227,7 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # still consuming the paste gets folded in as a newline instead of
 # submitting — the draft then sits unsent. Polling for the draft makes
 # the handoff deterministic where the old fixed sleep raced it.
-_PASTE_COMMIT_TIMEOUT_S = 5.0
+_PASTE_COMMIT_TIMEOUT_S = 20.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -2336,6 +2336,12 @@ def augment_claude_args(
     _write_json_file(settings_path, hook_settings)
     args.extend(
         [
+            # Omnigent worker panes load ONLY the bridge relay (see
+            # build_mcp_config); strict mode prevents Claude from merging the
+            # user-scope ~/.claude.json MCP fleet (serena, postgres, playwright,
+            # glitchtip, code-agents) into every pane -> was ~1GB/pane -> OOM.
+            # Only affects omnigent-spawned panes; hand-launched claude is untouched.
+            "--strict-mcp-config",
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
