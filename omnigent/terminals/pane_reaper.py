@@ -73,9 +73,13 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# Default idle window before an unused native pane is reaped. Mirrors
-# ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
-_DEFAULT_IDLE_TIMEOUT_S = 60 * 60
+# Default idle window before an unused native pane is reaped. Shortened from
+# the 1-hour HarnessProcessManager default to 20 min for the swapless dev box:
+# a 60-min window let bursty fan-out pile ~1GB/tree resident to OOM. The
+# OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S env var still overrides, but env
+# propagation across the zygote spawn paths proved unreliable, so the safe
+# window lives in code.
+_DEFAULT_IDLE_TIMEOUT_S = 20 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
