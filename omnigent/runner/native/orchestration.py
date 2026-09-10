@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
     from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.harnesses.qwen_native.settings import QwenSubagentLaunch
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -512,6 +513,14 @@ class _PiNativeLaunchConfig:
     :param reasoning_effort: Persisted per-session effort, e.g. ``"high"``.
         Consumed by the pi-native launch as ``--thinking``; ``None`` leaves
         Pi's model default in place.
+    :param parent_session_id: Owning parent conversation id when this session
+        is a sub-agent child (``kind == "sub_agent"``), else ``None`` for a
+        top-level session. The snapshot's authoritative sub-agent
+        discriminator — the ``omnigent.ui`` / ``omnigent.wrapper``
+        presentation labels are stamped on native sub-agents too, so they
+        cannot tell the two apart. Consumed by the qwen-native launch to
+        decide whether to trim the sub-agent's tool surface; ignored by
+        pi-/cursor-native.
     """
 
     workspace: Path
@@ -523,6 +532,7 @@ class _PiNativeLaunchConfig:
     fork_carry_history: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
+    parent_session_id: str | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1017,6 +1027,7 @@ async def _pi_native_launch_config(
                 f"Invalid model_override for session {session_id!r}: {exc}"
             ) from exc
     reasoning_effort = snapshot.get("reasoning_effort")
+    parent_session_id = snapshot.get("parent_session_id") or None
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
@@ -1029,6 +1040,7 @@ async def _pi_native_launch_config(
         reasoning_effort=reasoning_effort
         if isinstance(reasoning_effort, str) and reasoning_effort
         else None,
+        parent_session_id=parent_session_id if isinstance(parent_session_id, str) else None,
     )
 
 
@@ -3512,6 +3524,77 @@ async def _build_qwen_fork_recording(
     return qwen_session_id
 
 
+def _qwen_subagent_launch_overrides(
+    session_id: str,
+    launch_config: _PiNativeLaunchConfig,
+    bridge_dir: Path,
+) -> QwenSubagentLaunch:
+    """
+    Build the env + argv that scope a qwen SUB-AGENT to the implementer profile.
+
+    A qwen sub-agent — a ``qwen-native`` child session dispatched by an Omnigent
+    orchestrator — otherwise boots with qwen's full built-in registry declared
+    upfront (67 tools, a ~47.7k-token turn-1 prefill before it does any work) and
+    with base-prompt guidance written for a human-driven session. Two per-process
+    overrides fix that, both from :mod:`omnigent.harnesses.qwen_native.settings`:
+
+    - the settings trim, written into this session's bridge dir and handed over
+      via ``QWEN_CODE_SYSTEM_SETTINGS_PATH`` (qwen's highest-precedence scope);
+    - ``--append-system-prompt``, which qwen assembles after every other
+      instruction layer, telling the implementer that its dispatch is the durable
+      authorization qwen's base prompt asks for.
+
+    Nothing is written into the launch cwd, and neither override leaves this
+    terminal's process. That is the point: a workspace ``.qwen/settings.json`` is
+    persistent project config, and a sub-agent with no explicit workspace falls
+    back to ``OMNIGENT_RUNNER_WORKSPACE`` — the user's real checkout — so a
+    file-based trim would leak into every later interactive ``omnigent qwen`` run
+    in that directory. The interactive TUI keeps qwen's full surface and
+    unmodified prompt: a human at the terminal is the orchestrator there.
+
+    The gate is the session snapshot's ``parent_session_id`` (``kind ==
+    "sub_agent"``), not the ``omnigent.ui`` label — the server stamps that on
+    native sub-agents too, so it cannot tell the two apart.
+
+    Best-effort, and deliberately total: NOTHING here may stop qwen from
+    starting. A bridge dir that cannot be written, a settings file that cannot be
+    parsed or merged, any surprise at all — the session launches with qwen's
+    defaults instead of not launching. The trim is an optimization; the session
+    is the product.
+
+    :param session_id: Session/conversation identifier, for the log lines.
+    :param launch_config: Session snapshot config; read for the parent link.
+    :param bridge_dir: This session's private bridge dir.
+    :returns: Env and argv overrides; empty for a top-level session or when the
+        trim could not be materialized.
+    """
+    from omnigent.harnesses.qwen_native.settings import (
+        QWEN_SYSTEM_SETTINGS_ENV_VAR,
+        QwenSubagentLaunch,
+        subagent_launch_overrides,
+    )
+
+    if launch_config.parent_session_id is None:
+        return QwenSubagentLaunch()
+    try:
+        overrides = subagent_launch_overrides(bridge_dir)
+    except Exception:  # noqa: BLE001 - the launch must survive any failure here
+        _logger.warning(
+            "qwen-native: could not materialize the sub-agent tool-surface trim in %s; "
+            "session %s launches with qwen's full tool registry.",
+            bridge_dir,
+            session_id,
+            exc_info=True,
+        )
+        return QwenSubagentLaunch()
+    _logger.info(
+        "qwen-native: scoped the sub-agent tool surface for %s via %s",
+        session_id,
+        overrides.env[QWEN_SYSTEM_SETTINGS_ENV_VAR],
+    )
+    return overrides
+
+
 async def _auto_create_qwen_terminal(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -3572,6 +3655,7 @@ async def _auto_create_qwen_terminal(
         server_client=server_client,
     )
     workspace = os.path.realpath(str(launch_config.workspace))
+    subagent_overrides = _qwen_subagent_launch_overrides(session_id, launch_config, bridge_dir)
     qwen_command = resolve_qwen_executable()
     # Resume the qwen TUI's own history on re-launch (resume / runner restart) so
     # the embedded pane shows the prior conversation, not a blank prompt. Uses the
@@ -3641,7 +3725,16 @@ async def _auto_create_qwen_terminal(
     # relay will actually start (``ensure_comment_relay`` present), else the
     # registered tools would be dead (serve-mcp with nothing to route calls back
     # to) — mirrors the opencode-native gating.
-    mcp_enabled = server_client is not None and ensure_comment_relay is not None
+    # Skipped for a trimmed sub-agent: its ``mcp.excluded: ["*"]`` refuses every
+    # server INCLUDING this CLI-provided one (verified — qwen lists ``omnigent``
+    # as ``disconnected`` and registers none of its tools), so preparing it would
+    # write a relay token and spawn ``serve-mcp`` for a connection qwen declines.
+    # The comment relay itself still starts below; only the MCP wiring is dropped.
+    mcp_enabled = (
+        server_client is not None
+        and ensure_comment_relay is not None
+        and not subagent_overrides.env
+    )
     mcp_args: list[str] = []
     if mcp_enabled:
         try:
@@ -3669,6 +3762,9 @@ async def _auto_create_qwen_terminal(
         *(launch_config.terminal_launch_args or []),
         *resume_args,
         *mcp_args,
+        # Empty for a top-level (interactive) session — see
+        # ``_qwen_subagent_launch_overrides``.
+        *subagent_overrides.args,
         "--input-file",
         str(in_path),
         "--json-file",
@@ -3683,6 +3779,7 @@ async def _auto_create_qwen_terminal(
             os_env=OSEnvSpec(type="caller_process", cwd=workspace),
             command=qwen_command,
             args=qwen_args,
+            env=subagent_overrides.env,
             scrollback=100_000,
             tmux_allow_passthrough=True,
             tmux_start_on_attach=False,
