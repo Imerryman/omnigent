@@ -11620,7 +11620,16 @@ def create_runner_app(
                 process_manager is not None and process_manager.has_active_turn(conv_id)
             ):
                 return True
-            if _native_pane_status.get(conv_id) == "running":
+            # Codex's status map is fed by an OUT-OF-PROCESS forwarder that
+            # posts session.status to the server only (never through the
+            # in-runner _publish_event that feeds _native_pane_status), so a
+            # codex pane's local status stays a stale "running" after it goes
+            # idle and would pin it forever. Trust the in-runner status
+            # short-circuit for harnesses whose forwarder runs in-process
+            # (claude/qwen); for codex, fall through to the attached-client +
+            # tmux window-activity evidence below, which reflect a genuinely
+            # working pane (its TUI redraws every turn) and go quiet when idle.
+            if pane.terminal_name != "codex" and _native_pane_status.get(conv_id) == "running":
                 return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:
@@ -11632,9 +11641,28 @@ def create_runner_app(
             activity_at = await asyncio.to_thread(
                 _tmux_window_activity_at, str(pane.socket_path), "main"
             )
-            return (
-                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
-            )
+            if activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S:
+                return True
+            # Belt-and-suspenders for codex: its _native_pane_status is fed by an
+            # out-of-process forwarder that posts to the server only, so a quiet
+            # codex pane may still be mid-turn even though the local map is not
+            # "running". Before declaring it reapable, confirm against the
+            # AUTHORITATIVE server status. Fail-safe: a running/waiting status OR
+            # any error/non-200 => treat as busy, so a live turn is never reaped
+            # on doubt. (Runs only for a codex pane already quiet on every local
+            # signal, so it is at most one GET per idle codex pane per scan.)
+            if pane.terminal_name == "codex":
+                try:
+                    resp = await server_client.get(
+                        f"/v1/sessions/{conv_id}", timeout=5.0
+                    )
+                    if resp.status_code != 200:
+                        return True
+                    if resp.json().get("status") in ("running", "waiting"):
+                        return True
+                except Exception:  # noqa: BLE001 - never reap when liveness is unconfirmable
+                    return True
+            return False
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:
