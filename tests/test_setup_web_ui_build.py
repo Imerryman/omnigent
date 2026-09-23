@@ -245,6 +245,21 @@ def _make_project(tmp_path: Path, *, bundle: bool = False) -> Path:
     return root
 
 
+def _git_init(root: Path, *, ignore: str | None = None) -> None:
+    """Make ``root`` a real work tree with everything present committed."""
+    if ignore is not None:
+        (root / ".gitignore").write_text(ignore)
+    commands: tuple[list[str], ...] = (
+        ["init", "-q"],
+        ["config", "user.email", "test@example.com"],
+        ["config", "user.name", "Test"],
+        ["add", "-A"],
+        ["commit", "-q", "-m", "initial"],
+    )
+    for args in commands:
+        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+
+
 def _stamp_path(root: Path) -> Path:
     """Path of the build stamp inside ``root``'s bundle dir."""
     return root / "omnigent" / "server" / "static" / "web-ui" / "omnigent-build-stamp.json"
@@ -259,6 +274,7 @@ def _run_build(
     pnpm: bool = True,
     sha: str = _FAKE_SHA,
     env: dict[str, str] | None = None,
+    real_git: bool = False,
 ) -> list[list[str]]:
     """Invoke ``_build_web_ui`` against ``root``, returning the pnpm argvs.
 
@@ -271,9 +287,11 @@ def _run_build(
         monkeypatch.setenv(name, value)
     monkeypatch.setattr(module, "_project_root", lambda: root)
     monkeypatch.setattr(module, "_git_sha", lambda: sha)
-    # Force the pruned-walk path: the tmp dir is not a work tree, and the
-    # outcome must not depend on whether it happens to sit inside one.
-    monkeypatch.setattr(module, "_git_listed_files", lambda *_a, **_k: None)
+    if not real_git:
+        # Force the walk-only path so the outcome cannot depend on whether the
+        # tmp dir happens to sit inside a work tree. ``real_git=True`` leaves
+        # the git union live and drives the decision through it for real.
+        monkeypatch.setattr(module, "_git_listed_files", lambda *_a, **_k: None)
 
     def _node() -> str:
         if not node:
@@ -289,9 +307,14 @@ def _run_build(
     monkeypatch.setattr(module, "_resolve_pnpm_command", _pnpm)
 
     invocations: list[list[str]] = []
+    real_run = module.subprocess.run
 
-    def _fake_run(cmd: list[str], **_kwargs: object) -> mock.Mock:
-        invocations.append(list(cmd))
+    def _fake_run(cmd: list[str], **kwargs: object) -> object:
+        # git still runs for real: it is part of the code under test when
+        # ``real_git`` is set, and never a build command worth recording.
+        if cmd and str(cmd[0]) == "git":
+            return real_run(cmd, **kwargs)
+        invocations.append([str(part) for part in cmd])
         return mock.Mock(returncode=0)
 
     monkeypatch.setattr(module.subprocess, "run", _fake_run)
@@ -483,21 +506,34 @@ def test_missing_bundle_without_toolchain_still_aborts(
     assert "not found on PATH" in str(excinfo.value)
 
 
-def test_forced_rebuild_without_toolchain_aborts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("missing", ["node", "pnpm"])
+def test_forced_rebuild_without_toolchain_preserves_the_bundle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    missing: str,
 ) -> None:
-    """An explicit force is never silently downgraded to a warning."""
+    """Forcing bypasses the freshness check, not a missing toolchain.
+
+    An upgrade must not be aborted over a frontend the user may not even
+    use while a serviceable bundle sits on disk — it warns and keeps it.
+    """
     module = _load_setup_module()
     root = _make_project(tmp_path, bundle=True)
     _run_build(module, root, monkeypatch)
-    with pytest.raises(SystemExit):
-        _run_build(
-            module,
-            root,
-            monkeypatch,
-            node=False,
-            env={"OMNIGENT_BUILD_WEB_UI": "1"},
-        )
+    bundle = root / "omnigent" / "server" / "static" / "web-ui" / "index.html"
+    before = bundle.read_text()
+    invocations = _run_build(
+        module,
+        root,
+        monkeypatch,
+        node=missing != "node",
+        pnpm=missing != "pnpm",
+        env={"OMNIGENT_BUILD_WEB_UI": "1"},
+    )
+    assert invocations == []
+    assert bundle.read_text() == before
+    assert "THE WEB UI BUNDLE IS STALE AND WAS NOT REBUILT" in capsys.readouterr().err
 
 
 def test_build_failure_leaves_no_stamp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -560,9 +596,20 @@ def test_git_listing_excludes_ignored_files(tmp_path: Path) -> None:
     (root / ".gitignore").write_text("web/node_modules/\n")
     (root / "web" / "node_modules").mkdir()
     (root / "web" / "node_modules" / "dep.js").write_text("//\n")
+    _git_init(root)
+    # Created only AFTER staging, so it is genuinely untracked and actually
+    # tests the ``--others --exclude-standard`` half of the listing.
     (root / "web" / "src" / "untracked.tsx").write_text("export const x = 1;\n")
-    for args in (["init", "-q"], ["add", "-A"]):
-        subprocess.run(["git", *args], cwd=root, check=True, capture_output=True)
+    assert (
+        "untracked.tsx"
+        in subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all"],
+            cwd=root,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    )
     listed = module._git_listed_files(root, "web")
     assert listed is not None
     names = {path.name for path in listed}
@@ -597,3 +644,167 @@ def test_git_listing_returns_none_outside_a_work_tree(tmp_path: Path) -> None:
 def test_build_mode_parsing(raw: str | None, expected: str) -> None:
     module = _load_setup_module()
     assert module._web_ui_build_mode(raw) == expected
+
+
+# --- Fingerprint completeness ------------------------------------------------
+#
+# The fingerprint defines what counts as a build input. If it can miss one,
+# it produces a false SKIP — precisely the bug this mechanism exists to stop.
+# Git's ignore rules are not that definition, so these run with the real git
+# union live (``real_git=True``) and still demand a rebuild.
+
+
+@pytest.mark.parametrize("real_git", [False, True])
+def test_gitignored_build_input_change_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git: bool
+) -> None:
+    """A gitignored file can still be load-bearing; Vite inlines ``.env*``."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    env_file = root / "web" / ".env.local"
+    env_file.write_text("VITE_BRAIN_PICKER=1\n")
+    _git_init(root, ignore="web/.env.local\nomnigent/server/static/\n")
+    # git does not see it at all — only an ignore-agnostic walk does.
+    assert module._git_listed_files(root, "web") is not None
+    assert env_file not in (module._git_listed_files(root, "web") or [])
+
+    assert _run_build(module, root, monkeypatch, real_git=real_git)
+    env_file.write_text("VITE_BRAIN_PICKER=0\n")
+    assert _run_build(module, root, monkeypatch, real_git=real_git), (
+        "a changed but gitignored build input must not be a silent SKIP"
+    )
+
+
+@pytest.mark.parametrize("real_git", [False, True])
+def test_symlinked_source_dir_change_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git: bool
+) -> None:
+    """``git ls-files`` reports a dir symlink as one entry, not as its tree."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "util.ts").write_text("export const shared = 1;\n")
+    (root / "web" / "src" / "shared").symlink_to(shared, target_is_directory=True)
+    _git_init(root, ignore="omnigent/server/static/\n")
+
+    assert _run_build(module, root, monkeypatch, real_git=real_git)
+    (shared / "util.ts").write_text("export const shared = 2;\n")
+    assert _run_build(module, root, monkeypatch, real_git=real_git), (
+        "an edit inside a symlinked source tree must not be a silent SKIP"
+    )
+
+
+def test_real_git_enumeration_drives_the_build_decision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SKIP/REBUILD decision holds with the git union live, not stubbed."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _git_init(root, ignore="omnigent/server/static/\n")
+    assert _run_build(module, root, monkeypatch, real_git=True)
+    assert _run_build(module, root, monkeypatch, real_git=True) == []
+    (root / "web" / "src" / "main.tsx").write_text("export const app = 3;\n")
+    assert _run_build(module, root, monkeypatch, real_git=True)
+
+
+def test_walk_follows_symlinked_dirs_and_survives_cycles(tmp_path: Path) -> None:
+    module = _load_setup_module()
+    root = _make_project(tmp_path)
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    (shared / "util.ts").write_text("export const shared = 1;\n")
+    (root / "web" / "src" / "shared").symlink_to(shared, target_is_directory=True)
+    # A link back to an ancestor would loop forever without cycle protection.
+    (root / "web" / "src" / "loop").symlink_to(root / "web", target_is_directory=True)
+    walked = module._walk_web_ui_sources(root / "web")
+    assert root / "web" / "src" / "shared" / "util.ts" in walked
+    # Reported as traversed, not resolved, so the digest stays portable.
+    assert shared / "util.ts" not in walked
+
+
+def test_vite_failure_never_stamps_damaged_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Vite failure after partial output must not certify the bundle.
+
+    Vite writes into the live bundle dir, so a mid-build failure can leave a
+    half-updated SPA on disk next to the previous stamp. That stamp must
+    still describe the OLD sources, or the next install would SKIP over a
+    damaged bundle.
+    """
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _run_build(module, root, monkeypatch)
+    stamped_sources = json.loads(_stamp_path(root).read_text())["sources"]
+
+    (root / "web" / "src" / "main.tsx").write_text("export const broken = ;\n")
+    changed_sources = module._web_ui_source_fingerprint(root)
+    assert changed_sources != stamped_sources
+
+    for name in _BUILD_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setattr(module, "_project_root", lambda: root)
+    monkeypatch.setattr(module, "_git_sha", lambda: _FAKE_SHA)
+    monkeypatch.setattr(module, "_git_listed_files", lambda *_a, **_k: None)
+    monkeypatch.setattr(module, "_require_supported_node", lambda: "22.20.0")
+    monkeypatch.setattr(module, "_resolve_pnpm_command", lambda: ["pnpm"])
+
+    def _install_ok_vite_fails(cmd: list[str], **_kwargs: object) -> mock.Mock:
+        if "run" in cmd and "build" in cmd:
+            # Simulate Vite emitting some chunks before dying.
+            bundle_dir = root / "omnigent" / "server" / "static" / "web-ui"
+            (bundle_dir / "assets").mkdir(exist_ok=True)
+            (bundle_dir / "assets" / "partial-abc123.js").write_text("//\n")
+            raise subprocess.CalledProcessError(
+                1, cmd, stderr="vite: Transform failed with 1 error"
+            )
+        return mock.Mock(returncode=0)
+
+    monkeypatch.setattr(module.subprocess, "run", _install_ok_vite_fails)
+    with pytest.raises(SystemExit) as excinfo:
+        module._GenerateBuildInfo._build_web_ui(object())
+    assert "web UI build failed" in str(excinfo.value)
+    assert json.loads(_stamp_path(root).read_text())["sources"] == stamped_sources
+
+
+def test_stamp_write_is_atomic_and_leaves_no_temp_files(tmp_path: Path) -> None:
+    """A reader must never observe a truncated stamp."""
+    module = _load_setup_module()
+    target = tmp_path / "web-ui" / "omnigent-build-stamp.json"
+    module._write_web_ui_stamp(target, sources="a" * 64, commit="b" * 40)
+    module._write_web_ui_stamp(target, sources="c" * 64, commit="d" * 40)
+    assert json.loads(target.read_text())["sources"] == "c" * 64
+    assert [path.name for path in target.parent.iterdir()] == [target.name]
+
+
+def test_manual_entry_point_overrides_the_ci_skip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Someone who typed the build command meant it, whatever the shell exports."""
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _run_build(module, root, monkeypatch)
+    monkeypatch.setenv("OMNIGENT_SKIP_WEB_UI", "true")
+    monkeypatch.setattr(module, "_git_sha", lambda: _FAKE_SHA)
+    monkeypatch.setattr(module, "_git_listed_files", lambda *_a, **_k: None)
+    monkeypatch.setattr(module, "_require_supported_node", lambda: "22.20.0")
+    monkeypatch.setattr(module, "_resolve_pnpm_command", lambda: ["pnpm"])
+    invocations: list[list[str]] = []
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda cmd, **_kw: (invocations.append(list(cmd)), mock.Mock(returncode=0))[1],
+    )
+    # The install path honours the CI skip...
+    module._build_and_stamp_web_ui(root)
+    assert invocations == []
+    # ...the manual entry point does not, and forces past a matching stamp.
+    module._build_and_stamp_web_ui(root, mode="force", respect_ci_skip=False)
+    assert [cmd[1] for cmd in invocations] == ["install", "--filter"]
