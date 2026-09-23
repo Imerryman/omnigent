@@ -324,6 +324,22 @@ function createdHarnessOptions({
   return Object.keys(options).length > 0 ? options : null;
 }
 
+/**
+ * The harness that will actually launch a bundle agent's brain: the
+ * session's picked/draft override when the agent's spec harness is one of
+ * the overridable brain harnesses (see `BRAIN_HARNESS_LABELS`), else the
+ * spec's own harness. `null` for an agent with no brain-harness knob at all
+ * (native terminal wrappers, custom ACP agents, …).
+ */
+function effectiveBrainHarness(
+  agentHarness: string | null | undefined,
+  pickedHarness: string | null,
+  brainHarnessLabels: Record<string, string>,
+): string | null {
+  if (agentHarness == null || !(agentHarness in brainHarnessLabels)) return null;
+  return pickedHarness ?? agentHarness;
+}
+
 /** Use a local-friendly label only when the desktop shell proves the host id is this machine. */
 export function displayNameForHost(
   host: Pick<Host, "host_id" | "name">,
@@ -1685,6 +1701,14 @@ function HarnessConfigModal({
   const [draftBypass, setDraftBypass] = useState(bypassSandbox);
   const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
   const [draftRouting, setDraftRouting] = useState<CostControlMode>(costControlMode);
+  // Bundle agents (polly, debby, …) default their brain to the claude-sdk
+  // harness, which carries no `nativeAgentHasCapability` capability of its
+  // own (it isn't a native terminal wrapper) but still reads a per-session
+  // model override at spawn — same plumbing claude-native uses. Keyed off the
+  // DRAFT harness pick so the row appears/disappears live as the Agent
+  // Harness selector changes, before Save commits it.
+  const hasSdkModelPicker =
+    effectiveBrainHarness(agent.harness, draftHarness, brainHarnessLabels) === "claude-sdk";
 
   useEffect(() => {
     if (!open) return;
@@ -1763,7 +1787,9 @@ function HarnessConfigModal({
     ? claudeModelSelectOptions
     : hasApproval
       ? codexModelSelectOptions
-      : piModelOptions;
+      : hasSdkModelPicker
+        ? claudeModelSelectOptions
+        : piModelOptions;
   useEffect(() => {
     if (!open || !draftModel || draftModelOptions.length === 0) return;
     if (!draftModelOptions.some((m) => m.id === draftModel)) setDraftModel("");
@@ -1837,6 +1863,11 @@ function HarnessConfigModal({
       setAgySkipMode(draftAgySkip);
       if (entryHarness) writeHarnessOption(entryHarness, { mode: draftAgySkip });
     } else if (brainDefault) {
+      // The claude-sdk brain's Model row (above) drafts alongside the Agent
+      // Harness pick, so commit it only while that brain is still the one
+      // selected — switching away before Save must not carry a claude-sdk
+      // model pick onto a different brain harness.
+      if (hasSdkModelPicker) setPickedModel(draftModel);
       // Picking the spec default clears the override so the session tracks it.
       setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
     }
@@ -2133,6 +2164,20 @@ function HarnessConfigModal({
                 </div>
               )}
             </>
+          )}
+
+          {!autoRouting && hasSdkModelPicker && (
+            <ConfigRow label="Model" description="Underlying LLM" controlClassName="sm:w-80">
+              <SearchableModelPicker
+                value={modelValue}
+                options={claudeModelOptions.map((m) => ({
+                  id: m.id,
+                  displayName: m.displayName ?? m.id,
+                }))}
+                loading={claudeModelsLoading}
+                onValueChange={onModelChange}
+              />
+            </ConfigRow>
           )}
 
           {/* Stays rendered while Smart Routing is the pick: it is the control
@@ -3347,7 +3392,24 @@ export function NewChatLandingScreen() {
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
+      // Unlike claude-native, the claude-sdk brain's "no override" state
+      // isn't the CATALOG default — it's whatever the agent's spec configures
+      // (see `agent.executor.model`), which isn't known client-side here. So
+      // an unpicked model reads as the plain "Default" rather than
+      // `defaultModelLabel`'s catalog-default name, which would assert a
+      // specific model the runtime may not actually use.
+      const modelRow =
+        active === "claude-sdk"
+          ? [
+              {
+                label: "Model",
+                value:
+                  claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default",
+              },
+            ]
+          : [];
       return [
+        ...modelRow,
         { label: "Agent Harness", value: brainHarnessLabelsAll[active] ?? active },
         ...routingRow,
       ];
@@ -3401,7 +3463,16 @@ export function NewChatLandingScreen() {
     userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
-  }, [effectiveAgentId, setCostControlMode]);
+    // A picked model is per-agent-instance too: the claude-sdk-brain seed
+    // effect below early-returns for a non-native agent (it has no
+    // `selectedNativeHarness` to key off), so without this reset a model
+    // picked for a PREVIOUS agent would silently ride along onto the newly
+    // selected one — including forcing a pin on a bundle agent the user
+    // never opened the picker for. A native-harness switch immediately
+    // reseeds this from that agent's own remembered pick via the effect
+    // below, so this reset never strands a native agent on "Default".
+    setPickedModel("");
+  }, [effectiveAgentId, setCostControlMode, setPickedModel]);
   // A project-configured default model (Project settings) outranks the user's
   // remembered per-harness pick — but only while the composer sits on the
   // project's configured agent; switching to another agent falls back to the
@@ -3539,7 +3610,11 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes, when the selected host's catalog resolves,
     // and when the project's configured default model settles (its config
     // loads async, so the first run may see it as null); capability flags are
-    // derived from the same harness and stay omitted.
+    // derived from the same harness and stay omitted. Keyed on the agent too
+    // (not just the harness) so it re-runs after the agent-change reset
+    // above, which clears the picked model for every agent switch —
+    // including one between two agents that share the same native harness,
+    // where `selectedNativeHarness` alone wouldn't change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     selectedNativeHarness,
@@ -3547,6 +3622,7 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    effectiveAgentId,
   ]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
@@ -4414,7 +4490,13 @@ export function NewChatLandingScreen() {
       const agentSupportsApprovalMode = nativeAgentHasCapability(agent, "approvalMode");
       const agentSupportsCursorMode = nativeAgentHasCapability(agent, "cursorMode");
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
-      const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
+      // A bundle agent's claude-sdk brain gets the same model picker/override
+      // as claude-native, even though it advertises no native-wrapper
+      // capability of its own (see `effectiveBrainHarness`).
+      const agentSupportsModelPicker =
+        nativeAgentHasCapability(agent, "modelPicker") ||
+        effectiveBrainHarness(agent?.harness, pickedHarness, brainHarnessLabelsAll) ===
+          "claude-sdk";
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is

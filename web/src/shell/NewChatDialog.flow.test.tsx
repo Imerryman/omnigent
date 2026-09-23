@@ -1820,6 +1820,80 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.harness_override).toBeUndefined();
   });
 
+  it("keeps a picked model selected for polly's claude-sdk brain, validated against its own catalog", async () => {
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    // Deliberately DISJOINT ids between claude-native and pi-native: the
+    // claude-sdk brain's Model row must validate a pick against the CLAUDE
+    // catalog it's populated from, not piModelOptions (which a bundle agent
+    // never actually uses) — a wrong-catalog validation would reset this
+    // pick back to Default as soon as the effect re-runs.
+    vi.mocked(useHostModelOptions).mockImplementation(
+      (_hostId, harness) =>
+        ({
+          data:
+            harness === "pi-native"
+              ? [{ id: "pi-only-id", displayName: "Pi Only Model" }]
+              : [
+                  { id: "opus", displayName: "Opus" },
+                  { id: "sonnet", displayName: "Sonnet" },
+                ],
+          isLoading: false,
+        }) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentConfig("ag_polly");
+    fireEvent.click(screen.getByTestId("new-chat-landing-config-model"));
+    fireEvent.click(screen.getByText("Sonnet"));
+    // Must stick immediately — a regression validating against the Pi
+    // catalog would snap this back to "Default" on the next render.
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Sonnet");
+    saveConfig();
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("sonnet");
+  });
+
+  it("clears a native agent's picked model when switching to polly's claude-sdk brain", async () => {
+    setAgents([
+      agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    // Pick a model for Claude Code, then switch to Polly WITHOUT touching
+    // its own picker at all.
+    openAgentConfig("ag_native");
+    pickSelectOption("new-chat-landing-config-model", "Opus");
+    saveConfig();
+    selectAgent("ag_polly");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    // No forced pin: the previous agent's model must not silently ride onto
+    // the freshly-selected claude-sdk brain.
+    expect(body.model_override).toBeUndefined();
+  });
+
   // Skipped while the toggle is hidden behind the false-gate in NewChatDialog; un-skip when re-enabling.
   it("no longer renders a standalone smart-routing composer toggle", async () => {
     // The sparkle toggle was folded into the gear modal's Model dropdown — it
