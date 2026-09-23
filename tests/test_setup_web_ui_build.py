@@ -580,11 +580,15 @@ def test_walk_prunes_dependency_directories(tmp_path: Path) -> None:
     # web/electron/build is tracked source, so "build" must not be pruned.
     (root / "web" / "electron" / "build").mkdir(parents=True)
     (root / "web" / "electron" / "build" / "afterPack.js").write_text("//\n")
-    walked = module._walk_web_ui_sources(root / "web")
+    # A shipped asset that merely *sits under* a pruned basename.
+    (root / "web" / "public" / "dist").mkdir(parents=True)
+    (root / "web" / "public" / "dist" / "banner.svg").write_text("<svg/>\n")
+    walked, _ = module._walk_web_ui_sources(root / "web")
     assert not [path for path in walked if "node_modules" in path.parts]
-    assert not [path for path in walked if "dist" in path.parts]
+    assert root / "web" / "dist" / "assets" / "app.js" not in walked
     assert root / "web" / "src" / "main.tsx" in walked
     assert root / "web" / "electron" / "build" / "afterPack.js" in walked
+    assert root / "web" / "public" / "dist" / "banner.svg" in walked
 
 
 def test_git_listing_excludes_ignored_files(tmp_path: Path) -> None:
@@ -723,43 +727,39 @@ def test_walk_follows_symlinked_dirs_and_survives_cycles(tmp_path: Path) -> None
     (root / "web" / "src" / "shared").symlink_to(shared, target_is_directory=True)
     # A link back to an ancestor would loop forever without cycle protection.
     (root / "web" / "src" / "loop").symlink_to(root / "web", target_is_directory=True)
-    walked = module._walk_web_ui_sources(root / "web")
+    walked, links = module._walk_web_ui_sources(root / "web")
     assert root / "web" / "src" / "shared" / "util.ts" in walked
     # Reported as traversed, not resolved, so the digest stays portable.
     assert shared / "util.ts" not in walked
+    # Every link's target is recorded, so a retarget alone moves the digest.
+    assert links["src/shared"] == str(shared)
+    assert links["src/loop"] == str(root / "web")
 
 
-def test_vite_failure_never_stamps_damaged_output(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _run_build_with_failing_vite(
+    module: ModuleType,
+    root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    env: dict[str, str] | None = None,
 ) -> None:
-    """A Vite failure after partial output must not certify the bundle.
-
-    Vite writes into the live bundle dir, so a mid-build failure can leave a
-    half-updated SPA on disk next to the previous stamp. That stamp must
-    still describe the OLD sources, or the next install would SKIP over a
-    damaged bundle.
-    """
-    module = _load_setup_module()
-    root = _make_project(tmp_path, bundle=True)
-    _run_build(module, root, monkeypatch)
-    stamped_sources = json.loads(_stamp_path(root).read_text())["sources"]
-
-    (root / "web" / "src" / "main.tsx").write_text("export const broken = ;\n")
-    changed_sources = module._web_ui_source_fingerprint(root)
-    assert changed_sources != stamped_sources
-
+    """Run a build whose Vite step damages live output and then fails."""
     for name in _BUILD_ENV_VARS:
         monkeypatch.delenv(name, raising=False)
+    for key, value in (env or {}).items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(module, "_project_root", lambda: root)
     monkeypatch.setattr(module, "_git_sha", lambda: _FAKE_SHA)
     monkeypatch.setattr(module, "_git_listed_files", lambda *_a, **_k: None)
     monkeypatch.setattr(module, "_require_supported_node", lambda: "22.20.0")
     monkeypatch.setattr(module, "_resolve_pnpm_command", lambda: ["pnpm"])
+    bundle_dir = root / "omnigent" / "server" / "static" / "web-ui"
 
     def _install_ok_vite_fails(cmd: list[str], **_kwargs: object) -> mock.Mock:
         if "run" in cmd and "build" in cmd:
-            # Simulate Vite emitting some chunks before dying.
-            bundle_dir = root / "omnigent" / "server" / "static" / "web-ui"
+            # Vite writes straight into the live bundle dir, so a mid-build
+            # failure leaves the SPA half-overwritten.
+            (bundle_dir / "index.html").write_text("<!-- truncated -->")
             (bundle_dir / "assets").mkdir(exist_ok=True)
             (bundle_dir / "assets" / "partial-abc123.js").write_text("//\n")
             raise subprocess.CalledProcessError(
@@ -771,7 +771,83 @@ def test_vite_failure_never_stamps_damaged_output(
     with pytest.raises(SystemExit) as excinfo:
         module._GenerateBuildInfo._build_web_ui(object())
     assert "web UI build failed" in str(excinfo.value)
-    assert json.loads(_stamp_path(root).read_text())["sources"] == stamped_sources
+
+
+def test_failed_forced_build_on_unchanged_sources_cannot_be_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The nastiest false SKIP: damaged output under a still-valid digest.
+
+    Force a rebuild with sources that never changed. The build mangles the
+    live bundle and fails. If the old stamp survived, the next *automatic*
+    install would compute the very same source digest, match it, and skip —
+    serving damaged output forever. The stamp is therefore invalidated
+    before anything can touch the bundle, so a failure leaves none.
+    """
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _run_build(module, root, monkeypatch)
+    assert _stamp_path(root).is_file()
+
+    _run_build_with_failing_vite(module, root, monkeypatch, env={"OMNIGENT_BUILD_WEB_UI": "1"})
+    assert not _stamp_path(root).is_file(), (
+        "a failed build must leave no stamp certifying the damaged bundle"
+    )
+    # Sources are byte-identical to the successful build, so only the missing
+    # stamp can force the rebuild here.
+    assert _run_build(module, root, monkeypatch), (
+        "the next automatic install must rebuild, not skip over damage"
+    )
+
+
+def test_reverted_sources_after_failed_build_still_rebuild(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Revert-after-failure reaches the same state and must not skip either."""
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    source = root / "web" / "src" / "main.tsx"
+    original = source.read_text()
+    _run_build(module, root, monkeypatch)
+
+    source.write_text("export const app = 'broken';\n")
+    _run_build_with_failing_vite(module, root, monkeypatch)
+    # Undo the edit: the digest now matches what the last *successful* build
+    # was stamped with, which is exactly the trap.
+    source.write_text(original)
+    assert not _stamp_path(root).is_file()
+    assert _run_build(module, root, monkeypatch), (
+        "reverting the source must not resurrect the pre-failure stamp"
+    )
+
+
+def test_successful_build_restores_the_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalidate-first must not cost the fast path once a build succeeds."""
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _run_build_with_failing_vite(module, root, monkeypatch)
+    assert not _stamp_path(root).is_file()
+    assert _run_build(module, root, monkeypatch)
+    assert _stamp_path(root).is_file()
+    assert _run_build(module, root, monkeypatch) == []
+
+
+def test_toolchain_warning_path_preserves_the_stamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Invalidation happens after the toolchain gate, never before it.
+
+    The warn-and-continue path has not touched the bundle, so wiping its
+    stamp would only manufacture a rebuild that the install cannot run.
+    """
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _run_build(module, root, monkeypatch)
+    (root / "web" / "src" / "main.tsx").write_text("export const app = 4;\n")
+    assert _run_build(module, root, monkeypatch, node=False) == []
+    assert _stamp_path(root).is_file()
 
 
 def test_stamp_write_is_atomic_and_leaves_no_temp_files(tmp_path: Path) -> None:
@@ -808,3 +884,247 @@ def test_manual_entry_point_overrides_the_ci_skip(
     # ...the manual entry point does not, and forces past a matching stamp.
     module._build_and_stamp_web_ui(root, mode="force", respect_ci_skip=False)
     assert [cmd[1] for cmd in invocations] == ["install", "--filter"]
+
+
+# --- Pruning by location, not by basename ------------------------------------
+
+
+@pytest.mark.parametrize("real_git", [False, True])
+def test_asset_under_a_pruned_basename_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git: bool
+) -> None:
+    """A directory merely *named* ``dist`` is not disposable build output.
+
+    ``web/public/dist/banner.svg`` is a shipped asset. Pruning the basename
+    ``dist`` at every depth hid it from the walk, and ``web/.gitignore``'s
+    unanchored ``dist`` entry hides it from git too — so it was invisible to
+    both enumerations and editing it was a silent SKIP.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    asset = root / "web" / "public" / "dist" / "banner.svg"
+    asset.parent.mkdir(parents=True)
+    asset.write_text("<svg><title>old</title></svg>\n")
+    # Mirror the real web/.gitignore: an unanchored `dist` rule.
+    _git_init(root, ignore="dist\nomnigent/server/static/\n")
+    assert asset not in (module._git_listed_files(root, "web") or [])
+
+    assert _run_build(module, root, monkeypatch, real_git=real_git)
+    asset.write_text("<svg><title>new</title></svg>\n")
+    assert _run_build(module, root, monkeypatch, real_git=real_git), (
+        "editing a shipped asset under a pruned basename must not be a SKIP"
+    )
+
+
+@pytest.mark.parametrize("real_git", [False, True])
+def test_real_build_output_dir_is_still_ignored(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git: bool
+) -> None:
+    """Location-anchored pruning must still skip the actual output dirs."""
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    _git_init(root, ignore="web/dist/\nomnigent/server/static/\n")
+    assert _run_build(module, root, monkeypatch, real_git=real_git)
+    (root / "web" / "dist" / "assets").mkdir(parents=True)
+    (root / "web" / "dist" / "assets" / "chunk-abc.js").write_text("//\n")
+    (root / "web" / "node_modules" / "left-pad").mkdir(parents=True)
+    (root / "web" / "node_modules" / "left-pad" / "index.js").write_text("//\n")
+    assert _run_build(module, root, monkeypatch, real_git=real_git) == []
+
+
+# --- Symlink topology --------------------------------------------------------
+
+
+@pytest.mark.parametrize("real_git", [False, True])
+def test_sibling_symlink_retarget_rebuilds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, real_git: bool
+) -> None:
+    """Flipping an alias between two already-traversed siblings is a change.
+
+    ``src/selected`` -> ``src/a`` becomes ``src/selected`` -> ``src/b``. No
+    file content moved, and cycle protection skips the alias in both states
+    because ``a`` and ``b`` were each already visited under their own names.
+    Git cannot rescue it either: the directory symlink fails ``is_file()``.
+    Recording the link's target in the digest is what catches it.
+    """
+    if shutil.which("git") is None:
+        pytest.skip("git is not installed")
+    module = _load_setup_module()
+    root = _make_project(tmp_path, bundle=True)
+    src_dir = root / "web" / "src"
+    for name, impl in (("a", "A"), ("b", "B")):
+        (src_dir / name).mkdir()
+        (src_dir / name / "module.ts").write_text(f"export const impl = '{impl}';\n")
+    selected = src_dir / "selected"
+    selected.symlink_to(src_dir / "a", target_is_directory=True)
+    _git_init(root, ignore="omnigent/server/static/\n")
+
+    assert _run_build(module, root, monkeypatch, real_git=real_git)
+    selected.unlink()
+    selected.symlink_to(src_dir / "b", target_is_directory=True)
+    assert _run_build(module, root, monkeypatch, real_git=real_git), (
+        "retargeting the imported alias changes the build and must rebuild"
+    )
+
+
+def test_symlink_topology_is_recorded_in_the_digest(tmp_path: Path) -> None:
+    """The topology edge alone moves the digest, with no content change."""
+    module = _load_setup_module()
+    root = _make_project(tmp_path)
+    src_dir = root / "web" / "src"
+    for name in ("a", "b"):
+        (src_dir / name).mkdir()
+        (src_dir / name / "module.ts").write_text(f"export const impl = '{name}';\n")
+    selected = src_dir / "selected"
+    with mock.patch.object(module, "_git_listed_files", return_value=None):
+        selected.symlink_to(src_dir / "a", target_is_directory=True)
+        before = module._web_ui_source_fingerprint(root)
+        selected.unlink()
+        selected.symlink_to(src_dir / "b", target_is_directory=True)
+        assert module._web_ui_source_fingerprint(root) != before
+
+
+# --- Stamp publication -------------------------------------------------------
+
+
+def test_stamp_is_readable_by_another_user(tmp_path: Path) -> None:
+    """A 0600 stamp reads back as a permanent 'no readable stamp' warning.
+
+    The installing user and the serving user are routinely different, and
+    ``NamedTemporaryFile`` creates owner-only while ``os.replace`` preserves
+    the mode — so the published mode has to be set explicitly.
+    """
+    module = _load_setup_module()
+    target = tmp_path / "web-ui" / "omnigent-build-stamp.json"
+    module._write_web_ui_stamp(target, sources="a" * 64, commit="b" * 40)
+    mode = target.stat().st_mode & 0o777
+    assert mode == module._WEB_UI_STAMP_MODE
+    assert mode & 0o044, f"stamp is not group/world readable: {mode:o}"
+
+
+def test_failed_stamp_publish_leaves_no_temp_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_setup_module()
+    target = tmp_path / "web-ui" / "omnigent-build-stamp.json"
+    target.parent.mkdir(parents=True)
+    monkeypatch.setattr(module.os, "replace", mock.Mock(side_effect=OSError("nope")))
+    with pytest.raises(OSError, match="nope"):
+        module._write_web_ui_stamp(target, sources="a" * 64, commit="b" * 40)
+    assert not target.exists()
+    assert list(target.parent.iterdir()) == []
+
+
+# --- Entry-point dispatch ----------------------------------------------------
+#
+# The sentinel flag is handled at module scope, ahead of ``setup()``. These
+# exec the real dispatch against a *copy* of setup.py placed in a throwaway
+# project, so ``_project_root()`` resolves there and no real frontend or real
+# bundle dir is ever touched.
+
+
+def _exec_setup_copy(
+    root: Path, argv: list[str]
+) -> tuple[ModuleType | None, mock.Mock, list[list[str]], SystemExit | None]:
+    """Execute a copy of ``setup.py`` inside ``root`` under ``argv``."""
+    target = root / "setup.py"
+    shutil.copy2(Path(__file__).resolve().parents[1] / "setup.py", target)
+    spec = importlib.util.spec_from_file_location("_omnigent_setup_dispatch", target)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    setuptools = ModuleType("setuptools")
+    setup_mock = mock.Mock()
+    setuptools.setup = setup_mock  # type: ignore[attr-defined]
+    setuptools_command = ModuleType("setuptools.command")
+    setuptools_build_py = ModuleType("setuptools.command.build_py")
+    setuptools_build_py.build_py = type("build_py", (), {})  # type: ignore[attr-defined]
+    invocations: list[list[str]] = []
+
+    def _fake_run(cmd: list[str], **_kwargs: object) -> mock.Mock:
+        parts = [str(part) for part in cmd]
+        if parts[:2] == ["git", "ls-files"]:
+            return mock.Mock(returncode=0, stdout=b"")
+        if parts[0] == "git":
+            return mock.Mock(returncode=0, stdout="f" * 40)
+        if "--version" in parts:
+            return mock.Mock(returncode=0, stdout="v22.20.0\n")
+        invocations.append(parts)
+        return mock.Mock(returncode=0)
+
+    raised: SystemExit | None = None
+    with (
+        mock.patch.dict(
+            sys.modules,
+            {
+                "setuptools": setuptools,
+                "setuptools.command": setuptools_command,
+                "setuptools.command.build_py": setuptools_build_py,
+            },
+        ),
+        mock.patch.object(sys, "argv", argv),
+        mock.patch("subprocess.run", _fake_run),
+        mock.patch("shutil.which", return_value="/usr/bin/pnpm"),
+    ):
+        try:
+            spec.loader.exec_module(module)
+        except SystemExit as exc:
+            raised = exc
+            return None, setup_mock, invocations, raised
+    return module, setup_mock, invocations, raised
+
+
+def test_sentinel_dispatch_builds_and_stamps_without_calling_setup(
+    tmp_path: Path,
+) -> None:
+    root = _make_project(tmp_path, bundle=True)
+    _, setup_mock, invocations, raised = _exec_setup_copy(
+        root, ["setup.py", "--omnigent-build-web-ui"]
+    )
+    assert isinstance(raised, SystemExit)
+    assert raised.code == 0
+    setup_mock.assert_not_called()
+    assert [cmd[1] for cmd in invocations] == ["install", "--filter"]
+    assert _stamp_path(root).is_file()
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["setup.py", "--help"],
+        ["setup.py", "egg_info"],
+        ["setup.py", "bdist_wheel"],
+        ["setup.py"],
+    ],
+)
+def test_ordinary_setuptools_dispatch_is_untouched(tmp_path: Path, argv: list[str]) -> None:
+    """Every non-sentinel argv must fall through to ``setup()`` unchanged."""
+    root = _make_project(tmp_path, bundle=True)
+    module, setup_mock, invocations, raised = _exec_setup_copy(root, argv)
+    assert raised is None
+    assert module is not None
+    setup_mock.assert_called_once()
+    assert setup_mock.call_args.kwargs["cmdclass"] == {"build_py": module._GenerateBuildInfo}
+    # Importing setup.py must never run a frontend build on its own.
+    assert invocations == []
+    assert not _stamp_path(root).is_file()
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        (["setup.py", "--omnigent-build-web-ui"], True),
+        (["setup.py", "bdist_wheel", "--omnigent-build-web-ui"], True),
+        (["setup.py", "--help"], False),
+        (["setup.py", "egg_info"], False),
+        (["setup.py", "bdist_wheel"], False),
+        (["setup.py"], False),
+        (["--omnigent-build-web-ui"], False),
+    ],
+)
+def test_manual_build_requested(argv: list[str], expected: bool) -> None:
+    module = _load_setup_module()
+    assert module._manual_build_requested(argv) is expected
