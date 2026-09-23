@@ -1956,6 +1956,89 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.model_override).toBeUndefined();
   });
 
+  it("rides a picked effort along to create for a claude-sdk brain agent", async () => {
+    // polly's brain is claude-sdk, which reads reasoning_effort at spawn; the
+    // picked effort must travel on the create call as reasoning_effort, with no
+    // model override required.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    // Pick an effort from the Anthropic ladder.
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-efforts"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.harness_override).toBeUndefined();
+  });
+
+  it("omits reasoning_effort for an unpicked claude-sdk brain", async () => {
+    // Unpicked, the brain runs its spec-configured effort, so no override is
+    // sent — the create carries no reasoning_effort.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    // The Effort picker is offered, but nothing is picked.
+    expect(screen.getByTestId("new-chat-landing-agent-efforts")).toBeVisible();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-efforts"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it("does not carry a native agent's picked effort onto a claude-sdk brain", async () => {
+    // Switching from a native agent (effort picked) to polly WITHOUT touching
+    // polly's picker must not force the previous effort — the reset-on-agent
+    // clears it and the native reseed early-returns for the non-native brain.
+    setAgents([
+      agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-efforts"), { key: "Escape" });
+    selectAgent("ag_polly");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_polly");
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
   it("restores the remembered model when switching between two same-harness agents", async () => {
     // Two agents sharing claude-native: the reset clears the pick on every
     // agent switch, and the native reseed effect (keyed on the agent id, not

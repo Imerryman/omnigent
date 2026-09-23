@@ -4162,6 +4162,26 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-model-search")).toBeNull();
   });
 
+  it("offers an Effort submenu with the Anthropic ladder for a claude-sdk brain agent", () => {
+    // A claude-sdk brain gets the same effort ladder as claude-native (Low /
+    // Medium / High / xHigh / Max), not the Pi-specific "Thinking level" header.
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentModels("a_polly");
+    const efforts = screen.getByTestId("new-chat-landing-agent-efforts");
+    expect(efforts).toBeVisible();
+    // Header must say "Effort", not "Thinking level" (pi-native-specific).
+    expect(efforts).toHaveTextContent("Effort");
+    // Anthropic ladder: Low, Medium, High, xHigh, Max.
+    expect(screen.getByTestId("new-chat-landing-agent-effort-low")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-medium")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-high")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-xhigh")).toBeTruthy();
+    expect(screen.getByTestId("new-chat-landing-agent-effort-max")).toBeTruthy();
+    // Not the Pi picker: no search box (pi-native only).
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-search")).toBeNull();
+  });
+
   function mockClaudeAndPi() {
     mockAgents([
       {
