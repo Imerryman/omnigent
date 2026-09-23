@@ -1,6 +1,7 @@
 """FastAPI application — main entry point for the omnigent server."""
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -269,6 +270,14 @@ _WEB_UI_DIST = Path(
 # inline string so it doesn't clutter the app definition; it's pure static
 # markup with no interpolation. Shipped via package-data in pyproject.toml.
 _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.html"
+# Stamp that ``setup.py`` writes into the Vite output dir, recording the
+# commit and frontend-source fingerprint the bundle was built from. Keep the
+# name in sync with ``setup.py``'s ``_WEB_UI_STAMP_NAME``.
+_WEB_UI_BUILD_STAMP_NAME = "omnigent-build-stamp.json"
+_WEB_UI_STALE_FIX = (
+    "rebuild it with `pnpm install --frozen-lockfile --filter web && "
+    "pnpm --filter web run build`, or reinstall with OMNIGENT_BUILD_WEB_UI=1"
+)
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
@@ -3929,6 +3938,7 @@ def create_app(
     web_ui_dist = _WEB_UI_DIST
     web_ui_present = web_ui_dist.is_dir() and (web_ui_dist / "index.html").is_file()
     if web_ui_present:
+        _warn_if_web_ui_bundle_stale(web_ui_dist)
         app.mount(
             "/",
             _RangeAwareGZipMiddleware(
@@ -3957,6 +3967,68 @@ def create_app(
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
     return app
+
+
+@functools.lru_cache(maxsize=8)
+def _warn_if_web_ui_bundle_stale(dist: Path) -> None:
+    """Log a WARNING when the mounted SPA predates the installed package.
+
+    An upgrade regenerates ``omnigent/_build_info.py`` unconditionally but
+    only rebuilds the SPA when its sources changed, and an install that
+    could not run the frontend toolchain leaves the old bundle in place
+    entirely. Either way the server would otherwise report the new version
+    while serving an older UI. Comparing the bundle's build stamp against
+    ``_build_info.COMMIT_SHA`` turns that silent lie into a startup warning.
+
+    Reads one small JSON file, memoized per bundle dir, so repeat
+    ``create_app()`` calls in one process pay for it once and no request
+    path ever touches the bundle. Never fatal: a stale UI is a nuisance,
+    not a reason to refuse to boot.
+
+    :param dist: Directory the SPA is mounted from.
+    """
+    from omnigent.update_check import _read_build_info
+
+    info = _read_build_info()
+    if info is None:
+        # Source checkout that was never built through setup.py — there is
+        # no installed commit to compare the bundle against.
+        return
+    _, commit = info
+    if not commit:
+        # Built without git (sdist, Docker context with no .git). No SHA.
+        return
+
+    try:
+        stamp = json.loads((dist / _WEB_UI_BUILD_STAMP_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        stamp = None
+    if not isinstance(stamp, dict):
+        if os.environ.get("OMNIGENT_WEB_UI_DIST"):
+            # A deploy that ships the SPA outside the wheel (see _WEB_UI_DIST)
+            # supplies a bundle setup.py never saw, so an absent stamp says
+            # nothing about staleness. A *mismatched* stamp still warns below.
+            return
+        _logger.warning(
+            "web-ui: the bundle at %s carries no build stamp, so it cannot be "
+            "matched against this install (commit %s). If the UI looks out of "
+            "date, %s.",
+            dist,
+            commit[:12],
+            _WEB_UI_STALE_FIX,
+        )
+        return
+    bundle_commit = str(stamp.get("commit") or "")
+    if bundle_commit != commit:
+        _logger.warning(
+            "web-ui: STALE BUNDLE — the SPA at %s was built from commit %s but "
+            "this install is commit %s, so the browser is served an older UI "
+            "than the version this server reports. To fix, %s.",
+            dist,
+            bundle_commit[:12] or "unknown",
+            commit[:12],
+            _WEB_UI_STALE_FIX,
+        )
 
 
 class _SPAStaticFiles(StaticFiles):
