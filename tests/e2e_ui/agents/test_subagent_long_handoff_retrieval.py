@@ -43,9 +43,10 @@ _RELAY_DONE = "WRITER_REPORT_RELAYED"
 _RETRIEVAL_DONE = "FULL_REPORT_RETRIEVED"
 _TRUNCATION_HINT = "read the full text with sys_session_get_history"
 
-# Longer than the 12000-char inbox delivery cap, so the wake delivery
-# arrives truncated and only the retrieval path can show the tail.
-_HANDOFF_LEN = 20000
+# Longer than the 30000-char inbox delivery cap (_INBOX_OUTPUT_MAX_CHARS in
+# runner/tool_dispatch.py), so the wake delivery arrives truncated and only the
+# retrieval path can show the tail. Kept well above the cap for headroom.
+_HANDOFF_LEN = 40000
 
 pytestmark = [pytest.mark.timeout(600, method="signal")]
 
@@ -334,10 +335,10 @@ def test_long_subagent_handoff_tail_reachable_in_parent_chat(
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
 ) -> None:
-    """The parent transcript can show the full >12k handoff via retrieval.
+    """The parent transcript can show the full >30k handoff via retrieval.
 
     Journey (all in the browser): ask the orchestrator to delegate the
-    report → dispatch ack → the writer finishes with a 20000-char report →
+    report → dispatch ack → the writer finishes with a 40000-char report →
     the parent auto-wakes with a bounded result that names the retrieval path →
     the next turn reads the child session with ``sys_session_get_history`` →
     the report's end marker is visible in the parent transcript.
@@ -380,7 +381,7 @@ def test_long_subagent_handoff_tail_reachable_in_parent_chat(
     assert result["delivery_hint_reached_parent"], result
     assert not result["end_marker_reached_parent_before_retrieval"], result
     assert result["end_marker_hits_after_delivery"] == 0, (
-        f"the >12k report unexpectedly arrived whole before retrieval: {result!r}"
+        f"the >30k report unexpectedly arrived whole before retrieval: {result!r}"
     )
     # The user-visible fix: following the marker surfaces the complete
     # report — its end marker is on the parent session page.
