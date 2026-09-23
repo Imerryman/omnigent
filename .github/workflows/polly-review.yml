@@ -213,8 +213,7 @@ jobs:
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         # tmux: Polly uses it for its shell terminal.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tmux
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" tmux
 
       - name: Cache virtualenv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'

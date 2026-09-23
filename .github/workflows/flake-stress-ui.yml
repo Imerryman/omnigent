@@ -239,8 +239,7 @@ jobs:
         # namespaces, which bwrap's unshare(CLONE_NEWUSER) needs). tmux: the
         # native render-parity tests drive the CLIs through a tmux pane.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bubblewrap tmux
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Download codex-parity sidecar binary

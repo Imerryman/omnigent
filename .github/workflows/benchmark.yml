@@ -135,7 +135,7 @@ jobs:
         # stores-mysql lane in ci.yml.
         if: matrix.backend == 'mysql'
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" --with-recommends libmysqlclient-dev
           uv pip install mysqlclient
 
       # Resolve the DB URI + a stable seed-cache key for this backend. The

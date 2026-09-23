@@ -144,8 +144,7 @@ jobs:
         # Inner tests need these (Grep fallback, linux_bwrap sandbox);
         # always install so inner-test flakes work. Apparmor sysctl mirrors ci.yml.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep bubblewrap
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" ripgrep bubblewrap
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
