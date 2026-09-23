@@ -1787,7 +1787,9 @@ function HarnessConfigModal({
     ? claudeModelSelectOptions
     : hasApproval
       ? codexModelSelectOptions
-      : piModelOptions;
+      : hasSdkModelPicker
+        ? claudeModelSelectOptions
+        : piModelOptions;
   useEffect(() => {
     if (!open || !draftModel || draftModelOptions.length === 0) return;
     if (!draftModelOptions.some((m) => m.id === draftModel)) setDraftModel("");
@@ -3390,14 +3392,19 @@ export function NewChatLandingScreen() {
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
+      // Unlike claude-native, the claude-sdk brain's "no override" state
+      // isn't the CATALOG default — it's whatever the agent's spec configures
+      // (see `agent.executor.model`), which isn't known client-side here. So
+      // an unpicked model reads as the plain "Default" rather than
+      // `defaultModelLabel`'s catalog-default name, which would assert a
+      // specific model the runtime may not actually use.
       const modelRow =
         active === "claude-sdk"
           ? [
               {
                 label: "Model",
                 value:
-                  claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ??
-                  defaultModelLabel(claudeModelOptions),
+                  claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? "Default",
               },
             ]
           : [];
@@ -3456,7 +3463,16 @@ export function NewChatLandingScreen() {
     userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
-  }, [effectiveAgentId, setCostControlMode]);
+    // A picked model is per-agent-instance too: the claude-sdk-brain seed
+    // effect below early-returns for a non-native agent (it has no
+    // `selectedNativeHarness` to key off), so without this reset a model
+    // picked for a PREVIOUS agent would silently ride along onto the newly
+    // selected one — including forcing a pin on a bundle agent the user
+    // never opened the picker for. A native-harness switch immediately
+    // reseeds this from that agent's own remembered pick via the effect
+    // below, so this reset never strands a native agent on "Default".
+    setPickedModel("");
+  }, [effectiveAgentId, setCostControlMode, setPickedModel]);
   // A project-configured default model (Project settings) outranks the user's
   // remembered per-harness pick — but only while the composer sits on the
   // project's configured agent; switching to another agent falls back to the

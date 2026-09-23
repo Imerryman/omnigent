@@ -5445,6 +5445,40 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
     expect(tooltip.textContent).not.toContain("Permissions");
   });
 
+  it("doesn't name the claude-native catalog's default model for an unpicked claude-sdk brain", async () => {
+    // The claude-native catalog marks a default row (what a BARE claude-native
+    // launch would run), but the claude-sdk BRAIN's own "no override" state
+    // defers to the agent's spec model instead — unknown client-side here.
+    // Naming "Opus" would assert a model the runtime might not actually use.
+    useHostModelOptionsMock.mockImplementation(
+      (_hostId, harness) =>
+        (harness === "codex-native"
+          ? CODEX_MODEL_OPTIONS_RESULT
+          : {
+              data: [
+                { id: "opus", displayName: "Opus", isDefault: true },
+                { id: "sonnet", displayName: "Sonnet" },
+              ],
+              isLoading: false,
+              isError: false,
+            }) as unknown as ReturnType<typeof useHostModelOptions>,
+    );
+    renderLanding({ smart_routing_enabled: true });
+    selectAgent("ag_debby");
+    fireEvent.focus(screen.getByTestId("new-chat-landing-config-gear"));
+    await waitFor(() =>
+      expect(screen.getAllByTestId("new-chat-landing-config-gear-tooltip").length).toBeGreaterThan(
+        0,
+      ),
+    );
+    const tooltip = screen.getAllByTestId("new-chat-landing-config-gear-tooltip")[0];
+    expect(tooltip.textContent).toContain("Model: Default");
+    expect(tooltip.textContent).not.toContain("Opus");
+    // The modal itself must stay generic too.
+    openAgentConfig("ag_debby");
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toBe("Default");
+  });
+
   it.each(BOTH_BUNDLES)(
     "sends harness_override 'auto' with routing on and no pinned model for %s",
     async (_name, agentId) => {
