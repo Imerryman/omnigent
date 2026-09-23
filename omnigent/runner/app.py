@@ -13182,9 +13182,7 @@ def create_runner_app(
             # signal, so it is at most one GET per idle codex pane per scan.)
             if pane.terminal_name == "codex":
                 try:
-                    resp = await server_client.get(
-                        f"/v1/sessions/{conv_id}", timeout=5.0
-                    )
+                    resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=5.0)
                     if resp.status_code != 200:
                         return True
                     if resp.json().get("status") in ("running", "waiting"):
