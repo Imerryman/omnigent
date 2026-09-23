@@ -3315,9 +3315,10 @@ export function NewChatLandingScreen() {
       const modelRow = pickedClaudeModelLabel
         ? [{ label: "Model", value: pickedClaudeModelLabel }]
         : [];
-      const effortRow = pickedEffort
-        ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
-        : [];
+      const effortRow =
+        active === "claude-sdk" && pickedEffort
+          ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+          : [];
       return [
         ...modelRow,
         ...effortRow,
@@ -3479,15 +3480,15 @@ export function NewChatLandingScreen() {
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
-    : hasSdkModelPicker
-      ? CLAUDE_NATIVE_EFFORTS
-      : selectedNativeHarness === "pi-native"
-        ? PI_NATIVE_EFFORTS
-        : selectedNativeHarness === "codex-native"
-          ? codexEffortLevelsForModel(
-              codexModelOptions,
-              pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
-            ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+    : selectedNativeHarness === "pi-native"
+      ? PI_NATIVE_EFFORTS
+      : selectedNativeHarness === "codex-native"
+        ? codexEffortLevelsForModel(
+            codexModelOptions,
+            pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
+          ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
+        : hasSdkModelPicker
+          ? CLAUDE_NATIVE_EFFORTS
           : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;

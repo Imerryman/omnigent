@@ -2039,6 +2039,39 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.reasoning_effort).toBeUndefined();
   });
 
+  it("hides the Effort summary row when switching harness away from claude-sdk", async () => {
+    // Picking effort for a claude-sdk brain shows the Effort row in the
+    // config-summary. Switching the Agent Harness to a non-SDK harness (Pi,
+    // Codex, Auto) WITHOUT changing agents must remove that row — the effort
+    // pick is harness-scoped and the summary must not claim an effort that
+    // will not be sent on create.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    // Pick an effort and a model for the claude-sdk brain.
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "High" }));
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-efforts"), { key: "Escape" });
+    // The summary should show both Model and Effort rows.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).toContain("High");
+    // Switch the Agent Harness to Pi (a non-SDK harness).
+    openAgentConfig("ag_polly");
+    pickSelectOption("new-chat-landing-config-harness", "Pi");
+    saveConfig();
+    // The Effort row must no longer appear in the summary — Pi does not use
+    // the Anthropic effort ladder, and the create predicate omits
+    // reasoning_effort for that harness.
+    expect(screen.getByTestId("new-chat-landing-agent-select").textContent).not.toContain("High");
+  });
+
   it("restores the remembered model when switching between two same-harness agents", async () => {
     // Two agents sharing claude-native: the reset clears the pick on every
     // agent switch, and the native reseed effect (keyed on the agent id, not
