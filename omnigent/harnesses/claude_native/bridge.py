@@ -354,6 +354,18 @@ _MODEL_PICKER_FOOTER_MARKERS = (
     "".join(_MODEL_PICKER_OPEN_HINT.split()).lower(),
     "esctocancel",
 )
+# The ``/model`` picker's own overlay chrome, used to POSITIVELY identify the
+# picker region before matching its footer (see
+# :func:`_model_picker_footer_present`): its header title, and a numbered
+# selection row (``❯ 1. …`` / ``2. …``). Requiring real chrome — not just the
+# footer words — is what stops ordinary prose that happens to contain the marker
+# phrases in order from reading as a live picker.
+_MODEL_PICKER_TITLE_HINT = "select model"
+_MODEL_PICKER_MENU_ROW_RE = re.compile(r"^[❯>\s]*\d+\.\s")
+# Transcript/scrollback rows are prefixed with this glyph; they are conversation
+# history, never live overlay chrome, so they are dropped before any picker /
+# footer matching.
+_TRANSCRIPT_MARKER = "⎿"
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -5081,46 +5093,53 @@ def _submit_popped_surface(pane: str) -> bool:
 
 def _model_picker_footer_present(pane: str) -> bool:
     """
-    Return whether a pane shows the ``/model`` picker's footer action chrome.
+    Return whether a pane shows the live ``/model`` picker overlay.
 
-    The picker is a full-screen menu with no box frame; its footer is a single
-    menu line — ``Enter to set as default · s to use this session only · Esc to
-    cancel`` — that a narrow terminal soft-wraps across rows (``_capture_pane``
-    preserves the wrap), splitting the markers over lines and even mid-token.
+    Root-cause identification, in three steps, so ordinary transcript prose that
+    merely contains the footer's action phrases can never read as a picker:
 
-    Identity is the footer's **ordered action structure**, not the mere presence
-    of its words: the three markers must appear *in order*
-    (:data:`_MODEL_PICKER_FOOTER_MARKERS`) within one contiguous run of
-    non-blank lines, folded to absorb the wrap. Collecting independent
-    substrings anywhere in a block instead let unrelated transcript prose — two
-    ``⎿`` lines that separately mention "use this session only" and "Esc to
-    cancel" — stitch into a fake footer; requiring the full ordered trio
-    (the transcript lacks "Enter to set", and prose rarely lands all three in
-    order) keeps that a non-match while a genuinely wrapped footer still hits.
+    1. **Drop transcript rows.** A line prefixed with :data:`_TRANSCRIPT_MARKER`
+       (``⎿``) is conversation history, never live overlay chrome, so it is
+       removed before anything is matched. (Both reviewer repros are entirely
+       ``⎿`` prose, so this alone disqualifies them.)
+    2. **Positively identify the picker region.** The remaining lines must carry
+       the picker's own chrome — its ``Select model`` title
+       (:data:`_MODEL_PICKER_TITLE_HINT`) or a numbered selection row
+       (:data:`_MODEL_PICKER_MENU_ROW_RE`, e.g. ``❯ 1. …``). Marker phrases with
+       no such chrome above them are prose, not a picker.
+    3. **Match the ordered footer within that region.** Only then are the action
+       markers (:data:`_MODEL_PICKER_FOOTER_MARKERS`) matched, in order, over the
+       chrome region folded to absorb a soft-wrapped (even mid-token-split)
+       footer — preserving the narrow-pane wrapped-picker case.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when a contiguous block carries the ordered footer.
+    :returns: ``True`` when the live picker overlay (with its ordered footer) is
+        on screen.
     """
-    lines = pane.splitlines()
-    i = 0
-    while i < len(lines):
-        if not lines[i].strip():
-            i += 1
-            continue
-        j = i
-        while j < len(lines) and lines[j].strip():
-            j += 1
-        folded = "".join("".join(line.split()) for line in lines[i:j]).lower()
-        pos = 0
-        for marker in _MODEL_PICKER_FOOTER_MARKERS:
-            found = folded.find(marker, pos)
-            if found == -1:
-                break
-            pos = found + len(marker)
-        else:
-            return True
-        i = j
-    return False
+    # 1. Live overlay chrome only — never scrollback/transcript rows.
+    lines = [
+        line
+        for line in pane.splitlines()
+        if line.strip() and not line.strip().startswith(_TRANSCRIPT_MARKER)
+    ]
+    if not lines:
+        return False
+    # 2. Positive picker chrome must be present, or marker phrases are prose.
+    has_picker_chrome = any(
+        _MODEL_PICKER_TITLE_HINT in line.lower() or _MODEL_PICKER_MENU_ROW_RE.match(line.strip())
+        for line in lines
+    )
+    if not has_picker_chrome:
+        return False
+    # 3. Ordered footer markers within the identified region, wrap-tolerant.
+    folded = "".join("".join(line.split()) for line in lines).lower()
+    pos = 0
+    for marker in _MODEL_PICKER_FOOTER_MARKERS:
+        found = folded.find(marker, pos)
+        if found == -1:
+            return False
+        pos = found + len(marker)
+    return True
 
 
 def _claude_prompt_rendered(pane: str) -> bool:

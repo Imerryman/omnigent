@@ -4993,6 +4993,108 @@ def test_submit_torn_capture_with_footer_words_scattered_in_transcript_does_not_
     )
 
 
+def test_submit_transcript_prose_with_ordered_footer_markers_does_not_accept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transcript prose carrying all footer phrases IN ORDER is not a picker.
+
+    Regression (BLOCKING 1, 5th round — root cause): matching the ordered
+    marker subsequence anywhere in a non-blank block was defeated by natural
+    prose that happens to say "Enter to set …", "use this session only", then
+    "Esc to cancel" across three ``⎿`` transcript lines. The picker is now
+    identified by its own overlay chrome AND transcript (``⎿``) rows are
+    excluded, so this history prose stays PENDING and the still-present draft
+    on later captures fails loud.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S", 0.05, raising=False
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    draft_pane = _composer_pane("keep me unsent")
+    # Three transcript lines carrying the footer phrases in order — but they are
+    # conversation history (⎿), not a live picker overlay.
+    prose_pane = (
+        "  ⎿ The docs say Enter to set the default model.\n"
+        "  ⎿ Choose use this session only for a temporary change.\n"
+        "  ⎿ You can press Esc to cancel the menu.\n"
+    )
+    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            if not state["submitted"]:
+                return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
+            state["verify_captures"] += 1
+            if state["verify_captures"] == 1:
+                return SimpleNamespace(returncode=0, stdout=prose_pane, stderr="")
+            return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
+        if cmd[-1] == "Enter":
+            state["submitted"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="keep me unsent")
+
+    assert state["verify_captures"] >= 2, (
+        "verification accepted on ordered-marker transcript prose instead of "
+        f"waiting for a real picker overlay; verify_captures={state['verify_captures']}"
+    )
+
+
+def test_model_picker_footer_present_requires_overlay_chrome() -> None:
+    """The footer matcher needs positive picker chrome and rejects transcript.
+
+    Root-cause unit coverage for :func:`_model_picker_footer_present`:
+    - a genuine picker overlay (title + numbered rows) whose footer is soft-
+      wrapped across rows still matches;
+    - the same footer markers, in order, appearing only in ``⎿`` transcript
+      prose do NOT match (transcript rows are excluded);
+    - footer markers with NO picker chrome above them (non-transcript prose,
+      but no title/menu row) do NOT match.
+    """
+    from omnigent.harnesses.claude_native.bridge import _model_picker_footer_present
+
+    wrapped_overlay = (
+        "  Select model\n"
+        "  ❯ 3. databricks-claude-sonnet-5 ✔\n"
+        "  Enter to set as default · s\n"
+        "to use this session only · Esc\n"
+        " to cancel\n"
+    )
+    assert _model_picker_footer_present(wrapped_overlay) is True
+
+    transcript_prose = (
+        "  ⎿ The docs say Enter to set the default model.\n"
+        "  ⎿ Choose use this session only for a temporary change.\n"
+        "  ⎿ You can press Esc to cancel the menu.\n"
+    )
+    assert _model_picker_footer_present(transcript_prose) is False
+
+    chromeless_prose = (
+        "Enter to set the default model, then\n"
+        "use this session only, and finally\n"
+        "press Esc to cancel when you are done.\n"
+    )
+    assert _model_picker_footer_present(chromeless_prose) is False
+
+
 def test_submit_accepts_wrapped_model_picker_footer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
