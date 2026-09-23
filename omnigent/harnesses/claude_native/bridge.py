@@ -5035,7 +5035,12 @@ def _submit_popped_surface(pane: str) -> bool:
       box, so it must sit on a row framed by a vertical rule glyph
       (:data:`_VERTICAL_RULE_GLYPHS`).
     - The ``/model`` picker is a full-screen menu, identified by its footer
-      action chrome carrying :data:`_MODEL_PICKER_OPEN_HINT`.
+      action chrome — :data:`_MODEL_PICKER_OPEN_HINT` together with an
+      "Enter to set"/"Esc to cancel" action marker (see
+      :func:`_model_picker_footer_present`). Because ``_capture_pane`` keeps
+      the terminal's own line breaks, a narrow pane soft-wraps that footer
+      across rows, so the markers are matched over a contiguous block with
+      whitespace folded out rather than demanding one row carry them all.
 
     A bare composer-absent-plus-substring check was not enough: a torn/partial
     capture that just omits the composer, or a dialog title echoed in the
@@ -5050,20 +5055,51 @@ def _submit_popped_surface(pane: str) -> bool:
     """
     if _composer_row(pane) is not None:
         return False
+    # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
     for raw in pane.splitlines():
         stripped = raw.strip()
-        if not stripped:
+        if (
+            stripped[:1]
+            and stripped[0] in _VERTICAL_RULE_GLYPHS
+            and any(hint in stripped for hint in _BOXED_DIALOG_HINTS)
+        ):
+            return True
+    # ``/model`` picker: footer action chrome, tolerant of a wrapped footer.
+    return _model_picker_footer_present(pane)
+
+
+def _model_picker_footer_present(pane: str) -> bool:
+    """
+    Return whether a pane shows the ``/model`` picker's footer action chrome.
+
+    The picker is a full-screen menu with no box frame; its footer reads
+    ``Enter to set as default · s to use this session only · Esc to cancel``.
+    A narrow terminal soft-wraps that footer across rows (``_capture_pane``
+    preserves the wrap), so the hint and the action markers can land on
+    different lines and even split mid-token. Each maximal run of non-blank
+    lines is therefore folded to a whitespace-free string and matched as a
+    unit: the run must carry the picker hint AND an action marker, which is
+    stronger than a bare pane-wide substring (a stray footer word in the
+    transcript never gathers the whole marker set into one contiguous run).
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a contiguous block carries the picker footer.
+    """
+    hint = "".join(_MODEL_PICKER_OPEN_HINT.split()).lower()
+    actions = ("entertoset", "esctocancel")
+    lines = pane.splitlines()
+    i = 0
+    while i < len(lines):
+        if not lines[i].strip():
+            i += 1
             continue
-        # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
-        if stripped[0] in _VERTICAL_RULE_GLYPHS and any(
-            hint in stripped for hint in _BOXED_DIALOG_HINTS
-        ):
+        j = i
+        while j < len(lines) and lines[j].strip():
+            j += 1
+        folded = "".join("".join(line.split()) for line in lines[i:j]).lower()
+        if hint in folded and any(action in folded for action in actions):
             return True
-        # ``/model`` picker: its footer action chrome on one line.
-        if _MODEL_PICKER_OPEN_HINT in stripped and (
-            "Esc to cancel" in stripped or "Enter to set" in stripped
-        ):
-            return True
+        i = j
     return False
 
 

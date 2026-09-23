@@ -4928,6 +4928,72 @@ def test_submit_torn_capture_with_transcript_hint_does_not_accept(
     )
 
 
+def test_submit_accepts_wrapped_model_picker_footer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A narrow-pane ``/model`` picker whose footer wrapped is still accepted.
+
+    Regression: ``_capture_pane`` preserves the terminal's line breaks, so a
+    narrow pane soft-wraps the picker footer
+    (``Enter to set as default · s to use this session only · Esc to cancel``)
+    across rows, splitting the hint from the action markers. The
+    same-line-only matcher then false-rejected a displayed picker, waiting the
+    full verify window before reporting failure. The submit must be accepted
+    promptly, and no Enter may be sent into the picker (its default answer
+    rewrites the global model default).
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 5.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    # The picker footer wrapped to a narrow pane: hint and action markers on
+    # different rows, "Esc to cancel" split mid-marker.
+    wrapped_picker = (
+        "  Select model\n"
+        "  ❯ 3. databricks-claude-sonnet-5 ✔\n"
+        "  Enter to set as default · s\n"
+        "to use this session only · Esc\n"
+        " to cancel\n"
+    )
+    enters: list[list[str]] = []
+    tui: dict[str, Any] = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("set the model")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            # The submit pops the /model picker, whose wrapped footer replaces
+            # the composer before the cleared box is captured.
+            tui["pane"] = wrapped_picker
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    started = time.monotonic()
+    inject_user_message(bridge_dir, content="set the model")
+    elapsed = time.monotonic() - started
+
+    assert len(enters) == 1, (
+        f"exactly one submit Enter and none into the picker; got {len(enters)}"
+    )
+    # Accepted promptly on the first verify capture, not after the full window.
+    assert elapsed < 4.0, f"picker acceptance should be prompt, took {elapsed:.1f}s"
+
+
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
