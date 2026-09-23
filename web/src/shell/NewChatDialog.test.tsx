@@ -5188,12 +5188,14 @@ describe("claude-code default permission mode (payload anchor for Auto)", () => 
 });
 // ---------------------------------------------------------------------------
 // Smart Routing on a BUNDLE agent (Debby / Polly). Their brain runs on
-// claude-sdk — not one of the two routable native harnesses — so the per-turn
-// "Smart Routing" Model option never applies to them. Their whole routing story
-// is the gear modal's Agent Harness row, where picking Smart Routing hands the
-// harness AND the model to the router. These cover the config menu that pick
-// leaves behind: what stays selectable, what goes away, and what the create
-// call carries.
+// claude-sdk by default — not one of the two routable native harnesses, so
+// the PER-TURN "Smart Routing" Model option never applies to them, and
+// picking Smart Routing itself only happens via the gear modal's Agent
+// Harness row (which hands the harness AND the model to the router). Their
+// claude-sdk brain does get its own plain (non-routed) Model row, same as
+// claude-native's, once Smart Routing isn't the active pick. These cover the
+// config menu that pick leaves behind: what stays selectable, what goes
+// away, and what the create call carries.
 // ---------------------------------------------------------------------------
 
 describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
@@ -5239,16 +5241,18 @@ describe("NewChatLandingScreen bundle-agent Smart Routing", () => {
   ] as const;
 
   it.each(BOTH_BUNDLES)(
-    "%s's config menu is the brain-harness row alone, led by Smart Routing",
+    "%s's config menu offers a claude-sdk Model row plus the brain-harness row, led by Smart Routing",
     (name, agentId) => {
       renderLanding({ smart_routing_enabled: true });
       openAgentConfig(agentId);
       expect(screen.getByTestId("new-chat-landing-config-modal").textContent).toContain(
         `Configure ${name}`,
       );
-      // claude-sdk isn't a routable native harness, so none of the per-harness
-      // knobs (which is where the per-turn routing Model option lives) apply.
-      expect(screen.queryByTestId("new-chat-landing-config-model")).toBeNull();
+      // claude-sdk isn't a routable native harness, so the per-turn routing
+      // Model option (Smart Routing as a row inside the Model picker) never
+      // applies — but the brain still reads the runtime override plumbing
+      // claude-native uses, so a plain (non-routed) Model pick is offered.
+      expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Default");
       expect(screen.queryByTestId("new-chat-landing-config-effort")).toBeNull();
       expect(screen.queryByTestId("new-chat-landing-config-approval")).toBeNull();
       const harness = screen.getByTestId("new-chat-landing-config-harness");
