@@ -4968,7 +4968,8 @@ export function NewChatLandingScreen() {
       // model through the same `model_override` create field claude-native uses,
       // even though it has no native-wrapper capability of its own.
       const agentBrainIsSdk =
-        effectiveBrainHarness(agent?.harness, pickedHarness, brainHarnessLabelsAll) === "claude-sdk";
+        effectiveBrainHarness(agent?.harness, pickedHarness, brainHarnessLabelsAll) ===
+        "claude-sdk";
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is

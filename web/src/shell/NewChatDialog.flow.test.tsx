@@ -1962,8 +1962,18 @@ describe("NewChatLandingScreen create flow", () => {
     // just the harness) restores the harness's remembered pick — so the second
     // agent's create still carries model_override.
     setAgents([
-      agent({ id: "ag_native1", name: "claude-native-ui", display_name: "Claude Code", harness: "claude-native" }),
-      agent({ id: "ag_native2", name: "claude-native-custom", display_name: "Custom Claude", harness: "claude-native" }),
+      agent({
+        id: "ag_native1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+      agent({
+        id: "ag_native2",
+        name: "claude-native-custom",
+        display_name: "Custom Claude",
+        harness: "claude-native",
+      }),
     ]);
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
