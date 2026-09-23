@@ -69,7 +69,7 @@ def test_mismatched_stamp_warns_with_both_commits(
     assert "STALE BUNDLE" in message
     assert _OLD_SHA[:12] in message
     assert _INSTALLED_SHA[:12] in message
-    assert "pnpm --filter web run build" in message
+    assert "setup.py --omnigent-build-web-ui" in message
     assert "OMNIGENT_BUILD_WEB_UI=1" in message
 
 
@@ -80,7 +80,7 @@ def test_missing_stamp_warns(
     with caplog.at_level(logging.WARNING, logger=app_module.__name__):
         app_module._warn_if_web_ui_bundle_stale(bundle)
     assert len(caplog.records) == 1
-    assert "no build stamp" in caplog.records[0].getMessage()
+    assert "no readable build stamp" in caplog.records[0].getMessage()
 
 
 def test_corrupt_stamp_warns(
@@ -91,7 +91,7 @@ def test_corrupt_stamp_warns(
     with caplog.at_level(logging.WARNING, logger=app_module.__name__):
         app_module._warn_if_web_ui_bundle_stale(bundle)
     assert len(caplog.records) == 1
-    assert "no build stamp" in caplog.records[0].getMessage()
+    assert "no readable build stamp" in caplog.records[0].getMessage()
 
 
 def test_unbuilt_source_checkout_is_silent(
@@ -140,25 +140,81 @@ def test_stale_bundle_still_mounts_the_spa(stale_web_ui_dist: Path, app: FastAPI
     assert any(getattr(route, "name", None) == "web-ui" for route in app.routes)
 
 
-def test_externally_supplied_bundle_without_stamp_is_silent(
-    bundle: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("stamp", [None, "corrupt", _OLD_SHA])
+def test_externally_supplied_bundle_gets_no_exemption(
+    bundle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    stamp: str | None,
 ) -> None:
-    """A deploy that ships the SPA outside the wheel has no stamp to match."""
+    """A bundle shipped outside the wheel is held to the same standard.
+
+    Unknown provenance is exactly the condition this check exists to
+    surface, so neither a missing nor an unreadable stamp buys silence
+    just because ``OMNIGENT_WEB_UI_DIST`` is pointing at the bundle.
+    """
     _fake_build_info(monkeypatch, (0.0, _INSTALLED_SHA))
     monkeypatch.setenv("OMNIGENT_WEB_UI_DIST", str(bundle))
+    if stamp == "corrupt":
+        (bundle / app_module._WEB_UI_BUILD_STAMP_NAME).write_text("{not json")
+    elif stamp is not None:
+        _write_stamp(bundle, stamp)
+    with caplog.at_level(logging.WARNING, logger=app_module.__name__):
+        app_module._warn_if_web_ui_bundle_stale(bundle)
+    assert len(caplog.records) == 1
+
+
+def test_stale_external_bundle_still_mounts_the_spa(
+    bundle: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """Warning about an external bundle must not stop it being served."""
+    _fake_build_info(monkeypatch, (0.0, _INSTALLED_SHA))
+    monkeypatch.setenv("OMNIGENT_WEB_UI_DIST", str(bundle))
+    monkeypatch.setattr(app_module, "_WEB_UI_DIST", bundle)
+    app = request.getfixturevalue("app")
+    assert any(getattr(route, "name", None) == "web-ui" for route in app.routes)
+
+
+@pytest.mark.parametrize("value", ["1", "true", "YES", "on"])
+def test_explicit_opt_out_silences_the_warning(
+    bundle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: str,
+) -> None:
+    """The only way out is the documented, default-off env var."""
+    _fake_build_info(monkeypatch, (0.0, _INSTALLED_SHA))
+    _write_stamp(bundle, _OLD_SHA)
+    monkeypatch.setenv(app_module._WEB_UI_STALE_WARNING_OPT_OUT, value)
     with caplog.at_level(logging.WARNING, logger=app_module.__name__):
         app_module._warn_if_web_ui_bundle_stale(bundle)
     assert caplog.records == []
 
 
-def test_externally_supplied_bundle_with_old_stamp_still_warns(
-    bundle: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("value", ["", "0", "false", "off", "nonsense"])
+def test_opt_out_is_off_by_default_and_on_junk(
+    bundle: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    value: str,
 ) -> None:
-    """An external bundle that does carry a stamp is still held to it."""
     _fake_build_info(monkeypatch, (0.0, _INSTALLED_SHA))
-    monkeypatch.setenv("OMNIGENT_WEB_UI_DIST", str(bundle))
     _write_stamp(bundle, _OLD_SHA)
+    monkeypatch.setenv(app_module._WEB_UI_STALE_WARNING_OPT_OUT, value)
     with caplog.at_level(logging.WARNING, logger=app_module.__name__):
         app_module._warn_if_web_ui_bundle_stale(bundle)
     assert len(caplog.records) == 1
-    assert "STALE BUNDLE" in caplog.records[0].getMessage()
+
+
+def test_advertised_fix_points_at_a_command_that_writes_a_stamp(
+    bundle: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A bare `pnpm run build` leaves no stamp, so it cannot be the advice."""
+    _fake_build_info(monkeypatch, (0.0, _INSTALLED_SHA))
+    _write_stamp(bundle, _OLD_SHA)
+    with caplog.at_level(logging.WARNING, logger=app_module.__name__):
+        app_module._warn_if_web_ui_bundle_stale(bundle)
+    message = caplog.records[0].getMessage()
+    assert "setup.py --omnigent-build-web-ui" in message
+    assert "OMNIGENT_BUILD_WEB_UI=1" in message
+    assert "writes no stamp" in message
