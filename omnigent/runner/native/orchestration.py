@@ -36,8 +36,8 @@ if TYPE_CHECKING:
     from omnigent.harnesses.opencode_native.app_server import OpenCodeNativeServer
     from omnigent.harnesses.opencode_native.client import OpenCodeClient, OpenCodeSession
     from omnigent.harnesses.opencode_native.forwarder import OpenCodeNativeForwarder
-    from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.harnesses.qwen_native.settings import QwenSubagentLaunch
+    from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.runner.subagent_routing import SubagentRouter
     from omnigent.runner.turn_routing import TurnRouter
     from omnigent.spec.types import MCPServerConfig
@@ -3834,7 +3834,11 @@ async def _auto_create_qwen_terminal(
 
     qwen_recording_path = qwen_session_recording_path(qwen_session_id, workspace)
 
-    if mcp_enabled:
+    # ``mcp_enabled`` already implies ``ensure_comment_relay is not None`` (see
+    # its definition above), but the narrowing is restated here so the type
+    # checker can see the callback is non-None at the call, matching the guard
+    # every other relay call site in this module uses.
+    if mcp_enabled and ensure_comment_relay is not None:
         await ensure_comment_relay(
             session_id,
             explicit_bridge_dir=bridge_dir,
