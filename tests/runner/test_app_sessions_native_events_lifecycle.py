@@ -1016,13 +1016,6 @@ async def test_codex_native_model_options_query_model_list(
     for model_row in expected_models:
         if model_row["id"] == expected_default:
             model_row["isDefault"] = True
-        # Post-0.13 the endpoint stamps the resolved provider source on every
-        # row (_with_model_configuration_source); it is deterministic here.
-        model_row["source"] = {
-            "kind": "subscription",
-            "label": "Subscription",
-            "name": "codex",
-        }
     assert resp.json() == {"models": expected_models}
     assert fake_client.requests == [
         ("model/list", {"includeHidden": False}),

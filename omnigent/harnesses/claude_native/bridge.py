@@ -343,6 +343,17 @@ _FOREIGN_DIALOG_HINTS = (
 # echoed in the transcript, or a torn capture that just omits the composer, is
 # not proof a dialog replaced it.
 _BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
+# The ``/model`` picker footer's action markers, in the order they render on its
+# single footer line ("Enter to set as default · s to use this session only ·
+# Esc to cancel"), whitespace-folded so a soft-wrapped or mid-token-split footer
+# still matches. Matched as an ordered subsequence within one contiguous run
+# (see :func:`_model_picker_footer_present`) so transcript prose that merely
+# mentions the same words in separate lines does not read as an active picker.
+_MODEL_PICKER_FOOTER_MARKERS = (
+    "entertoset",
+    "".join(_MODEL_PICKER_OPEN_HINT.split()).lower(),
+    "esctocancel",
+)
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -5072,21 +5083,24 @@ def _model_picker_footer_present(pane: str) -> bool:
     """
     Return whether a pane shows the ``/model`` picker's footer action chrome.
 
-    The picker is a full-screen menu with no box frame; its footer reads
-    ``Enter to set as default · s to use this session only · Esc to cancel``.
-    A narrow terminal soft-wraps that footer across rows (``_capture_pane``
-    preserves the wrap), so the hint and the action markers can land on
-    different lines and even split mid-token. Each maximal run of non-blank
-    lines is therefore folded to a whitespace-free string and matched as a
-    unit: the run must carry the picker hint AND an action marker, which is
-    stronger than a bare pane-wide substring (a stray footer word in the
-    transcript never gathers the whole marker set into one contiguous run).
+    The picker is a full-screen menu with no box frame; its footer is a single
+    menu line — ``Enter to set as default · s to use this session only · Esc to
+    cancel`` — that a narrow terminal soft-wraps across rows (``_capture_pane``
+    preserves the wrap), splitting the markers over lines and even mid-token.
+
+    Identity is the footer's **ordered action structure**, not the mere presence
+    of its words: the three markers must appear *in order*
+    (:data:`_MODEL_PICKER_FOOTER_MARKERS`) within one contiguous run of
+    non-blank lines, folded to absorb the wrap. Collecting independent
+    substrings anywhere in a block instead let unrelated transcript prose — two
+    ``⎿`` lines that separately mention "use this session only" and "Esc to
+    cancel" — stitch into a fake footer; requiring the full ordered trio
+    (the transcript lacks "Enter to set", and prose rarely lands all three in
+    order) keeps that a non-match while a genuinely wrapped footer still hits.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when a contiguous block carries the picker footer.
+    :returns: ``True`` when a contiguous block carries the ordered footer.
     """
-    hint = "".join(_MODEL_PICKER_OPEN_HINT.split()).lower()
-    actions = ("entertoset", "esctocancel")
     lines = pane.splitlines()
     i = 0
     while i < len(lines):
@@ -5097,7 +5111,13 @@ def _model_picker_footer_present(pane: str) -> bool:
         while j < len(lines) and lines[j].strip():
             j += 1
         folded = "".join("".join(line.split()) for line in lines[i:j]).lower()
-        if hint in folded and any(action in folded for action in actions):
+        pos = 0
+        for marker in _MODEL_PICKER_FOOTER_MARKERS:
+            found = folded.find(marker, pos)
+            if found == -1:
+                break
+            pos = found + len(marker)
+        else:
             return True
         i = j
     return False

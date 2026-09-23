@@ -4928,6 +4928,71 @@ def test_submit_torn_capture_with_transcript_hint_does_not_accept(
     )
 
 
+def test_submit_torn_capture_with_footer_words_scattered_in_transcript_does_not_accept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Transcript prose that scatters footer words across lines is not a picker.
+
+    Regression (BLOCKING 1, 4th round): folding a whole contiguous non-blank
+    block and matching independent substrings let two unrelated transcript
+    lines — one mentioning 'use this session only', another 'Esc to cancel' —
+    stitch into a fake ``/model`` picker footer, so verification wrongly
+    accepted on the first (torn) capture without inspecting the still-present
+    draft. The footer is now matched as an ORDERED trio (Enter to set → use
+    this session only → Esc to cancel); this prose lacks 'Enter to set', so it
+    stays PENDING and the unsent draft on later captures fails loud.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S", 0.05, raising=False
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    draft_pane = _composer_pane("keep me unsent")
+    # Torn capture: no composer, only two transcript lines that separately
+    # contain footer words — never a real, ordered picker footer.
+    transcript_pane = (
+        "  ⎿ Earlier we discussed 'use this session only'.\n"
+        "  ⎿ Separately, press Esc to cancel the search.\n"
+    )
+    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            if not state["submitted"]:
+                return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
+            state["verify_captures"] += 1
+            if state["verify_captures"] == 1:
+                return SimpleNamespace(returncode=0, stdout=transcript_pane, stderr="")
+            return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
+        if cmd[-1] == "Enter":
+            state["submitted"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="keep me unsent")
+
+    assert state["verify_captures"] >= 2, (
+        "verification accepted on the transcript-lookalike frame instead of "
+        f"waiting for a real ordered picker footer; verify_captures={state['verify_captures']}"
+    )
+
+
 def test_submit_accepts_wrapped_model_picker_footer(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
