@@ -3938,11 +3938,12 @@ def _verify_submit_accepted(
             #    tool, so an Enter must never be sent into it, and treating it
             #    as ambiguous instead failed a delivered turn after the full
             #    window. ``_submit_popped_surface`` requires the composer to be
-            #    gone, so a hint sitting in the transcript never counts.
+            #    gone AND the draft to be off-screen (the hard draft veto), so a
+            #    hint or how-to prose sitting in the transcript never counts.
             #  - a torn or not-yet-rendered capture. Its absence proves
             #    nothing, so keep waiting without re-sending Enter rather than
             #    mistaking the ambiguity for acceptance.
-            if _submit_popped_surface(pane):
+            if _submit_popped_surface(pane, needle):
                 if warned:
                     _logger.info(
                         "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -5040,7 +5041,7 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
-def _submit_popped_surface(pane: str) -> bool:
+def _submit_popped_surface(pane: str, needle: str = "") -> bool:
     """
     Return whether a submit popped a dialog/picker/permission over the composer.
 
@@ -5051,32 +5052,37 @@ def _submit_popped_surface(pane: str) -> bool:
     press Enter into such a surface — its default answer commits something
     unasked-for).
 
-    Acceptance demands **positive** evidence of the surface's own chrome, not
-    merely a recognized word somewhere in a composer-less pane:
+    Acceptance is governed by two invariants that no pane-text heuristic can be
+    tricked past, because they key on the DRAFT, not on classifying prose:
 
-    - The confirm and permission dialogs draw their title inside a bordered
-      box, so it must sit on a row framed by a vertical rule glyph
-      (:data:`_VERTICAL_RULE_GLYPHS`).
-    - The ``/model`` picker is a full-screen menu, identified by its footer
-      action chrome — :data:`_MODEL_PICKER_OPEN_HINT` together with an
-      "Enter to set"/"Esc to cancel" action marker (see
-      :func:`_model_picker_footer_present`). Because ``_capture_pane`` keeps
-      the terminal's own line breaks, a narrow pane soft-wraps that footer
-      across rows, so the markers are matched over a contiguous block with
-      whitespace folded out rather than demanding one row carry them all.
+    1. **Hard draft veto.** If the submitted draft (*needle*) is still visible
+       on screen (outside the transcript), the message was NOT submitted, so no
+       surface acceptance is possible — whatever picker/dialog/footer text also
+       appears. Assistant prose or a numbered how-to can mimic any chrome, but
+       it cannot make the draft's own text disappear; a genuinely popped
+       surface has replaced the composer, so the draft is gone.
+    2. **Region anchoring.** A live composer row means the active bottom region
+       IS the input box, and its draft is handled by the tri-state
+       :func:`_draft_in_input_box`; any surface text elsewhere is scrollback,
+       not a popped overlay, so this returns not-popped.
 
-    A bare composer-absent-plus-substring check was not enough: a torn/partial
-    capture that just omits the composer, or a dialog title echoed in the
-    scrollback transcript (``⎿ … Switch model? …``), would then be read as an
-    active overlay and an unsent draft called delivered. Those captures carry
-    no dialog chrome, so they now stay pending. The ``_composer_row is None``
-    guard additionally keeps box-art inside a *live* draft from matching.
+    Only past both gates is the surface's own chrome consulted — the boxed
+    confirm/permission title on a vertical-rule row, or the ``/model`` picker
+    footer (:func:`_model_picker_footer_present`, transcript-excluded, wrap
+    tolerant).
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when a recognized surface's chrome has replaced the
-        composer.
+    :param needle: The submitted draft marker (:func:`_submit_needle`); when
+        it is still on screen the veto fires. Empty disables the veto.
+    :returns: ``True`` when a recognized surface has replaced the composer and
+        the draft is no longer on screen.
     """
+    # Invariant 2: a live composer means the active region is the input box.
     if _composer_row(pane) is not None:
+        return False
+    # Invariant 1: the hard draft veto — the draft's continued presence proves
+    # the message was not submitted, overriding any surface-looking text.
+    if needle and _draft_needle_on_screen(pane, needle):
         return False
     # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
     for raw in pane.splitlines():
@@ -5089,6 +5095,31 @@ def _submit_popped_surface(pane: str) -> bool:
             return True
     # ``/model`` picker: footer action chrome, tolerant of a wrapped footer.
     return _model_picker_footer_present(pane)
+
+
+def _draft_needle_on_screen(pane: str, needle: str) -> bool:
+    """
+    Return whether the submitted draft text is still visible in the live pane.
+
+    Whitespace-folded so a wrapped/re-flowed draft still matches, and scoped to
+    the LIVE region: transcript/scrollback rows (:data:`_TRANSCRIPT_MARKER`,
+    ``⎿``) are excluded so a *previous* turn's echo of the same text cannot veto
+    a genuine popped surface. Used as the hard draft veto in
+    :func:`_submit_popped_surface`.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :param needle: The draft marker from :func:`_submit_needle`.
+    :returns: ``True`` when the draft text is present among the live rows.
+    """
+    folded_needle = "".join(needle.split()).lower()
+    if not folded_needle:
+        return False
+    live = "".join(
+        "".join(line.split())
+        for line in pane.splitlines()
+        if line.strip() and not line.strip().startswith(_TRANSCRIPT_MARKER)
+    ).lower()
+    return folded_needle in live
 
 
 def _model_picker_footer_present(pane: str) -> bool:
