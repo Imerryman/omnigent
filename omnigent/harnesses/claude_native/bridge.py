@@ -3421,23 +3421,21 @@ def _paste_and_submit(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
+    # load / large payloads); polling is deterministic.
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle) is True:
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
     time.sleep(_PASTE_SETTLE_S)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
+        raise RuntimeError(
+            "Claude Code's pasted draft could not be confirmed in the input box. "
+            "The message was not delivered."
+        )
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -3449,14 +3447,17 @@ def _paste_and_submit(
     while time.monotonic() < deadline:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
+        draft_present = _draft_in_input_box(pane, needle)
+        if draft_present is None:
+            continue
+        if draft_present is False:
             return
         if time.monotonic() - last_enter >= _SUBMIT_RETRY_INTERVAL_S:
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             last_enter = time.monotonic()
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
+        "(submission could not be confirmed). The message was not delivered."
     )
 
 
@@ -4415,32 +4416,51 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
+def _draft_in_input_box(pane: str, needle: str) -> bool | None:
+    """Locate the draft in the framed composer, including continuation rows.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
+    Return None when the capture cannot establish whether the draft remains.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
-        return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
-        return True
-    return bool(needle) and needle in tail
+    if (
+        _MODEL_PICKER_OPEN_HINT in pane
+        or any(hint in pane for hint in _CONFIRM_DIALOG_HINTS)
+        or not _claude_prompt_rendered(pane)
+    ):
+        return None
+
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    # The composer is always the last framed box at the bottom of the pane.
+    # Check the last rule first; fall back to the second-to-last rule when
+    # the last rule's row is the footer (e.g. a continuation-line composer
+    # where the row after the closing rule is the footer, not the composer).
+    candidates: list[int] = []
+    if rules:
+        candidates.append(rules[-1] + 1)
+    if len(rules) >= 2:
+        candidates.append(rules[-2] + 1)
+
+    for start in candidates:
+        if start >= len(lines):
+            continue
+        row = lines[start].strip()
+        if not row.startswith(_CLAUDE_PROMPT_GLYPH):
+            continue
+        end = next((i for i in rules if i > start), len(lines))
+        body = "\n".join([row.removeprefix(_CLAUDE_PROMPT_GLYPH), *lines[start + 1 : end]])
+        # Folding whitespace also handles terminal wrapping within the needle.
+        folded_body = "".join(body.split())
+        folded_needle = "".join(needle.split())
+        if _PASTED_PLACEHOLDER_PREFIX in body or (folded_needle and folded_needle in folded_body):
+            return True
+        # A closing rule immediately after the composer row means the box
+        # is definitively empty (not ambiguous).
+        if end < len(lines) and lines[end].strip():
+            return False
+        # Without a closing rule, the remaining draft may be below the pane.
+        return None
+
+    return None
 
 
 def _format_terminal_failure_tail(pane: str) -> str:

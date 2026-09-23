@@ -100,6 +100,26 @@ def _composer_pane(draft: str = "") -> str:
 """
 
 
+def _composer_pane_continuation(draft_first_line: str, draft_continuation: str) -> str:
+    """
+    Render a Claude Code 2.1.280+ composer with draft on continuation rows.
+
+    On 2.1.280 a pasted multiline draft renders as an empty ``❯`` with the
+    draft text on the line(s) below, still inside the framed box.
+
+    :param draft_first_line: Text after the prompt glyph (often empty).
+    :param draft_continuation: Draft text on the continuation row(s).
+    :returns: The pane text.
+    """
+    return f"""\
+──────────────────────────────
+❯ {draft_first_line}
+{draft_continuation}
+──────────────────────────────
+  ? for shortcuts
+"""
+
+
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
@@ -4106,6 +4126,259 @@ def test_inject_user_message_raises_when_draft_never_submits(
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("fix the flaky test")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="fix the flaky test")
+
+
+@pytest.mark.parametrize(
+    "layout",
+    [
+        pytest.param("same-line", id="same-line"),
+        pytest.param("continuation-line", id="continuation-line"),
+    ],
+)
+def test_inject_user_message_multiline_draft_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    layout: str,
+) -> None:
+    """
+    A multiline draft pasted into Claude Code 2.1.280+ clears after two Enters.
+
+    On 2.1.280 a pasted multiline draft renders as an empty ``❯`` with the
+    draft text on continuation rows below. The first Enter is swallowed
+    (draft stays visible on continuation rows); the second Enter clears the
+    composer and the message is delivered.
+
+    The test parameterises both the legacy same-line layout (draft on the
+    ``❯`` row) and the 2.1.280 continuation-line layout.
+
+    Asserts exactly two Enter send-keys calls, one paste, and success only
+    after the composer clears.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[list[str]] = []
+    tui: dict[str, Any] = {"pane": _composer_pane(), "swallowed_enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            if layout == "same-line":
+                tui["pane"] = _composer_pane("fix the flaky test")
+            else:
+                tui["pane"] = _composer_pane_continuation(
+                    "",
+                    "fix the flaky test\nin module_a.py",
+                )
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            if tui["swallowed_enters"] == 0:
+                tui["swallowed_enters"] = 1
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test\nin module_a.py")
+
+    assert len(enters) == 2, f"Expected exactly two Enters, got {len(enters)}."
+
+
+def test_inject_user_message_multiline_draft_never_clears_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A multiline draft that never clears raises with 'message was not delivered'.
+
+    Every Enter is swallowed so the draft persists on continuation rows;
+    the submit-verify loop times out and raises.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui: dict[str, Any] = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane_continuation(
+                "",
+                "fix the flaky test\nin module_a.py",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="fix the flaky test\nin module_a.py")
+
+
+def test_inject_user_message_ambiguous_capture_continues(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An empty/ambiguous capture between Enter attempts returns None.
+
+    When capture-pane returns an empty pane (neither True nor False),
+    _draft_in_input_box returns None => the verify loop continues without
+    sending another Enter during that unknown frame.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.3)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    enters: list[list[str]] = []
+    capture_count = 0
+    tui: dict[str, Any] = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        nonlocal capture_count
+        del kwargs
+        if "capture-pane" in cmd:
+            capture_count += 1
+            # First capture after paste: draft visible (True).
+            # Second capture (after Enter): empty/ambiguous (None).
+            # Third capture: draft still visible (True) => retry.
+            # Fourth capture: cleared (False) => success.
+            if capture_count == 2:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            enters.append(cmd)
+            if len(enters) >= 2:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="fix the flaky test")
+
+    # Success: the ambiguous frame returned None (continue), not False.
+    assert len(enters) >= 2
+
+
+def test_draft_in_input_box_continuation_rows_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Draft text and '[Pasted text ...]' on continuation rows IS detected.
+
+    Claude Code 2.1.280 renders a pasted multiline draft as an empty ``❯``
+    with the draft text on the line(s) below, still inside the framed box.
+    _draft_in_input_box must detect this layout.
+    """
+    from omnigent.harnesses.claude_native.bridge import _draft_in_input_box
+
+    # Multiline draft on continuation rows — needle on continuation.
+    pane_cont = _composer_pane_continuation("", "fix the flaky test\nin module_a.py")
+    assert _draft_in_input_box(pane_cont, "fix the flaky test") is True
+
+    # Large paste with placeholder on continuation row.
+    pane_pasted = _composer_pane_continuation("", "[Pasted text 142 lines …]")
+    assert _draft_in_input_box(pane_pasted, "any needle") is True
+
+
+def test_draft_in_input_box_scrollback_needle_not_detected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A needle only in scrollback or footer is NOT detected.
+
+    The composer is empty; the needle appears only in a transcript echo
+    above the live composer frame. _draft_in_input_box must anchor on the
+    live composer (the last framed box), not scrollback.
+    """
+    from omnigent.harnesses.claude_native.bridge import _draft_in_input_box
+
+    # Realistic Claude Code pane: a submitted message in scrollback,
+    # followed by the live empty composer below.
+    scrollback_pane = """\
+──────────────────────────────
+❯ fix the flaky test
+──────────────────────────────
+  ? for shortcuts
+──────────────────────────────
+❯
+──────────────────────────────
+  ? for shortcuts
+"""
+    # Composer is the last framed box (empty); needle only in scrollback.
+    assert _draft_in_input_box(scrollback_pane, "fix the flaky test") is False
+
+
+def test_inject_user_message_unobserved_paste_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An unobserved paste raises instead of returning success.
+
+    When the draft is never confirmed in the input box during the
+    paste-observation loop, inject_user_message raises RuntimeError
+    rather than falling through to a blind submit.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            # Always returns empty — draft never observed.
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
