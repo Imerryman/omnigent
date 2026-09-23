@@ -4862,6 +4862,72 @@ def test_inject_user_message_failure_path_sends_no_enter(
     assert enters == [], f"the failure path must send no Enter; got {enters}"
 
 
+def test_submit_torn_capture_with_transcript_hint_does_not_accept(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A torn capture that merely echoes a dialog title is not an acceptance.
+
+    Regression (BLOCKING 1 residual): after a swallowed submit Enter, the
+    FIRST verify capture can be torn — it omits the composer and happens to
+    show a transcript line like ``⎿ … Switch model? was discussed``. A missing
+    composer plus a whole-pane hint substring is NOT proof a dialog replaced
+    the composer (no dialog chrome is present), so this must stay PENDING. The
+    next complete capture still holds the unsent draft, so verification keeps
+    waiting and ultimately fails loud (draft undelivered) rather than falsely
+    reporting success on the torn frame.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S", 0.05, raising=False
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    draft_pane = _composer_pane("keep me unsent")
+    # Torn capture: composer missing, only a transcript echo of a dialog title.
+    torn_pane = "  ⎿ earlier: Switch model? was discussed\n  more scrollback here\n"
+    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            if not state["submitted"]:
+                # Paste-observation: the draft is visibly committed.
+                return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
+            state["verify_captures"] += 1
+            if state["verify_captures"] == 1:
+                # First verify frame is torn: transcript hint, no composer.
+                return SimpleNamespace(returncode=0, stdout=torn_pane, stderr="")
+            # Every later frame: the unsent draft is still sitting in the box.
+            return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
+        if cmd[-1] == "Enter":
+            state["submitted"] = True
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="keep me unsent")
+
+    # It never accepted on the torn frame: it went on to inspect the real,
+    # still-present draft on later captures before failing loud.
+    assert state["verify_captures"] >= 2, (
+        "verification accepted on the torn transcript frame instead of waiting "
+        f"for a positive dialog surface; verify_captures={state['verify_captures']}"
+    )
+
+
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

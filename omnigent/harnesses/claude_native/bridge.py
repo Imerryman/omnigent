@@ -336,12 +336,13 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
-# Surfaces a submit can pop over the composer, whose appearance is itself proof
-# the draft was sent: the switch/effort confirmation, the ``/model`` picker, and
-# a tool-permission prompt the started turn reached. Matched only once the
-# composer is gone (see :func:`_submit_popped_surface`) so the same words inside
-# a draft or a scrollback transcript are never mistaken for an active overlay.
-_POST_SUBMIT_SURFACE_HINTS = (*_CONFIRM_DIALOG_HINTS, *_FOREIGN_DIALOG_HINTS)
+# Titles that render INSIDE a bordered confirm/permission dialog box (the
+# switch/effort confirmation and every tool-permission prompt). Positive
+# overlay evidence requires one of these on a box-chrome row (see
+# :func:`_submit_popped_surface`), not merely somewhere in the pane — a title
+# echoed in the transcript, or a torn capture that just omits the composer, is
+# not proof a dialog replaced it.
+_BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -5022,25 +5023,48 @@ def _submit_popped_surface(pane: str) -> bool:
 
     A submitted turn can immediately replace the composer with the
     switch/effort confirmation, the ``/model`` picker, or a tool-permission
-    prompt; the composer's disappearance is itself proof the draft left the
-    box. This is what a submit-verification loop treats as acceptance (and it
-    must NOT press Enter into such a surface — its default answer commits
-    something unasked-for).
+    prompt; that surface appearing is proof the draft left the box. This is
+    what a submit-verification loop treats as acceptance (and it must NOT
+    press Enter into such a surface — its default answer commits something
+    unasked-for).
 
-    The check is anchored to the composer being gone
-    (:func:`_composer_row` returns ``None``): while a live composer is on
-    screen the draft is still sitting there unsent, so the same words
-    appearing inside that draft (e.g. a pasted ``"Explain Switch model?"``)
-    or in a scrollback transcript are content, not an active overlay. A bare
-    whole-pane substring — the old test — reported those as a dialog and so
-    called an unsent draft delivered.
+    Acceptance demands **positive** evidence of the surface's own chrome, not
+    merely a recognized word somewhere in a composer-less pane:
+
+    - The confirm and permission dialogs draw their title inside a bordered
+      box, so it must sit on a row framed by a vertical rule glyph
+      (:data:`_VERTICAL_RULE_GLYPHS`).
+    - The ``/model`` picker is a full-screen menu, identified by its footer
+      action chrome carrying :data:`_MODEL_PICKER_OPEN_HINT`.
+
+    A bare composer-absent-plus-substring check was not enough: a torn/partial
+    capture that just omits the composer, or a dialog title echoed in the
+    scrollback transcript (``⎿ … Switch model? …``), would then be read as an
+    active overlay and an unsent draft called delivered. Those captures carry
+    no dialog chrome, so they now stay pending. The ``_composer_row is None``
+    guard additionally keeps box-art inside a *live* draft from matching.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when a recognized surface has replaced the composer.
+    :returns: ``True`` when a recognized surface's chrome has replaced the
+        composer.
     """
     if _composer_row(pane) is not None:
         return False
-    return any(hint in pane for hint in _POST_SUBMIT_SURFACE_HINTS)
+    for raw in pane.splitlines():
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
+        if stripped[0] in _VERTICAL_RULE_GLYPHS and any(
+            hint in stripped for hint in _BOXED_DIALOG_HINTS
+        ):
+            return True
+        # ``/model`` picker: its footer action chrome on one line.
+        if _MODEL_PICKER_OPEN_HINT in stripped and (
+            "Esc to cancel" in stripped or "Enter to set" in stripped
+        ):
+            return True
+    return False
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
