@@ -3890,12 +3890,29 @@ def _verify_submit_accepted(
     warned = False
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        draft_present = _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle)
+        pane = _capture_pane(socket_path, tmux_target)
+        draft_present = _draft_in_input_box(pane, needle)
         if draft_present is None:
-            # Ambiguous capture (draft may have scrolled below the pane, a
-            # dialog is up, or the prompt has not re-rendered): its absence
-            # proves nothing, so keep waiting without re-sending Enter rather
-            # than mistaking the ambiguity for acceptance.
+            # ``_draft_in_input_box`` returns None whenever it cannot read the
+            # composer, which has two very different meanings for a submit:
+            #  - a confirm dialog or model picker now sits where the composer
+            #    was. That surface only appears once the submit popped it, so
+            #    the draft is gone and the submit landed — count it accepted
+            #    (see inject_slash_command: "the dialog replacing the composer
+            #    counts, since submission pops it").
+            #  - a torn or not-yet-rendered capture. Its absence proves
+            #    nothing, so keep waiting without re-sending Enter rather than
+            #    mistaking the ambiguity for acceptance.
+            if _MODEL_PICKER_OPEN_HINT in pane or any(
+                hint in pane for hint in _CONFIRM_DIALOG_HINTS
+            ):
+                if warned:
+                    _logger.info(
+                        "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                        what,
+                        time.monotonic() - start,
+                    )
+                return True
             continue
         if draft_present is False:
             if warned:

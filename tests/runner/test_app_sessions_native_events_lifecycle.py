@@ -1303,13 +1303,11 @@ async def test_claude_native_model_options_use_session_launch_catalog(
                 "model": "system.ai.claude-opus-4-10",
                 "displayName": "Opus 4.10",
                 "isDefault": True,
-                "source": {"kind": "subscription", "label": "Subscription", "name": "claude"},
             },
             {
                 "id": "haiku",
                 "model": "system.ai.claude-haiku-4-5",
                 "displayName": "Haiku 4.5",
-                "source": {"kind": "subscription", "label": "Subscription", "name": "claude"},
             },
         ]
     }
@@ -1437,17 +1435,12 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     # so it is the row a Default launch truly runs.
     assert resolved.json() == {
         "models": [
-            {
-                "id": "sonnet[1m]",
-                "model": "claude-sonnet-5[1m]",
-                "source": {"kind": "subscription", "label": "Subscription", "name": "claude"},
-            },
+            {"id": "sonnet[1m]", "model": "claude-sonnet-5[1m]"},
             {
                 "id": "system.ai.claude-opus-4-10",
                 "model": "system.ai.claude-opus-4-10",
                 "displayName": "system.ai.claude-opus-4-10",
                 "isDefault": True,
-                "source": {"kind": "subscription", "label": "Subscription", "name": "claude"},
             },
         ]
     }
