@@ -2123,6 +2123,26 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
     )
 
 
+def _qwen_subagent_exit_grace_s() -> float:
+    """Grace before failing a qwen/antigravity sub-agent that exited with
+    undelivered work.
+
+    Must exceed a couple of forwarder poll intervals (~0.4s;
+    ``harnesses/qwen_native/forwarder.py``) plus POST latency so a SUCCESS whose
+    pane exited just before the forwarder's asynchronous ``idle`` -> ``completed``
+    edge landed is not falsely failed. Override with
+    ``OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S`` (tests set ``0``).
+    """
+    raw = os.environ.get("OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S")
+    if raw is None:
+        return 3.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3.0
+    return value if value >= 0.0 else 3.0
+
+
 def reap_stalled_subagent_launches(
     *,
     now: float | None = None,
@@ -3321,6 +3341,44 @@ def create_runner_app(
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
 
+    async def _qwen_subagent_exit_grace(event: TerminalExitEvent) -> None:
+        """Fail a qwen/antigravity sub-agent that exited without a terminal edge.
+
+        Runs after a bounded grace so a SUCCESS whose pane raced ahead of the
+        forwarder's asynchronous ``idle`` -> ``completed`` POST is NOT failed: if
+        the forwarder delivered any terminal status during the grace, the work
+        entry is terminal and this returns. Only a still-undelivered entry -- a
+        genuine mid-turn death -- is failed and its parent woken.
+        """
+        await asyncio.sleep(_qwen_subagent_exit_grace_s())
+        entry = get_subagent_work(event.session_id)
+        if entry is None or entry.status in _SUBAGENT_TERMINAL_STATUSES:
+            return
+        error = _build_required_terminal_error(event)
+        _logger.error(
+            "qwen-native sub-agent %s exited mid-turn with no terminal result "
+            "within the %.1fs grace; failing it and waking parent %s: %s",
+            event.session_id,
+            _qwen_subagent_exit_grace_s(),
+            entry.parent_session_id,
+            error.get("message"),
+            extra={"session_id": event.session_id},
+        )
+        _publish_event(
+            event.session_id,
+            {"type": "session.status", "status": "failed", "error": error},
+        )
+        _mark_subagent_terminal_and_wake(
+            event.session_id,
+            status="failed",
+            output=error["message"],
+        )
+
+    def _schedule_qwen_subagent_exit_grace(event: TerminalExitEvent) -> None:
+        task = asyncio.create_task(_qwen_subagent_exit_grace(event))
+        task.add_done_callback(_background_tasks.discard)
+        _background_tasks.add(task)
+
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
         _publish_event(
             event.session_id,
@@ -3346,6 +3404,35 @@ def create_runner_app(
         _background_tasks.add(_teardown_task)
 
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
+            # A qwen/antigravity SUB-AGENT (a child a native orchestrator
+            # dispatched) that dies mid-turn -- crash, auth failure, the OOM this
+            # box has seen -- emits no forwarder terminal edge: the forwarder
+            # posts ``completed``/``failed`` only from a real ``result`` or
+            # ``message_stop`` (qwen_native/forwarder.py), and its clean-completion
+            # ``idle`` edge is what the ``external_session_status`` handler turns
+            # into the parent wake. With neither, the parent is never told and its
+            # dispatch hangs forever. ``session_was_idle`` cannot discriminate here
+            # -- qwen's "powering down" redraw leaves the exit memo on ``running``
+            # even on a clean quit (see the clean-quit test) -- so key off delivery
+            # state instead: an UNDELIVERED sub-agent-work entry means no terminal
+            # result ever reached the parent, i.e. the exit is a death. Fail it and
+            # wake the parent, reusing the required-terminal error. A clean
+            # completion already marked the entry terminal (skipped here); an
+            # interactive top-level quit has no work entry at all (untouched).
+            pending = get_subagent_work(event.session_id)
+            if pending is not None and pending.status not in _SUBAGENT_TERMINAL_STATUSES:
+                # Undelivered SUB-AGENT work at exit is EITHER a mid-turn death
+                # (no forwarder terminal edge will ever come) OR a success whose
+                # pane exited in the gap before the forwarder's asynchronous
+                # ``idle`` -> ``completed`` POST landed (it polls the event file
+                # every ~0.4s). Failing inline would lock in a FALSE failure on
+                # that race -- ``mark_subagent_work_terminal`` keeps a recorded
+                # ``failed`` over a trailing ``completed``. So drain the race:
+                # schedule a bounded grace re-check and fail + wake ONLY if the
+                # work is still undelivered afterwards.
+                _schedule_qwen_subagent_exit_grace(event)
+                _release_required_terminal_session(event.session_id)
+                return
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
             return
@@ -12124,7 +12211,16 @@ def create_runner_app(
                 process_manager is not None and process_manager.has_active_turn(conv_id)
             ):
                 return True
-            if _native_pane_status.get(conv_id) == "running":
+            # Codex's status map is fed by an OUT-OF-PROCESS forwarder that
+            # posts session.status to the server only (never through the
+            # in-runner _publish_event that feeds _native_pane_status), so a
+            # codex pane's local status stays a stale "running" after it goes
+            # idle and would pin it forever. Trust the in-runner status
+            # short-circuit for harnesses whose forwarder runs in-process
+            # (claude/qwen); for codex, fall through to the attached-client +
+            # tmux window-activity evidence below, which reflect a genuinely
+            # working pane (its TUI redraws every turn) and go quiet when idle.
+            if pane.terminal_name != "codex" and _native_pane_status.get(conv_id) == "running":
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
             # active turn, so every signal above reads idle. Reaping it kills the
@@ -12141,9 +12237,26 @@ def create_runner_app(
             activity_at = await asyncio.to_thread(
                 _tmux_window_activity_at, str(pane.socket_path), "main"
             )
-            return (
-                activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
-            )
+            if activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S:
+                return True
+            # Belt-and-suspenders for codex: its _native_pane_status is fed by an
+            # out-of-process forwarder that posts to the server only, so a quiet
+            # codex pane may still be mid-turn even though the local map is not
+            # "running". Before declaring it reapable, confirm against the
+            # AUTHORITATIVE server status. Fail-safe: a running/waiting status OR
+            # any error/non-200 => treat as busy, so a live turn is never reaped
+            # on doubt. (Runs only for a codex pane already quiet on every local
+            # signal, so it is at most one GET per idle codex pane per scan.)
+            if pane.terminal_name == "codex":
+                try:
+                    resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=5.0)
+                    if resp.status_code != 200:
+                        return True
+                    if resp.json().get("status") in ("running", "waiting"):
+                        return True
+                except Exception:  # noqa: BLE001 - never reap when liveness is unconfirmable
+                    return True
+            return False
 
         async def _reap_native_pane(pane: PaneRef) -> None:
             try:

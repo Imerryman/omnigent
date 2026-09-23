@@ -1873,6 +1873,211 @@ describe("NewChatLandingScreen create flow", () => {
     expect(body.harness_override).toBeUndefined();
   });
 
+  it("rides a picked model along to create for a claude-sdk brain agent", async () => {
+    // polly's brain is claude-sdk, which reads a per-session model override at
+    // spawn (same plumbing claude-native uses); the picked model must travel on
+    // the create call as model_override, with no harness override.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    // The claude-sdk brain lists the Claude catalog (Opus/Sonnet/Haiku), not Pi's.
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("opus");
+    expect(body.harness_override).toBeUndefined();
+  });
+
+  it("omits model_override for an unpicked claude-sdk brain (defers to spec)", async () => {
+    // Unpicked, the brain runs its spec-configured model, so no override is
+    // sent — the summary reads plain "Default", not a catalog-default name.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    // The Model picker is offered, but nothing is picked.
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
+  });
+
+  it("does not carry a native agent's picked model onto a claude-sdk brain", async () => {
+    // Switching from a native agent (model picked) to polly WITHOUT touching
+    // polly's picker must not force the previous model — the reset-on-agent
+    // clears it and the native reseed early-returns for the non-native brain.
+    setAgents([
+      agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" }),
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_native");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    selectAgent("ag_polly");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_polly");
+    expect(body.model_override).toBeUndefined();
+  });
+
+  it("restores the remembered model when switching between two same-harness agents", async () => {
+    // Two agents sharing claude-native: the reset clears the pick on every
+    // agent switch, and the native reseed effect (keyed on the agent id, not
+    // just the harness) restores the harness's remembered pick — so the second
+    // agent's create still carries model_override.
+    setAgents([
+      agent({
+        id: "ag_native1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+      agent({
+        id: "ag_native2",
+        name: "claude-native-custom",
+        display_name: "Custom Claude",
+        harness: "claude-native",
+      }),
+    ]);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_shared_harness" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_native1");
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Opus" }));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    // Switch to the other claude-native agent — no harness change — and submit.
+    selectAgent("ag_native2");
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.agent_id).toBe("ag_native2");
+    expect(body.model_override).toBe("opus");
+  });
+
+  it("pins a claude-sdk brain's explicit model even when the catalog marks it default", async () => {
+    // Regression: for an SDK brain, clicking a catalog row flagged
+    // isDefault must still send model_override (a native harness would collapse
+    // it to the no-override sentinel). Unpicked, the explicit "Agent default"
+    // entry is selected — not the catalog-default model row.
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "opus", displayName: "Opus", isDefault: true },
+        { id: "sonnet", displayName: "Sonnet" },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    // Unpicked: "Agent default" is checked, NOT the catalog-default Opus row.
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
+    // Clicking Opus (the catalog default) still pins it as an override.
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-opus"));
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBe("opus");
+  });
+
+  it("clears the override when a claude-sdk brain picks Agent default", async () => {
+    // The explicit "Agent default" entry is the only thing that clears an SDK
+    // brain's model_override (deferring to its spec model).
+    setAgents([
+      agent({ id: "ag_polly", name: "polly", display_name: "Polly", harness: "claude-sdk" }),
+    ]);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        { id: "opus", displayName: "Opus", isDefault: true },
+        { id: "sonnet", displayName: "Sonnet" },
+      ],
+      isLoading: false,
+    } as unknown as ReturnType<typeof useHostModelOptions>);
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_polly" }),
+    } as unknown as Response);
+
+    renderLanding();
+    await waitForWorkspaceSeed();
+    openAgentModels("ag_polly");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-sonnet"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-default"));
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+    typeMessage("go");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(init.body as string);
+    expect(body.model_override).toBeUndefined();
+  });
+
   it("no longer renders a standalone smart-routing composer toggle", async () => {
     // Smart Routing belongs in the model menu, not a separate composer toggle.
     setAgents([agent({ id: "ag_native", name: "claude-native-ui", display_name: "Claude Code" })]);

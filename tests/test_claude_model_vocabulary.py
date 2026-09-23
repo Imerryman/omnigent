@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.models.claude_model_vocabulary import (
+    canonical_claude_id,
     claude_model_alias,
     claude_model_command_arg,
     model_vocabulary_env,
@@ -221,6 +222,18 @@ def test_served_alias_pins_pick_the_newest_served_id_per_family() -> None:
 
 def test_served_alias_pins_ignore_ids_of_no_claude_family() -> None:
     assert served_alias_pins(["databricks-gpt-5-6", "gemini-3-pro", ""]) == {}
+
+
+def test_a_new_opus_generation_is_spoken_without_touching_this_module() -> None:
+    """``claude-opus-5-5`` needs no vocabulary change: the family segment and
+    numeric version ordering already cover a generation this module has
+    never heard of, same as :func:`served_canonical_overrides` above.
+    """
+    assert claude_model_alias("databricks-claude-opus-5-5", {}) == "opus"
+    assert served_alias_pins(
+        ["databricks-claude-opus-5-5", "databricks-claude-opus-4-8", "databricks-claude-opus-5"]
+    ) == {"opus": "databricks-claude-opus-5-5"}
+    assert canonical_claude_id("databricks-claude-opus-5-5") == "claude-opus-5-5"
 
 
 def test_served_canonical_overrides_map_canonical_ids_to_gateway_spellings() -> None:

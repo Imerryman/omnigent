@@ -4146,6 +4146,22 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-harness-copilot")).toBeNull();
   });
 
+  it("offers a Claude-catalog Model picker for a claude-sdk brain agent", () => {
+    // A bundle agent whose brain is claude-sdk gets a Model picker even though
+    // it advertises no native-wrapper capability — sourced from the Claude
+    // catalog claude-native uses, not Pi's.
+    mockPollyWithBrainReadiness();
+    renderLanding();
+    openAgentModels("a_polly");
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(models).toBeVisible();
+    expect(models).toHaveTextContent("Opus 4.8");
+    expect(models).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toBeTruthy();
+    // Not the Pi picker: no search box (pi-native only).
+    expect(screen.queryByTestId("new-chat-landing-agent-model-search")).toBeNull();
+  });
+
   function mockClaudeAndPi() {
     mockAgents([
       {
