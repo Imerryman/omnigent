@@ -62,6 +62,9 @@ _MINIMUM_NODE_VERSION_TEXT = ".".join(str(part) for part in _MINIMUM_NODE_VERSIO
 _WEB_UI_STAMP_NAME = "omnigent-build-stamp.json"
 # Bumping this invalidates every existing stamp, forcing one rebuild.
 _WEB_UI_STAMP_VERSION = 1
+# World-readable: the installing user and the serving user are routinely
+# different (a root/CI install serving as an unprivileged app user).
+_WEB_UI_STAMP_MODE = 0o644
 # Workspace-root files that change what the bundle contains. Named
 # explicitly rather than discovered, because several are routinely
 # gitignored yet load-bearing: ``.npmrc`` steers pnpm's resolution, and
@@ -77,21 +80,31 @@ _WEB_UI_ROOT_INPUTS = (
     "pnpm-lock.yaml",
     "pnpm-workspace.yaml",
 )
-# The positive definition of "not a build input", applied on every
-# enumeration and deliberately independent of ``.gitignore`` (see
-# ``_web_ui_source_files``). Excludes ``build``: ``web/electron/build``
-# is tracked source.
-_WEB_UI_PRUNED_DIRS = frozenset(
+# Directory names a tool owns outright, pruned at any depth. Reserved
+# names only: npm owns ``node_modules``, git owns ``.git``, CPython owns
+# ``__pycache__``, so a directory with one of these names is never
+# hand-written source anywhere in the tree.
+_WEB_UI_RESERVED_DIR_NAMES = frozenset({".git", "__pycache__", "node_modules"})
+# Build output and tool caches, pruned by LOCATION relative to ``web/``,
+# never by basename. A directory merely *named* ``dist`` or ``coverage``
+# is not disposable: ``web/public/dist/banner.svg`` is a shipped asset,
+# and pruning that basename everywhere would make it invisible to the
+# fingerprint. Everything not listed here — all of ``web/public/**``
+# included — is a build input. ``electron/build`` is absent on purpose:
+# it is tracked source.
+_WEB_UI_PRUNED_PATHS = frozenset(
     {
-        ".git",
         ".turbo",
         ".vite",
-        "__pycache__",
+        "android/.gradle",
+        "android/build",
         "coverage",
         "dist",
         "dist-embed",
         "dist-ssr",
-        "node_modules",
+        "electron/dist",
+        "ios/Pods",
+        "ios/build",
         "storybook-static",
     }
 )
@@ -355,6 +368,13 @@ def _build_and_stamp_web_ui(
     # prompt is invisible under a build backend, so the install looks
     # hung; "0" downloads without asking (shims default it to "1").
     env = {**os.environ, "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+    # Invalidate BEFORE anything can touch live bundle output. Vite writes
+    # straight into the bundle dir, so a build that damages the SPA and then
+    # fails must not leave a stamp behind — with unchanged sources the next
+    # automatic install would match that stamp and skip, serving the damaged
+    # bundle forever. No stamp always means rebuild, which is the safe
+    # direction, and the server warns in the meantime.
+    stamp_path.unlink(missing_ok=True)
     try:
         # Workspace root, not ``web/``: the lockfile and workspace
         # manifest live at the repo root. ``--frozen-lockfile``
@@ -478,8 +498,8 @@ def _warn_stale_web_ui_bundle(reason: str) -> None:
     sys.stderr.flush()
 
 
-def _web_ui_source_files(root: Path) -> list[Path]:
-    """Return every file whose content determines the SPA bundle.
+def _web_ui_build_inputs(root: Path) -> tuple[list[Path], dict[str, str]]:
+    """Return everything whose content or shape determines the bundle.
 
     Build inputs are defined here positively, and explicitly NOT by
     git's ignore rules. ``.gitignore`` answers "should this be
@@ -494,29 +514,57 @@ def _web_ui_source_files(root: Path) -> list[Path]:
       not as the tree behind it, so edits inside an imported symlinked
       source dir would be invisible.
 
-    So the primary enumeration is an ignore-agnostic walk that prunes
-    only :data:`_WEB_UI_PRUNED_DIRS` and follows directory symlinks
-    (with cycle protection). ``git ls-files`` is unioned on top purely
-    as a safety net for tracked files that happen to sit under a pruned
-    name; it is never the sole source of truth, and its absence changes
-    nothing that matters.
+    So the primary enumeration is :func:`_walk_web_ui_sources`, an
+    ignore-agnostic walk that prunes by location rather than basename and
+    records symlink topology. ``git ls-files`` is unioned on top purely
+    as a safety net; it is never the sole source of truth, and its
+    absence changes nothing that matters. Both enumerations are held to
+    the same pruning policy, so what counts as build output is decided in
+    one place — otherwise a ``node_modules`` that simply was not
+    gitignored would slip back in through the union.
 
     :param root: Workspace root (the directory holding ``setup.py``).
-    :returns: Deduplicated absolute paths, unordered; the caller sorts.
+    :returns: ``(files, links)`` — deduplicated absolute paths, unordered
+        (the caller sorts), and the symlink topology behind them.
     """
     candidates: dict[Path, None] = {root / name: None for name in _WEB_UI_ROOT_INPUTS}
-    for path in _walk_web_ui_sources(root / "web"):
+    walked, links = _walk_web_ui_sources(root / "web")
+    for path in walked:
         candidates[path] = None
     for path in _git_listed_files(root, "web") or ():
-        candidates[path] = None
-    return [path for path in candidates if path.is_file()]
+        if not _is_pruned_web_ui_path(root, path):
+            candidates[path] = None
+    return [path for path in candidates if path.is_file()], links
+
+
+def _is_pruned_web_ui_path(root: Path, path: Path) -> bool:
+    """Whether ``path`` sits in a location the walk would have pruned.
+
+    Applied to the git listing so both enumerations answer "is this a
+    build input?" from the single policy in
+    :data:`_WEB_UI_RESERVED_DIR_NAMES` / :data:`_WEB_UI_PRUNED_PATHS`.
+
+    :param root: Workspace root (the directory holding ``setup.py``).
+    :param path: Absolute path to classify.
+    :returns: True when any directory component is pruned.
+    """
+    try:
+        directories = path.relative_to(root / "web").parts[:-1]
+    except ValueError:
+        return False
+    if any(name in _WEB_UI_RESERVED_DIR_NAMES for name in directories):
+        return True
+    return any(
+        "/".join(directories[: depth + 1]) in _WEB_UI_PRUNED_PATHS
+        for depth in range(len(directories))
+    )
 
 
 def _git_listed_files(root: Path, subdir: str) -> list[Path] | None:
     """Return git's view of ``subdir``'s files, or ``None``.
 
     A safety net for the walk, not a definition of build inputs — see
-    :func:`_web_ui_source_files`.
+    :func:`_web_ui_build_inputs`.
 
     :param root: Repository root to run git in.
     :param subdir: Pathspec to limit the listing to.
@@ -545,14 +593,26 @@ def _git_listed_files(root: Path, subdir: str) -> list[Path] | None:
     return [root / os.fsdecode(entry) for entry in result.stdout.split(b"\0") if entry]
 
 
-def _walk_web_ui_sources(web: Path) -> list[Path]:
-    """Walk ``web/`` for build inputs, pruning dependency/output dirs.
+def _walk_web_ui_sources(web: Path) -> tuple[list[Path], dict[str, str]]:
+    """Walk ``web/`` for build inputs, pruning output by location.
 
     Ignore-agnostic by design: dotfiles and gitignored files are
-    included, because Vite happily reads both. Directory symlinks are
-    followed, since an imported source tree may be one; traversal is
-    guarded by the set of real directories already visited, or a link
-    pointing at an ancestor would loop forever.
+    included, because Vite happily reads both. Pruning is by reserved
+    basename (:data:`_WEB_UI_RESERVED_DIR_NAMES`) or by exact location
+    (:data:`_WEB_UI_PRUNED_PATHS`) — never by an arbitrary basename at
+    arbitrary depth, which would swallow real inputs.
+
+    Directory symlinks are followed, since an imported source tree may
+    be one, and traversal is guarded by the real directories already
+    visited so a link pointing at an ancestor cannot loop. That guard
+    also skips a *sibling alias* — two links onto one target — which on
+    its own would hide a retarget: flipping ``src/selected`` from
+    ``src/a`` to ``src/b`` visits neither, because both were already
+    traversed under their own names. So every symlink's target is
+    recorded as topology alongside the file list, and a retarget changes
+    the digest even though no file content did. Recording the edge is
+    much cheaper than re-traversing each alias, and cannot blow up on a
+    legitimately shared directory.
 
     Paths are reported as traversed rather than as resolved, so a
     symlink into a tree outside the workspace still yields a
@@ -560,9 +620,12 @@ def _walk_web_ui_sources(web: Path) -> list[Path]:
     independent.
 
     :param web: The ``web/`` package directory.
-    :returns: Absolute paths of candidate build inputs.
+    :returns: ``(files, links)`` — absolute paths of candidate build
+        inputs, and a mapping of each symlink's traversal path to its raw
+        target as ``os.readlink`` reports it.
     """
     found: list[Path] = []
+    links: dict[str, str] = {}
     visited: set[str] = set()
     for dirpath, dirnames, filenames in os.walk(web, followlinks=True):
         real = os.path.realpath(dirpath)
@@ -570,11 +633,27 @@ def _walk_web_ui_sources(web: Path) -> list[Path]:
             dirnames[:] = []
             continue
         visited.add(real)
+        relative = os.path.relpath(dirpath, web)
+        prefix = "" if relative == os.curdir else relative.replace(os.sep, "/") + "/"
         # Sorted so which of two links to one target is traversed first
         # (and therefore under which name its files are hashed) is stable.
-        dirnames[:] = sorted(d for d in dirnames if d not in _WEB_UI_PRUNED_DIRS)
+        kept = []
+        for name in sorted(dirnames):
+            if name in _WEB_UI_RESERVED_DIR_NAMES:
+                continue
+            if f"{prefix}{name}" in _WEB_UI_PRUNED_PATHS:
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+        for name in sorted([*kept, *filenames]):
+            entry = Path(dirpath) / name
+            if entry.is_symlink():
+                try:
+                    links[f"{prefix}{name}"] = os.readlink(entry)
+                except OSError:
+                    links[f"{prefix}{name}"] = "<unreadable>"
         found.extend(Path(dirpath) / name for name in filenames)
-    return found
+    return found, links
 
 
 def _web_ui_source_fingerprint(root: Path) -> str:
@@ -584,11 +663,14 @@ def _web_ui_source_fingerprint(root: Path) -> str:
     or a fresh clone rewrites them without changing a byte of source.
 
     :param root: Workspace root (the directory holding ``setup.py``).
-    :returns: Hex sha256 over ``(relative path, file digest)`` pairs.
+    :returns: Hex sha256 over ``(relative path, file digest)`` pairs plus
+        the symlink topology, so retargeting a link changes the digest
+        even when no file content did.
     """
+    files, links = _web_ui_build_inputs(root)
     digest = hashlib.sha256()
     digest.update(f"stamp-v{_WEB_UI_STAMP_VERSION}\n".encode())
-    for path in sorted(_web_ui_source_files(root)):
+    for path in sorted(files):
         try:
             relative = path.relative_to(root).as_posix()
         except ValueError:
@@ -601,6 +683,12 @@ def _web_ui_source_fingerprint(root: Path) -> str:
             # Raced away or unreadable; record its absence rather than
             # silently hashing the same value as an empty file.
             digest.update(b"<unreadable>")
+        digest.update(b"\0")
+    digest.update(b"symlinks\0")
+    for name in sorted(links):
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(links[name].encode())
         digest.update(b"\0")
     return digest.hexdigest()
 
@@ -655,6 +743,11 @@ def _write_web_ui_stamp(path: Path, *, sources: str, commit: str) -> None:
     ) as handle:
         handle.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         temporary = Path(handle.name)
+    # NamedTemporaryFile creates 0600 and os.replace preserves the mode, so
+    # without this the stamp is unreadable to a server running as a different
+    # user than the installer — which reads back as a permanent "no readable
+    # build stamp" warning on a perfectly fresh bundle.
+    os.chmod(temporary, _WEB_UI_STAMP_MODE)
     try:
         os.replace(temporary, path)
     except OSError:
@@ -764,7 +857,19 @@ def _git_sha() -> str:
 
 _MANUAL_BUILD_FLAG = "--omnigent-build-web-ui"
 
-if _MANUAL_BUILD_FLAG in sys.argv[1:]:
+
+def _manual_build_requested(argv: list[str]) -> bool:
+    """Whether ``argv`` asks for the manual build, not a setuptools command.
+
+    :param argv: Full process argv, ``argv[0]`` being the script.
+    :returns: True only for the sentinel flag, so every ordinary
+        setuptools invocation (``--help``, ``egg_info``, ``bdist_wheel``)
+        falls through to ``setup()`` untouched.
+    """
+    return _MANUAL_BUILD_FLAG in argv[1:]
+
+
+if _manual_build_requested(sys.argv):
     # Manual entry point: run exactly the build an install runs and write
     # exactly the same stamp, so the server's staleness warning clears and
     # the next install takes the fast path. A bare `pnpm --filter web run
