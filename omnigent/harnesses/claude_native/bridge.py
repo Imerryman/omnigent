@@ -336,6 +336,12 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
+# Surfaces a submit can pop over the composer, whose appearance is itself proof
+# the draft was sent: the switch/effort confirmation, the ``/model`` picker, and
+# a tool-permission prompt the started turn reached. Matched only once the
+# composer is gone (see :func:`_submit_popped_surface`) so the same words inside
+# a draft or a scrollback transcript are never mistaken for an active overlay.
+_POST_SUBMIT_SURFACE_HINTS = (*_CONFIRM_DIALOG_HINTS, *_FOREIGN_DIALOG_HINTS)
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -3836,13 +3842,17 @@ def _paste_and_submit(
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Fail BEFORE the submit Enter, never after. The draft was never confirmed
+    # in the box (e.g. an unidentifiable draft whose needle is empty), so its
+    # delivery cannot be verified — and pressing Enter first would submit, and
+    # so possibly execute, the very message this then reports as undelivered.
     if not draft_seen:
         raise RuntimeError(
             "Claude Code's pasted draft could not be confirmed in the input box. "
             "The message was not delivered."
         )
+    time.sleep(_PASTE_SETTLE_S)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -3895,17 +3905,20 @@ def _verify_submit_accepted(
         if draft_present is None:
             # ``_draft_in_input_box`` returns None whenever it cannot read the
             # composer, which has two very different meanings for a submit:
-            #  - a confirm dialog or model picker now sits where the composer
-            #    was. That surface only appears once the submit popped it, so
-            #    the draft is gone and the submit landed — count it accepted
-            #    (see inject_slash_command: "the dialog replacing the composer
-            #    counts, since submission pops it").
+            #  - a confirm dialog, model picker, or tool-permission prompt now
+            #    sits where the composer was. That surface only appears once the
+            #    submit popped it, so the draft is gone and the submit landed —
+            #    count it accepted (see inject_slash_command: "the dialog
+            #    replacing the composer counts, since submission pops it"). A
+            #    permission prompt is included: its default answer approves the
+            #    tool, so an Enter must never be sent into it, and treating it
+            #    as ambiguous instead failed a delivered turn after the full
+            #    window. ``_submit_popped_surface`` requires the composer to be
+            #    gone, so a hint sitting in the transcript never counts.
             #  - a torn or not-yet-rendered capture. Its absence proves
             #    nothing, so keep waiting without re-sending Enter rather than
             #    mistaking the ambiguity for acceptance.
-            if _MODEL_PICKER_OPEN_HINT in pane or any(
-                hint in pane for hint in _CONFIRM_DIALOG_HINTS
-            ):
+            if _submit_popped_surface(pane):
                 if warned:
                     _logger.info(
                         "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -5003,6 +5016,33 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
+def _submit_popped_surface(pane: str) -> bool:
+    """
+    Return whether a submit popped a dialog/picker/permission over the composer.
+
+    A submitted turn can immediately replace the composer with the
+    switch/effort confirmation, the ``/model`` picker, or a tool-permission
+    prompt; the composer's disappearance is itself proof the draft left the
+    box. This is what a submit-verification loop treats as acceptance (and it
+    must NOT press Enter into such a surface — its default answer commits
+    something unasked-for).
+
+    The check is anchored to the composer being gone
+    (:func:`_composer_row` returns ``None``): while a live composer is on
+    screen the draft is still sitting there unsent, so the same words
+    appearing inside that draft (e.g. a pasted ``"Explain Switch model?"``)
+    or in a scrollback transcript are content, not an active overlay. A bare
+    whole-pane substring — the old test — reported those as a dialog and so
+    called an unsent draft delivered.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a recognized surface has replaced the composer.
+    """
+    if _composer_row(pane) is not None:
+        return False
+    return any(hint in pane for hint in _POST_SUBMIT_SURFACE_HINTS)
+
+
 def _claude_prompt_rendered(pane: str) -> bool:
     """
     Return whether Claude Code's chat input is rendered in a pane.
@@ -5144,11 +5184,15 @@ def _draft_in_input_box(pane: str, needle: str) -> bool | None:
 
     Return None when the capture cannot establish whether the draft remains.
     """
-    if (
-        _MODEL_PICKER_OPEN_HINT in pane
-        or any(hint in pane for hint in _CONFIRM_DIALOG_HINTS)
-        or not _claude_prompt_rendered(pane)
-    ):
+    # Only the absence of a rendered composer makes the draft's state
+    # unknowable here. A confirm dialog / model picker / permission prompt that
+    # replaced the composer already trips this (no composer row renders), and
+    # anchoring on the composer this way is what keeps ordinary text — a pasted
+    # ``"Explain Switch model?"`` draft, or a hint echoed in the transcript —
+    # from being read as an active dialog while the composer is plainly up. A
+    # bare whole-pane substring check returned None for such a draft, so the
+    # verifier then called the still-present, unsent draft delivered.
+    if not _claude_prompt_rendered(pane):
         return None
 
     lines = [line for line in pane.splitlines() if line.strip()]
