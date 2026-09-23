@@ -231,7 +231,7 @@ def test_a_new_opus_generation_is_spoken_without_touching_this_module() -> None:
     """
     assert claude_model_alias("databricks-claude-opus-5-5", {}) == "opus"
     assert served_alias_pins(
-        ["databricks-claude-opus-4-8", "databricks-claude-opus-5", "databricks-claude-opus-5-5"]
+        ["databricks-claude-opus-5-5", "databricks-claude-opus-4-8", "databricks-claude-opus-5"]
     ) == {"opus": "databricks-claude-opus-5-5"}
     assert canonical_claude_id("databricks-claude-opus-5-5") == "claude-opus-5-5"
 
