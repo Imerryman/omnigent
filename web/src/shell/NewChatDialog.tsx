@@ -3589,18 +3589,35 @@ export function NewChatLandingScreen() {
                     </>
                   ),
                   choices: [
-                    ...(pickerModelOptions.length > 0 &&
-                    !pickerModelOptions.some((option) => option.isDefault)
+                    // SDK brains ALWAYS get an explicit "Agent default" entry
+                    // (the only thing that clears the override, deferring to the
+                    // agent's spec model) — even when the Claude catalog marks a
+                    // row isDefault, because that catalog default is unrelated
+                    // to the brain's own spec model. Native/Pi keep their
+                    // "Harness default" row, shown only when the catalog itself
+                    // carries no default row.
+                    ...(hasSdkModelPicker
                       ? [
                           {
                             key: "__default__",
-                            label: "Harness default",
+                            label: "Agent default",
                             checked: !routingOn && pickedModel === "",
                             onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
                             testId: "new-chat-landing-agent-model-default",
                           },
                         ]
-                      : []),
+                      : pickerModelOptions.length > 0 &&
+                          !pickerModelOptions.some((option) => option.isDefault)
+                        ? [
+                            {
+                              key: "__default__",
+                              label: "Harness default",
+                              checked: !routingOn && pickedModel === "",
+                              onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                              testId: "new-chat-landing-agent-model-default",
+                            },
+                          ]
+                        : []),
                     ...pickerModelOptions
                       .filter((option) =>
                         pickerModelSearch
@@ -3614,12 +3631,24 @@ export function NewChatLandingScreen() {
                       .map((option) => ({
                         key: option.id,
                         label: visibleModelLabel(nativeModelLabel(option)),
+                        // SDK brains select their concrete model regardless of
+                        // the catalog's isDefault flag (an explicit Opus/Sonnet
+                        // pick must reach model_override, not collapse to the
+                        // no-override sentinel), and an unpicked brain checks
+                        // "Agent default" above rather than the catalog default.
+                        // Native/Pi keep isDefault semantics.
                         checked:
                           !routingOn &&
                           (pickedModel === option.id ||
-                            (pickedModel === "" && option.isDefault === true)),
+                            (!hasSdkModelPicker &&
+                              pickedModel === "" &&
+                              option.isDefault === true)),
                         onSelect: () =>
-                          selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                          selectPickerModel(
+                            !hasSdkModelPicker && option.isDefault
+                              ? MODEL_SELECT_DEFAULT
+                              : option.id,
+                          ),
                         testId: `new-chat-landing-agent-model-${option.id}`,
                         title: nativeModelLabel(option),
                         className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
