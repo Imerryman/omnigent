@@ -253,7 +253,24 @@ jobs:
         env:
           NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" ripgrep tmux bubblewrap
+          # INLINE ON PURPOSE -- do NOT replace this with
+          # .github/scripts/ci/apt-install.sh like the other CI jobs do. This job
+          # checks out an ARBITRARY HISTORICAL revision (target_branch), so the helper
+          # would be read from that old tree and any revision predating it fails
+          # with "No such file or directory" before the run even starts. Logic
+          # below mirrors the helper 1:1 -- keep them in step.
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            if sudo -E apt-get update -qq \
+              && sudo -E apt-get install -y -q --no-install-recommends ripgrep tmux bubblewrap; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "apt install failed after 3 attempts: ripgrep tmux bubblewrap" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
           node .github/ci-deps/node_modules/@anthropic-ai/claude-code/install.cjs

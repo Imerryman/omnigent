@@ -135,7 +135,24 @@ jobs:
         # stores-mysql lane in ci.yml.
         if: matrix.backend == 'mysql'
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" --with-recommends libmysqlclient-dev
+          # INLINE ON PURPOSE -- do NOT replace this with
+          # .github/scripts/ci/apt-install.sh like the other CI jobs do. This job
+          # checks out an ARBITRARY HISTORICAL revision (checkout_sha), so the helper
+          # would be read from that old tree and any revision predating it fails
+          # with "No such file or directory" before the run even starts. Logic
+          # below mirrors the helper 1:1 -- keep them in step.
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            if sudo -E apt-get update -qq \
+              && sudo -E apt-get install -y -q libmysqlclient-dev; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "apt install failed after 3 attempts: libmysqlclient-dev" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           uv pip install mysqlclient
 
       # Resolve the DB URI + a stable seed-cache key for this backend. The

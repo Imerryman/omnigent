@@ -1,7 +1,8 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # Installs apt packages on a GitHub-hosted runner, with a bounded retry.
 #
 # Usage:  apt-install.sh [--with-recommends] PACKAGE...
+# Exits:  0 installed, 1 still failing after 3 attempts, 2 no packages given.
 #
 # Why this exists: the runner images ship a PRE-SEEDED apt index. When the
 # upstream Ubuntu mirror rotates a package to a newer version, that stale index
@@ -15,33 +16,52 @@
 # --no-install-recommends, which is a no-op for the tools we install here
 # (bubblewrap's only Recommends is procps, already on the runner image) but is
 # NOT verified for every package, hence the opt-out.
+#
+# POSIX sh, no bashisms: it is invoked as `bash <script>` from workflow steps
+# today, but nothing here needs bash and /bin/sh keeps it portable.
+#
+# Deliberately NOT passing `-o APT::Update::Error-Mode=any` to apt-get update:
+# it would turn a transient failure on any third-party index we do not even
+# need (docker, microsoft, the git-core PPA -- all present on the runner image)
+# into a hard job failure after the retries. A stale index still surfaces as an
+# install failure, which this loop already retries, and each retry re-runs
+# update -- so the tolerant default is strictly more resilient here.
+#
+# Callers that check out an ARBITRARY HISTORICAL revision (flake-stress*.yml,
+# benchmark.yml) cannot use this file -- it would be read from that old tree.
+# They keep an equivalent install inline; see the comments at those call sites.
 
-set -euo pipefail
+set -eu
 
-recommends=(--no-install-recommends)
-if [[ "${1:-}" == "--with-recommends" ]]; then
-  recommends=()
+no_recommends=1
+if [ "${1:-}" = "--with-recommends" ]; then
+  no_recommends=
   shift
 fi
 
-if [[ $# -eq 0 ]]; then
+if [ "$#" -eq 0 ]; then
   echo "apt-install.sh: no packages given" >&2
   exit 2
 fi
 
+packages="$*"
+if [ -n "$no_recommends" ]; then
+  set -- --no-install-recommends "$@"
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 
-attempts=3
-for attempt in $(seq 1 "$attempts"); do
+# 3 attempts, 5s then 10s of backoff. Keep in step with the inline copies.
+for attempt in 1 2 3; do
   if sudo -E apt-get update -qq \
-    && sudo -E apt-get install -y -q "${recommends[@]}" "$@"; then
+    && sudo -E apt-get install -y -q "$@"; then
     exit 0
   fi
-  if [[ "$attempt" -lt "$attempts" ]]; then
-    echo "apt-install.sh: attempt $attempt/$attempts failed for [$*]; retrying" >&2
+  if [ "$attempt" -lt 3 ]; then
+    echo "apt-install.sh: attempt $attempt/3 failed for [$packages]; retrying" >&2
     sleep $((attempt * 5))
   fi
 done
 
-echo "apt-install.sh: giving up after $attempts attempts for [$*]" >&2
+echo "apt-install.sh: giving up after 3 attempts for [$packages]" >&2
 exit 1
