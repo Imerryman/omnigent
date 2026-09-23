@@ -266,9 +266,17 @@ _API_ONLY_LANDING_HTML = Path(__file__).parent / "static" / "api_only_landing.ht
 # name in sync with ``setup.py``'s ``_WEB_UI_STAMP_NAME``.
 _WEB_UI_BUILD_STAMP_NAME = "omnigent-build-stamp.json"
 _WEB_UI_STALE_FIX = (
-    "rebuild it with `pnpm install --frozen-lockfile --filter web && "
-    "pnpm --filter web run build`, or reinstall with OMNIGENT_BUILD_WEB_UI=1"
+    "run `python setup.py --omnigent-build-web-ui` from a checkout, or "
+    "reinstall with OMNIGENT_BUILD_WEB_UI=1 — a bare `pnpm --filter web run "
+    "build` rebuilds the bundle but writes no stamp, so this warning would "
+    "persist"
 )
+# Explicit, default-off opt-out for a deploy that knowingly ships a bundle
+# setup.py never stamped (e.g. an SPA unpacked outside the wheel behind
+# OMNIGENT_WEB_UI_DIST) and accepts the loss of the staleness check. Default
+# off on purpose: an unverifiable bundle is precisely what this check exists
+# to surface, so opting out has to be a deliberate, documented act.
+_WEB_UI_STALE_WARNING_OPT_OUT = "OMNIGENT_SUPPRESS_WEB_UI_STALE_WARNING"
 _WEB_UI_HTML_CACHE_CONTROL = "no-cache"
 _WEB_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
 _WEB_UI_STATIC_CACHE_CONTROL = "public, max-age=3600"
@@ -3577,9 +3585,23 @@ def _warn_if_web_ui_bundle_stale(dist: Path) -> None:
     path ever touches the bundle. Never fatal: a stale UI is a nuisance,
     not a reason to refuse to boot.
 
+    A bundle with no stamp, or an unreadable one, warns just like a
+    mismatched one: unknown provenance is exactly the condition worth
+    surfacing, and there is no implicit exemption for a bundle supplied
+    from outside the wheel. Set ``OMNIGENT_SUPPRESS_WEB_UI_STALE_WARNING``
+    to opt out deliberately.
+
     :param dist: Directory the SPA is mounted from.
     """
     from omnigent.update_check import _read_build_info
+
+    if (os.environ.get(_WEB_UI_STALE_WARNING_OPT_OUT) or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        return
 
     info = _read_build_info()
     if info is None:
@@ -3596,15 +3618,10 @@ def _warn_if_web_ui_bundle_stale(dist: Path) -> None:
     except (OSError, ValueError):
         stamp = None
     if not isinstance(stamp, dict):
-        if os.environ.get("OMNIGENT_WEB_UI_DIST"):
-            # A deploy that ships the SPA outside the wheel (see _WEB_UI_DIST)
-            # supplies a bundle setup.py never saw, so an absent stamp says
-            # nothing about staleness. A *mismatched* stamp still warns below.
-            return
         _logger.warning(
-            "web-ui: the bundle at %s carries no build stamp, so it cannot be "
-            "matched against this install (commit %s). If the UI looks out of "
-            "date, %s.",
+            "web-ui: the bundle at %s carries no readable build stamp, so it "
+            "cannot be matched against this install (commit %s) and may be "
+            "serving an older UI than the version reported. To fix, %s.",
             dist,
             commit[:12],
             _WEB_UI_STALE_FIX,
