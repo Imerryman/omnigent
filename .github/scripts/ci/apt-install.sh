@@ -23,13 +23,19 @@
 # Deliberately NOT passing `-o APT::Update::Error-Mode=any` to apt-get update:
 # it would turn a transient failure on any third-party index we do not even
 # need (docker, microsoft, the git-core PPA -- all present on the runner image)
-# into a hard job failure after the retries. A stale index still surfaces as an
-# install failure, which this loop already retries, and each retry re-runs
-# update -- so the tolerant default is strictly more resilient here.
+# into a hard job failure after the retries. Note this is an AVAILABILITY
+# TRADEOFF, not a strict improvement: a stale index that still references a
+# downloadable .deb installs fine without being refreshed, so tolerating index
+# errors can mask a refresh failure. We take that trade because THE OBSERVED
+# failure -- a 404 on the package fetch itself -- surfaces as an install
+# failure, which this loop retries, re-running update each time.
 #
-# Callers that check out an ARBITRARY HISTORICAL revision (flake-stress*.yml,
-# benchmark.yml) cannot use this file -- it would be read from that old tree.
-# They keep an equivalent install inline; see the comments at those call sites.
+# Not every caller can use this file. Seven jobs do; the other seven install
+# inline because the tree they check out may not contain this script: four
+# check out an arbitrary historical revision (flake-stress*.yml,
+# benchmark.yml), and three pin `ref: default_branch` while their own workflow
+# definition comes from the triggering ref (issue-triage.yml,
+# security-triage.yml, polly-review.yml). See the comments at those sites.
 
 set -eu
 

@@ -213,7 +213,26 @@ jobs:
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'
         # tmux: Polly uses it for its shell terminal.
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" tmux
+          # INLINE ON PURPOSE -- do NOT replace this with
+          # .github/scripts/ci/apt-install.sh like the HEAD-checkout jobs do. The
+          # checkout above deliberately pins `ref: default_branch`, but this
+          # workflow's DEFINITION is read from whatever ref triggered it --
+          # workflow_dispatch, or a pull_request's merge ref. Those two can differ, so the definition
+          # may call a helper that the checked-out default branch does not carry
+          # yet, failing with "No such file or directory". Logic below mirrors
+          # .github/scripts/ci/apt-install.sh 1:1 -- keep them in step.
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            if sudo -E apt-get update -qq \
+              && sudo -E apt-get install -y -q --no-install-recommends tmux; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "apt install failed after 3 attempts: tmux" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
 
       - name: Cache virtualenv
         if: steps.trigger.outputs.skip != 'true' && steps.creds.outputs.available == 'true'

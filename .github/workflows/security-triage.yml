@@ -175,7 +175,26 @@ jobs:
       - name: Install bubblewrap
         if: steps.creds.outputs.available == 'true'
         run: |
-          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" bubblewrap tmux
+          # INLINE ON PURPOSE -- do NOT replace this with
+          # .github/scripts/ci/apt-install.sh like the HEAD-checkout jobs do. The
+          # checkout above deliberately pins `ref: default_branch`, but this
+          # workflow's DEFINITION is read from whatever ref triggered it --
+          # a workflow_dispatch from any branch. Those two can differ, so the definition
+          # may call a helper that the checked-out default branch does not carry
+          # yet, failing with "No such file or directory". Logic below mirrors
+          # .github/scripts/ci/apt-install.sh 1:1 -- keep them in step.
+          export DEBIAN_FRONTEND=noninteractive
+          for attempt in 1 2 3; do
+            if sudo -E apt-get update -qq \
+              && sudo -E apt-get install -y -q --no-install-recommends bubblewrap tmux; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              echo "apt install failed after 3 attempts: bubblewrap tmux" >&2
+              exit 1
+            fi
+            sleep $((attempt * 5))
+          done
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
