@@ -4762,10 +4762,34 @@ def test_submit_popped_surface_distinguishes_overlay_from_transcript() -> None:
     assert _submit_popped_surface(live) is False
     assert _draft_in_input_box(live, "still unsent") is True
 
-    # Real surfaces that replaced the composer -> popped (accepted).
+    # Real boxed surfaces that replaced the composer -> popped (accepted). The
+    # interactive /model picker is intentionally NOT a detected surface (its
+    # plain-text footer is forgeable; upstream switches models via
+    # non-interactive `/model <id>`), so only box-chrome dialogs are detected.
     assert _submit_popped_surface(_EFFORT_DIALOG_PANE) is True
-    assert _submit_popped_surface(_MODEL_PICKER_PANE) is True
     assert _submit_popped_surface(_PERMISSION_PROMPT_PANE) is True
+    assert _submit_popped_surface(_MODEL_PICKER_PANE) is False
+
+
+def test_submit_popped_surface_draft_veto_overrides_boxed_dialog() -> None:
+    """The hard draft veto beats even a genuine boxed-dialog surface.
+
+    If the submitted draft is still on screen, the message was not submitted, so
+    acceptance is impossible regardless of a real ``│``-boxed permission/effort
+    dialog also being present. The draft's own presence — which prose cannot
+    fake away — is the invariant, not the surface chrome.
+    """
+    from omnigent.harnesses.claude_native.bridge import _submit_popped_surface
+
+    needle = "keep me unsent"
+    # A real boxed permission dialog whose chrome is present, but the draft is
+    # still visible on a live (non-transcript, non-composer) row -> vetoed.
+    boxed_with_draft = (
+        "╭──────╮\n│ Do you want to proceed? │\n│ keep me unsent │\n│ ❯ 1. Yes │\n╰──────╯\n"
+    )
+    assert _submit_popped_surface(boxed_with_draft, needle) is False
+    # The same surface once the draft is gone -> accepted.
+    assert _submit_popped_surface(_PERMISSION_PROMPT_PANE, needle) is True
 
 
 def test_inject_user_message_accepts_when_submit_reaches_permission_prompt(
@@ -4926,364 +4950,6 @@ def test_submit_torn_capture_with_transcript_hint_does_not_accept(
         "verification accepted on the torn transcript frame instead of waiting "
         f"for a positive dialog surface; verify_captures={state['verify_captures']}"
     )
-
-
-def test_submit_torn_capture_with_footer_words_scattered_in_transcript_does_not_accept(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Transcript prose that scatters footer words across lines is not a picker.
-
-    Regression (BLOCKING 1, 4th round): folding a whole contiguous non-blank
-    block and matching independent substrings let two unrelated transcript
-    lines — one mentioning 'use this session only', another 'Esc to cancel' —
-    stitch into a fake ``/model`` picker footer, so verification wrongly
-    accepted on the first (torn) capture without inspecting the still-present
-    draft. The footer is now matched as an ORDERED trio (Enter to set → use
-    this session only → Esc to cancel); this prose lacks 'Enter to set', so it
-    stays PENDING and the unsent draft on later captures fails loud.
-    """
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S", 0.05, raising=False
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    draft_pane = _composer_pane("keep me unsent")
-    # Torn capture: no composer, only two transcript lines that separately
-    # contain footer words — never a real, ordered picker footer.
-    transcript_pane = (
-        "  ⎿ Earlier we discussed 'use this session only'.\n"
-        "  ⎿ Separately, press Esc to cancel the search.\n"
-    )
-    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            if not state["submitted"]:
-                return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
-            state["verify_captures"] += 1
-            if state["verify_captures"] == 1:
-                return SimpleNamespace(returncode=0, stdout=transcript_pane, stderr="")
-            return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
-        if cmd[-1] == "Enter":
-            state["submitted"] = True
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
-        inject_user_message(bridge_dir, content="keep me unsent")
-
-    assert state["verify_captures"] >= 2, (
-        "verification accepted on the transcript-lookalike frame instead of "
-        f"waiting for a real ordered picker footer; verify_captures={state['verify_captures']}"
-    )
-
-
-def test_submit_transcript_prose_with_ordered_footer_markers_does_not_accept(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Transcript prose carrying all footer phrases IN ORDER is not a picker.
-
-    Regression (BLOCKING 1, 5th round — root cause): matching the ordered
-    marker subsequence anywhere in a non-blank block was defeated by natural
-    prose that happens to say "Enter to set …", "use this session only", then
-    "Esc to cancel" across three ``⎿`` transcript lines. The picker is now
-    identified by its own overlay chrome AND transcript (``⎿``) rows are
-    excluded, so this history prose stays PENDING and the still-present draft
-    on later captures fails loud.
-    """
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S", 0.05, raising=False
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    draft_pane = _composer_pane("keep me unsent")
-    # Three transcript lines carrying the footer phrases in order — but they are
-    # conversation history (⎿), not a live picker overlay.
-    prose_pane = (
-        "  ⎿ The docs say Enter to set the default model.\n"
-        "  ⎿ Choose use this session only for a temporary change.\n"
-        "  ⎿ You can press Esc to cancel the menu.\n"
-    )
-    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            if not state["submitted"]:
-                return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
-            state["verify_captures"] += 1
-            if state["verify_captures"] == 1:
-                return SimpleNamespace(returncode=0, stdout=prose_pane, stderr="")
-            return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
-        if cmd[-1] == "Enter":
-            state["submitted"] = True
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
-        inject_user_message(bridge_dir, content="keep me unsent")
-
-    assert state["verify_captures"] >= 2, (
-        "verification accepted on ordered-marker transcript prose instead of "
-        f"waiting for a real picker overlay; verify_captures={state['verify_captures']}"
-    )
-
-
-def test_model_picker_footer_present_requires_overlay_chrome() -> None:
-    """The footer matcher needs positive picker chrome and rejects transcript.
-
-    Root-cause unit coverage for :func:`_model_picker_footer_present`:
-    - a genuine picker overlay (title + numbered rows) whose footer is soft-
-      wrapped across rows still matches;
-    - the same footer markers, in order, appearing only in ``⎿`` transcript
-      prose do NOT match (transcript rows are excluded);
-    - footer markers with NO picker chrome above them (non-transcript prose,
-      but no title/menu row) do NOT match.
-    """
-    from omnigent.harnesses.claude_native.bridge import _model_picker_footer_present
-
-    wrapped_overlay = (
-        "  Select model\n"
-        "  ❯ 3. databricks-claude-sonnet-5 ✔\n"
-        "  Enter to set as default · s\n"
-        "to use this session only · Esc\n"
-        " to cancel\n"
-    )
-    assert _model_picker_footer_present(wrapped_overlay) is True
-
-    transcript_prose = (
-        "  ⎿ The docs say Enter to set the default model.\n"
-        "  ⎿ Choose use this session only for a temporary change.\n"
-        "  ⎿ You can press Esc to cancel the menu.\n"
-    )
-    assert _model_picker_footer_present(transcript_prose) is False
-
-    chromeless_prose = (
-        "Enter to set the default model, then\n"
-        "use this session only, and finally\n"
-        "press Esc to cancel when you are done.\n"
-    )
-    assert _model_picker_footer_present(chromeless_prose) is False
-
-
-def test_submit_popped_surface_draft_veto_beats_chrome_mimicking_prose() -> None:
-    """The hard draft veto: draft-still-on-screen overrides any surface text.
-
-    Root-cause invariant (round 9): text heuristics are defeated by assistant
-    prose that mimics picker chrome (a numbered/bulleted how-to, or the
-    unnumbered "To select model settings …"). But such prose cannot make the
-    submitted draft's own text disappear — a genuine popped surface has
-    replaced the composer, so the draft is gone. ``_submit_popped_surface``
-    therefore returns not-popped whenever the draft (needle) is still visible,
-    regardless of chrome, and still accepts a genuine picker/dialog where the
-    draft is gone.
-    """
-    from omnigent.harnesses.claude_native.bridge import _submit_popped_surface
-
-    needle = "keep me unsent"
-    numbered_howto = (
-        "1. Press Enter to set the default model\n"
-        "2. Choose use this session only\n"
-        "3. Press Esc to cancel\n"
-        "❯ keep me unsent\n"
-    )
-    bulleted_howto = (
-        "● 1. Press Enter to set the default model\n"
-        "● 2. Choose use this session only\n"
-        "● 3. Press Esc to cancel\n"
-        "❯ keep me unsent\n"
-    )
-    unnumbered_prose = (
-        "To select model settings, press Enter to set the default model,\n"
-        "choose use this session only, then press Esc to cancel.\n"
-        "❯ keep me unsent\n"
-    )
-    # Draft still on screen -> veto -> never a popped surface, whatever the prose.
-    assert _submit_popped_surface(numbered_howto, needle) is False
-    assert _submit_popped_surface(bulleted_howto, needle) is False
-    assert _submit_popped_surface(unnumbered_prose, needle) is False
-    # Genuine picker (draft gone, composer replaced) still accepts.
-    genuine_picker = (
-        "  Select model\n"
-        "  ❯ 3. databricks-claude-sonnet-5 ✔\n"
-        "  Enter to set as default · s to use this session only · Esc to cancel\n"
-    )
-    assert _submit_popped_surface(genuine_picker, needle) is True
-
-
-def _run_verify_stays_pending_with_prose(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    prose_frame: str,
-) -> None:
-    """Drive inject_user_message so a chrome-mimicking prose frame that still
-    shows the draft never accepts (verify keeps polling, then fails loud)."""
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.1)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_MAX_INTERVAL_S", 0.05, raising=False
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    draft_pane = _composer_pane("keep me unsent")
-    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            if not state["submitted"]:
-                return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
-            state["verify_captures"] += 1
-            if state["verify_captures"] == 1:
-                # A torn frame: chrome-mimicking prose with the draft still shown.
-                return SimpleNamespace(returncode=0, stdout=prose_frame, stderr="")
-            return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
-        if cmd[-1] == "Enter":
-            state["submitted"] = True
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered"):
-        inject_user_message(bridge_dir, content="keep me unsent")
-    assert state["verify_captures"] >= 2, (
-        "verification accepted on chrome-mimicking prose while the draft was "
-        f"still on screen; verify_captures={state['verify_captures']}"
-    )
-
-
-def test_submit_numbered_howto_prose_with_draft_present_does_not_accept(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A numbered/bulleted how-to mimicking picker chrome + draft => not accepted."""
-    _run_verify_stays_pending_with_prose(
-        tmp_path,
-        monkeypatch,
-        "● 1. Press Enter to set the default model\n"
-        "● 2. Choose use this session only\n"
-        "● 3. Press Esc to cancel\n"
-        "❯ keep me unsent\n",
-    )
-
-
-def test_submit_unnumbered_model_prose_with_draft_present_does_not_accept(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Unnumbered 'To select model settings…' prose + draft => not accepted."""
-    _run_verify_stays_pending_with_prose(
-        tmp_path,
-        monkeypatch,
-        "To select model settings, press Enter to set the default model,\n"
-        "choose use this session only, then press Esc to cancel.\n"
-        "❯ keep me unsent\n",
-    )
-
-
-def test_submit_accepts_wrapped_model_picker_footer(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A narrow-pane ``/model`` picker whose footer wrapped is still accepted.
-
-    Regression: ``_capture_pane`` preserves the terminal's line breaks, so a
-    narrow pane soft-wraps the picker footer
-    (``Enter to set as default · s to use this session only · Esc to cancel``)
-    across rows, splitting the hint from the action markers. The
-    same-line-only matcher then false-rejected a displayed picker, waiting the
-    full verify window before reporting failure. The submit must be accepted
-    promptly, and no Enter may be sent into the picker (its default answer
-    rewrites the global model default).
-    """
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
-    monkeypatch.setattr(
-        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
-    )
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 5.0)
-    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
-    bridge_dir = tmp_path / "bridge"
-    write_tmux_target(
-        bridge_dir,
-        socket_path=Path("/tmp/example/tmux.sock"),
-        tmux_target="claude:0.0",
-    )
-
-    # The picker footer wrapped to a narrow pane: hint and action markers on
-    # different rows, "Esc to cancel" split mid-marker.
-    wrapped_picker = (
-        "  Select model\n"
-        "  ❯ 3. databricks-claude-sonnet-5 ✔\n"
-        "  Enter to set as default · s\n"
-        "to use this session only · Esc\n"
-        " to cancel\n"
-    )
-    enters: list[list[str]] = []
-    tui: dict[str, Any] = {"pane": _composer_pane()}
-
-    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
-        del kwargs
-        if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
-        if "paste-buffer" in cmd:
-            tui["pane"] = _composer_pane("set the model")
-        if cmd[-1] == "Enter":
-            enters.append(cmd)
-            # The submit pops the /model picker, whose wrapped footer replaces
-            # the composer before the cleared box is captured.
-            tui["pane"] = wrapped_picker
-        return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr("subprocess.run", _fake_run)
-    started = time.monotonic()
-    inject_user_message(bridge_dir, content="set the model")
-    elapsed = time.monotonic() - started
-
-    assert len(enters) == 1, (
-        f"exactly one submit Enter and none into the picker; got {len(enters)}"
-    )
-    # Accepted promptly on the first verify capture, not after the full window.
-    assert elapsed < 4.0, f"picker acceptance should be prompt, took {elapsed:.1f}s"
 
 
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(

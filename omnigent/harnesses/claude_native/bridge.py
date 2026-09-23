@@ -343,28 +343,9 @@ _FOREIGN_DIALOG_HINTS = (
 # echoed in the transcript, or a torn capture that just omits the composer, is
 # not proof a dialog replaced it.
 _BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
-# The ``/model`` picker footer's action markers, in the order they render on its
-# single footer line ("Enter to set as default · s to use this session only ·
-# Esc to cancel"), whitespace-folded so a soft-wrapped or mid-token-split footer
-# still matches. Matched as an ordered subsequence within one contiguous run
-# (see :func:`_model_picker_footer_present`) so transcript prose that merely
-# mentions the same words in separate lines does not read as an active picker.
-_MODEL_PICKER_FOOTER_MARKERS = (
-    "entertoset",
-    "".join(_MODEL_PICKER_OPEN_HINT.split()).lower(),
-    "esctocancel",
-)
-# The ``/model`` picker's own overlay chrome, used to POSITIVELY identify the
-# picker region before matching its footer (see
-# :func:`_model_picker_footer_present`): its header title, and a numbered
-# selection row (``❯ 1. …`` / ``2. …``). Requiring real chrome — not just the
-# footer words — is what stops ordinary prose that happens to contain the marker
-# phrases in order from reading as a live picker.
-_MODEL_PICKER_TITLE_HINT = "select model"
-_MODEL_PICKER_MENU_ROW_RE = re.compile(r"^[❯>\s]*\d+\.\s")
 # Transcript/scrollback rows are prefixed with this glyph; they are conversation
-# history, never live overlay chrome, so they are dropped before any picker /
-# footer matching.
+# history, never live overlay chrome, so they are dropped before the draft veto
+# scans for the still-visible draft (see :func:`_draft_needle_on_screen`).
 _TRANSCRIPT_MARKER = "⎿"
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
@@ -5052,30 +5033,33 @@ def _submit_popped_surface(pane: str, needle: str = "") -> bool:
     press Enter into such a surface — its default answer commits something
     unasked-for).
 
-    Acceptance is governed by two invariants that no pane-text heuristic can be
-    tricked past, because they key on the DRAFT, not on classifying prose:
+    Only the boxed confirm/permission surfaces are detected. Acceptance is
+    governed by two invariants that no pane-text heuristic can be tricked past,
+    because they key on the DRAFT, not on classifying prose:
 
     1. **Hard draft veto.** If the submitted draft (*needle*) is still visible
        on screen (outside the transcript), the message was NOT submitted, so no
-       surface acceptance is possible — whatever picker/dialog/footer text also
-       appears. Assistant prose or a numbered how-to can mimic any chrome, but
-       it cannot make the draft's own text disappear; a genuinely popped
-       surface has replaced the composer, so the draft is gone.
+       surface acceptance is possible — whatever dialog text also appears.
+       Assistant prose can mimic any chrome, but it cannot make the draft's own
+       text disappear; a genuinely popped surface has replaced the composer, so
+       the draft is gone.
     2. **Region anchoring.** A live composer row means the active bottom region
        IS the input box, and its draft is handled by the tri-state
        :func:`_draft_in_input_box`; any surface text elsewhere is scrollback,
        not a popped overlay, so this returns not-popped.
 
     Only past both gates is the surface's own chrome consulted — the boxed
-    confirm/permission title on a vertical-rule row, or the ``/model`` picker
-    footer (:func:`_model_picker_footer_present`, transcript-excluded, wrap
-    tolerant).
+    confirm/permission title on a vertical-rule (``│``) row. The interactive
+    ``/model`` picker footer is deliberately NOT detected: its footer is plain
+    text a prose how-to can forge, upstream drives model switching through the
+    non-interactive ``/model <id>`` command rather than the picker, and box
+    chrome is far harder to fake.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: The submitted draft marker (:func:`_submit_needle`); when
         it is still on screen the veto fires. Empty disables the veto.
-    :returns: ``True`` when a recognized surface has replaced the composer and
-        the draft is no longer on screen.
+    :returns: ``True`` when a recognized boxed surface has replaced the composer
+        and the draft is no longer on screen.
     """
     # Invariant 2: a live composer means the active region is the input box.
     if _composer_row(pane) is not None:
@@ -5093,8 +5077,7 @@ def _submit_popped_surface(pane: str, needle: str = "") -> bool:
             and any(hint in stripped for hint in _BOXED_DIALOG_HINTS)
         ):
             return True
-    # ``/model`` picker: footer action chrome, tolerant of a wrapped footer.
-    return _model_picker_footer_present(pane)
+    return False
 
 
 def _draft_needle_on_screen(pane: str, needle: str) -> bool:
@@ -5120,57 +5103,6 @@ def _draft_needle_on_screen(pane: str, needle: str) -> bool:
         if line.strip() and not line.strip().startswith(_TRANSCRIPT_MARKER)
     ).lower()
     return folded_needle in live
-
-
-def _model_picker_footer_present(pane: str) -> bool:
-    """
-    Return whether a pane shows the live ``/model`` picker overlay.
-
-    Root-cause identification, in three steps, so ordinary transcript prose that
-    merely contains the footer's action phrases can never read as a picker:
-
-    1. **Drop transcript rows.** A line prefixed with :data:`_TRANSCRIPT_MARKER`
-       (``⎿``) is conversation history, never live overlay chrome, so it is
-       removed before anything is matched. (Both reviewer repros are entirely
-       ``⎿`` prose, so this alone disqualifies them.)
-    2. **Positively identify the picker region.** The remaining lines must carry
-       the picker's own chrome — its ``Select model`` title
-       (:data:`_MODEL_PICKER_TITLE_HINT`) or a numbered selection row
-       (:data:`_MODEL_PICKER_MENU_ROW_RE`, e.g. ``❯ 1. …``). Marker phrases with
-       no such chrome above them are prose, not a picker.
-    3. **Match the ordered footer within that region.** Only then are the action
-       markers (:data:`_MODEL_PICKER_FOOTER_MARKERS`) matched, in order, over the
-       chrome region folded to absorb a soft-wrapped (even mid-token-split)
-       footer — preserving the narrow-pane wrapped-picker case.
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the live picker overlay (with its ordered footer) is
-        on screen.
-    """
-    # 1. Live overlay chrome only — never scrollback/transcript rows.
-    lines = [
-        line
-        for line in pane.splitlines()
-        if line.strip() and not line.strip().startswith(_TRANSCRIPT_MARKER)
-    ]
-    if not lines:
-        return False
-    # 2. Positive picker chrome must be present, or marker phrases are prose.
-    has_picker_chrome = any(
-        _MODEL_PICKER_TITLE_HINT in line.lower() or _MODEL_PICKER_MENU_ROW_RE.match(line.strip())
-        for line in lines
-    )
-    if not has_picker_chrome:
-        return False
-    # 3. Ordered footer markers within the identified region, wrap-tolerant.
-    folded = "".join("".join(line.split()) for line in lines).lower()
-    pos = 0
-    for marker in _MODEL_PICKER_FOOTER_MARKERS:
-        found = folded.find(marker, pos)
-        if found == -1:
-            return False
-        pos = found + len(marker)
-    return True
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
