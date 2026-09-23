@@ -1883,6 +1883,56 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-config-effort").textContent).toContain("high");
   });
 
+  it("restores the remembered model when switching between two agents on the SAME claude-native harness", async () => {
+    // Two distinct agents sharing one harness (e.g. two user-registered
+    // claude-native templates): the harness, catalog and project default are
+    // all UNCHANGED across the switch, so `selectedNativeHarness` alone never
+    // flips — only the agent identity does. The remembered-pick reseed must
+    // still re-run off that.
+    mockAgents([
+      {
+        id: "a1",
+        name: "claude-native-ui",
+        display_name: "Claude Code",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+      {
+        id: "a3",
+        name: "claude-native-custom",
+        display_name: "Custom Claude",
+        description: null,
+        harness: "claude-native",
+        skills: [],
+      },
+    ]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_shared_harness" }),
+    } as unknown as Response);
+    renderLanding();
+
+    openAgentConfig("a1");
+    pickSelectOption("new-chat-landing-config-model", "Opus 4.8");
+    saveConfig();
+
+    // Switch straight to the other claude-native agent — no intervening
+    // harness or catalog change — and reopen its config.
+    selectAgent("a3");
+    openAgentConfig("a3");
+    // Must RESTORE the shared harness's remembered pick, not reset to
+    // Default: the per-agent reset above clears the live pick on every
+    // switch, and only a reseed keyed on the agent (not just the harness)
+    // repopulates it here.
+    expect(screen.getByTestId("new-chat-landing-config-model").textContent).toContain("Opus 4.8");
+    saveConfig();
+
+    const { body } = await submitAndReadBody();
+    expect(body.agent_id).toBe("a3");
+    expect(body.model_override).toBe("opus");
+  });
+
   it("sends the selected Codex launch model without changing Claude's remembered model", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,

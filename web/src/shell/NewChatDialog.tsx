@@ -3610,7 +3610,11 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes, when the selected host's catalog resolves,
     // and when the project's configured default model settles (its config
     // loads async, so the first run may see it as null); capability flags are
-    // derived from the same harness and stay omitted.
+    // derived from the same harness and stay omitted. Keyed on the agent too
+    // (not just the harness) so it re-runs after the agent-change reset
+    // above, which clears the picked model for every agent switch —
+    // including one between two agents that share the same native harness,
+    // where `selectedNativeHarness` alone wouldn't change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     selectedNativeHarness,
@@ -3618,6 +3622,7 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    effectiveAgentId,
   ]);
   // Smart Routing is remembered per harness alongside the mode/model
   // knobs, in its own effect because eligibility depends on the server flag
