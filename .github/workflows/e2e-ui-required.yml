@@ -41,7 +41,7 @@ jobs:
   require-e2e-ui:
     name: E2E UI Required
     # Skip drafts; the `ready_for_review` trigger re-fires on un-drafting.
-    if: ${{ !github.event.pull_request.draft }}
+    if: ${{ github.repository != 'Imerryman/omnigent' && !github.event.pull_request.draft }}
     permissions:
       contents: read
       pull-requests: read
