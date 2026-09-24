@@ -3315,8 +3315,13 @@ export function NewChatLandingScreen() {
       const modelRow = pickedClaudeModelLabel
         ? [{ label: "Model", value: pickedClaudeModelLabel }]
         : [];
+      const effortRow =
+        active === "claude-sdk" && pickedEffort
+          ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+          : [];
       return [
         ...modelRow,
+        ...effortRow,
         { label: "Agent Harness", value: brainHarnessLabelsAll[active] ?? active },
         ...routingRow,
       ];
@@ -3482,7 +3487,9 @@ export function NewChatLandingScreen() {
             codexModelOptions,
             pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
           ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-        : [];
+        : hasSdkModelPicker
+          ? CLAUDE_NATIVE_EFFORTS
+          : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -3535,9 +3542,14 @@ export function NewChatLandingScreen() {
     }
   };
   const selectPickerEffort = (effort: string) => {
-    if (!selectedNativeHarness) return;
+    // A claude-sdk brain has no native harness to key an option store off, but
+    // its pick still flows through the shared `pickedEffort` -> `reasoning_effort`
+    // create field, so it must not early-return here.
+    if (!selectedNativeHarness && !hasSdkModelPicker) return;
     setPickedEffort(effort);
-    rememberPickerOptions(selectedNativeHarness, { effort });
+    if (selectedNativeHarness) {
+      rememberPickerOptions(selectedNativeHarness, { effort });
+    }
   };
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
@@ -3782,8 +3794,11 @@ export function NewChatLandingScreen() {
     // opened for. A native-harness switch immediately reseeds this from that
     // agent's own remembered pick via the effect below (keyed on the agent id
     // too), so this reset never strands a native agent on "Default".
+    // The same applies to effort: a previous agent's effort pick must not leak
+    // onto the newly selected agent (including a claude-sdk brain).
     setPickedModel("");
-  }, [effectiveAgentId, setCostControlMode, setPickedModel]);
+    setPickedEffort("");
+  }, [effectiveAgentId, setCostControlMode, setPickedModel, setPickedEffort]);
   // A project-configured default model (Project settings) outranks the user's
   // remembered per-harness pick — but only while the composer sits on the
   // project's configured agent; switching to another agent falls back to the
@@ -5012,7 +5027,8 @@ export function NewChatLandingScreen() {
         !routingOwnsModel &&
         (agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
-          nativeAgent?.harness === "codex-native") &&
+          nativeAgent?.harness === "codex-native" ||
+          agentBrainIsSdk) &&
         pickedEffort
           ? pickedEffort
           : null;
