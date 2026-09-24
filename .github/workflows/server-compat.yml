@@ -46,6 +46,7 @@ on:
       - "tests/_helpers/compat.py"
       - ".github/actions/compat-smoke-run/**"
       - ".github/actions/compat-smoke-ui-run/**"
+      - ".github/scripts/ci/**"
       - ".github/workflows/server-compat.yml"
 
 concurrency:
