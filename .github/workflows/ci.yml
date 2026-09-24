@@ -175,8 +175,7 @@ jobs:
         # apparmor sysctl: Ubuntu 24.04 blocks unprivileged user namespaces
         # that bwrap needs; scope is the ephemeral runner.
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ripgrep bubblewrap tmux
+          bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" ripgrep bubblewrap tmux
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
@@ -363,7 +362,7 @@ jobs:
         with:
           enable-cache: true
       - name: Install system MySQL client library
-        run: sudo apt-get update -qq && sudo apt-get install -y -q libmysqlclient-dev
+        run: bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" --with-recommends libmysqlclient-dev
       - name: Install dependencies
         run: uv sync --locked --extra all --group test --extra databricks && uv pip install mysqlclient
       - name: Run store + DB tests against MySQL

@@ -83,8 +83,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        sudo apt-get update
-        sudo apt-get install -y tmux ripgrep bubblewrap
+        bash "$GITHUB_WORKSPACE/.github/scripts/ci/apt-install.sh" tmux ripgrep bubblewrap
         sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
         npm install --ignore-scripts
         node node_modules/@anthropic-ai/claude-code/install.cjs
