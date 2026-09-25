@@ -370,8 +370,10 @@ async def test_launch_config_reads_parent_session_id_from_the_snapshot() -> None
         def __init__(self, payload: dict) -> None:
             self._payload = payload
 
-        async def get(self, url: str, timeout: float | None = None) -> _Snapshot:
-            del url, timeout
+        async def get(
+            self, url: str, params: object = None, timeout: float | None = None
+        ) -> _Snapshot:
+            del url, params, timeout
             return _Snapshot(self._payload)
 
     child = await _pi_native_launch_config(
