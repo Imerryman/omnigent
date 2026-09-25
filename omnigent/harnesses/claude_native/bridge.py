@@ -283,6 +283,18 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+# A selection dialog Claude Code stacks ABOVE a still-rendered composer (e.g.
+# 2.1.280's "Teach auto mode about your environment?", opened as a turn ends)
+# takes the keyboard: a paste lands in the dialog, not the input box. It is
+# framed by a rule above and the composer's opening rule below, lists numbered
+# options behind the ``❯`` selector, and its last row is the footer naming
+# Escape as the way out.
+_STACKED_DIALOG_FOOTER_RE = re.compile(
+    r"enter to \w+\s*·\s*esc to (cancel|exit)\s*$", re.IGNORECASE
+)
+_STACKED_DIALOG_OPTION_RE = re.compile(r"^\s*" + re.escape("❯") + r"\s*\d+\.")
+# Taller framed regions are transcript, not a dialog.
+_STACKED_DIALOG_MAX_LINES = 14
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -4020,6 +4032,87 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    _paste_draft(bridge_dir, socket_path, tmux_target, text=text)
+    # Wait until the TUI has visibly committed the paste into its input
+    # box before submitting. Claude Code coalesces rapid stdin bursts
+    # into a paste; an Enter that arrives while it is still consuming
+    # the paste becomes a newline inside the draft instead of a submit,
+    # and the message sits unsent. A fixed sleep raced this (lost under
+    # load / large payloads); polling is deterministic.
+    draft_seen = False
+    repasted = False
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _draft_in_input_box(pane, needle) is True:
+            draft_seen = True
+            break
+        if _stacked_dialog_headline(pane) is not None:
+            # A dialog opened above the composer after the pre-paste restore
+            # (they appear as a turn ends) and swallowed the paste. Dismiss it
+            # through the same verified-Escape path and paste once more; a
+            # dialog that will not go away is named now instead of costing
+            # the full commit timeout.
+            if not repasted:
+                _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+            headline = _stacked_dialog_headline(_capture_pane(socket_path, tmux_target))
+            if headline is not None:
+                raise ClaudeTerminalDialog(
+                    f"Claude Code is waiting for an answer in its terminal ({headline}). "
+                    "The message was not delivered."
+                )
+            if not repasted:
+                _paste_draft(bridge_dir, socket_path, tmux_target, text=text)
+                repasted = True
+                deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+                continue
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    # Fail BEFORE the submit Enter, never after. The draft was never confirmed
+    # in the box (e.g. an unidentifiable draft whose needle is empty), so its
+    # delivery cannot be verified — and pressing Enter first would submit, and
+    # so possibly execute, the very message this then reports as undelivered.
+    if not draft_seen:
+        raise RuntimeError(
+            "Claude Code's pasted draft could not be confirmed in the input box. "
+            "The message was not delivered."
+        )
+    time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Verify the submit took: a successful Enter clears the input box.
+    # If the draft is still sitting there the Enter was swallowed into
+    # the paste burst as a newline — re-send it (the retry lands well
+    # after the burst, so it submits). Each Enter only fires while the
+    # draft is verifiably still present, so a retry can never hit an
+    # empty prompt or a permission dialog of the started turn.
+    if _verify_submit_accepted(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        what="submitted message",
+        bridge_dir=bridge_dir,
+    ):
+        return
+    raise RuntimeError(
+        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
+        "(submission could not be confirmed). The message was not delivered."
+    )
+
+
+def _paste_draft(bridge_dir: Path, socket_path: str, tmux_target: str, *, text: str) -> None:
+    """
+    Clear the input box and bracketed-paste *text* into it (no submit).
+
+    :param bridge_dir: Bridge directory path (hosts the paste temp file).
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param text: Exact text to paste (already escaped as needed).
+    :returns: None.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -4057,52 +4150,6 @@ def _paste_and_submit(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
-    # Wait until the TUI has visibly committed the paste into its input
-    # box before submitting. Claude Code coalesces rapid stdin bursts
-    # into a paste; an Enter that arrives while it is still consuming
-    # the paste becomes a newline inside the draft instead of a submit,
-    # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic.
-    draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle) is True:
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Fail BEFORE the submit Enter, never after. The draft was never confirmed
-    # in the box (e.g. an unidentifiable draft whose needle is empty), so its
-    # delivery cannot be verified — and pressing Enter first would submit, and
-    # so possibly execute, the very message this then reports as undelivered.
-    if not draft_seen:
-        raise RuntimeError(
-            "Claude Code's pasted draft could not be confirmed in the input box. "
-            "The message was not delivered."
-        )
-    time.sleep(_PASTE_SETTLE_S)
-    if has_pending_user_prompt(bridge_dir):
-        raise ClaudeUserPromptPending(
-            "Claude is waiting for an explicit answer; message not sent."
-        )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    if _verify_submit_accepted(
-        socket_path,
-        tmux_target,
-        needle=needle,
-        what="submitted message",
-        bridge_dir=bridge_dir,
-    ):
-        return
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(submission could not be confirmed). The message was not delivered."
-    )
 
 
 def _verify_submit_accepted(
@@ -5441,6 +5488,12 @@ def _occupying_surface(pane: str) -> str | None:
     row = _composer_row(pane)
     if row is None:
         return "an overlay"
+    # A dialog stacked above the composer owns the keyboard even though the
+    # box is rendered; its footer names Escape as the non-committal way out
+    # (for the auto-mode setup prompt, Escape is "Not now").
+    headline = _stacked_dialog_headline(pane)
+    if headline is not None:
+        return f"a dialog above the input box ({headline})"
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return "shell mode"
@@ -5777,6 +5830,57 @@ def _terminal_dialog_headline(pane: str) -> str | None:
         line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region
     )
     if not has_selector and "press enter" not in footer.lower():
+        return None
+    return " ".join(region[0].strip().strip("│").split())[:120]
+
+
+def _stacked_dialog_headline(pane: str) -> str | None:
+    """
+    Name a selection dialog stacked above a live composer, or ``None``.
+
+    :func:`_terminal_dialog_headline` covers dialogs drawn *instead of* the
+    input box. Some open *above* it while the composer stays rendered — the
+    "Teach auto mode about your environment?" prompt Claude Code 2.1.280
+    shows as a turn ends — yet still own the keyboard, so a pasted message
+    is swallowed by the dialog and the composer stays empty. Every structural
+    check still passes (the composer row is there), which is why delivery
+    used to wait out the paste-commit timeout instead of seeing the dialog.
+
+    The read is structural and deliberately narrow, because the answer draws
+    an Escape: the region between the composer's opening rule and the rule
+    above it must be short (:data:`_STACKED_DIALOG_MAX_LINES`), hold a
+    numbered ``❯ 1.`` option row, and END with an "Enter to … · Esc to
+    cancel/exit" footer directly on the composer's rule. Transcript text
+    echoing such a dialog never ends flush against the composer frame with
+    a numbered selector inside one short framed region.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The dialog's first line, e.g.
+        ``"Teach auto mode about your environment?"``, or ``None``.
+    """
+    if not pane.strip():
+        return None
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    opening = next(
+        (
+            r
+            for r in (rules[-2:] if len(rules) >= 2 else rules)
+            if r + 1 < len(lines) and lines[r + 1].strip().startswith(_CLAUDE_PROMPT_GLYPH)
+        ),
+        None,
+    )
+    if opening is None:
+        return None
+    above = [r for r in rules if r < opening]
+    if not above:
+        return None
+    region = lines[above[-1] + 1 : opening]
+    if not region or len(region) > _STACKED_DIALOG_MAX_LINES:
+        return None
+    if not _STACKED_DIALOG_FOOTER_RE.search(region[-1].strip()):
+        return None
+    if not any(_STACKED_DIALOG_OPTION_RE.match(line) for line in region):
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
 
