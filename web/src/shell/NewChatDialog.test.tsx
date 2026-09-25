@@ -5197,6 +5197,75 @@ describe("NewChatLandingScreen", () => {
     ]);
   }
 
+  function mockPollyOnDefaultHost() {
+    // The default landing host reports no per-harness readiness, so the
+    // Claude catalog probe the SDK picker relies on is eligible (a live host
+    // reports ``claude-native: true``). Polly is a bundle agent whose spec
+    // brain is claude-sdk.
+    mockAgents([
+      {
+        id: "a_polly",
+        name: "polly",
+        display_name: "Polly",
+        description: null,
+        harness: "claude-sdk",
+        skills: [],
+      },
+    ]);
+  }
+
+  it("offers a Claude-catalog Model picker for a claude-sdk brain agent", () => {
+    // A bundle agent whose brain is claude-sdk gets a Model picker even though
+    // it advertises no native-wrapper capability — sourced from the Claude
+    // catalog claude-native uses, not Pi's.
+    mockPollyOnDefaultHost();
+    renderLanding();
+    openAgentModels("a_polly");
+    const models = screen.getByTestId("new-chat-landing-agent-models");
+    expect(models).toBeVisible();
+    expect(models).toHaveTextContent("Opus 4.8");
+    expect(models).toHaveTextContent("Sonnet 4.6");
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toBeTruthy();
+    // The brain's "no override" entry names the agent's spec, not the harness.
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveTextContent(
+      "Agent default",
+    );
+    // Not the Pi picker: no search box (pi-native only).
+    expect(screen.queryByTestId("new-chat-landing-agent-model-search")).toBeNull();
+  });
+
+  it("loads the host Claude catalog for a claude-sdk brain agent", () => {
+    // Catalogs load only for the harness the picker needs (#7966). A claude-sdk
+    // brain has no native harness of its own, so the Claude catalog must still
+    // be probed — otherwise its picker reads "Models unavailable".
+    mockPollyOnDefaultHost();
+    renderLanding();
+    const claudeCalls = useHostModelOptionsMock.mock.calls.filter(
+      ([, harness]) => harness === "claude-native",
+    );
+    expect(claudeCalls.at(-1)?.[2]).toBe(true);
+    expect(
+      useHostModelOptionsMock.mock.calls
+        .filter(([, harness]) => harness === "pi-native" || harness === "codex-native")
+        .every(([, , enabled]) => enabled === false),
+    ).toBe(true);
+  });
+
+  it("offers an Effort submenu with the Anthropic ladder for a claude-sdk brain agent", () => {
+    // A claude-sdk brain gets the same effort ladder as claude-native (Low /
+    // Medium / High / xHigh / Max), not the Pi-specific "Thinking level" header.
+    mockPollyOnDefaultHost();
+    renderLanding();
+    openAgentModels("a_polly");
+    const efforts = screen.getByTestId("new-chat-landing-agent-efforts");
+    expect(efforts).toBeVisible();
+    expect(efforts).toHaveTextContent("Effort");
+    expect(efforts).not.toHaveTextContent("Thinking level");
+    for (const rung of ["low", "medium", "high", "xhigh", "max"]) {
+      expect(screen.getByTestId(`new-chat-landing-agent-effort-${rung}`)).toBeTruthy();
+    }
+  });
+
   it("lists every brain harness in a bundle agent's override select by default", () => {
     // Preference off → the brain override still offers unconfigured harnesses
     // (badged), so they remain discoverable.

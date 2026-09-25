@@ -1313,12 +1313,33 @@ function visibleModelLabel(label: string): string {
 
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 
+/**
+ * The harness that will actually launch a bundle agent's brain: the session's
+ * picked/draft override when the agent's spec harness is one of the overridable
+ * brain harnesses (see `brainHarnessLabels`), else the spec's own harness.
+ * `null` for an agent with no brain-harness knob at all (native terminal
+ * wrappers, custom ACP agents, …).
+ */
+function effectiveBrainHarness(
+  agentHarness: string | null | undefined,
+  pickedHarness: string | null,
+  brainHarnessLabels: Readonly<Record<string, string>>,
+): string | null {
+  if (agentHarness == null || !(agentHarness in brainHarnessLabels)) return null;
+  return pickedHarness ?? agentHarness;
+}
+
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
     // devinMode owns Devin's own Model + Effort rows (see nativeCodingAgents).
     nativeAgentHasCapability(agent, "devinMode") ||
-    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native"
+    nativeCodingAgentForAvailableAgent(agent)?.harness === "codex-native" ||
+    // A bundle agent whose spec brain is claude-sdk gets a Model + Effort
+    // picker too — it reads a per-session model/effort override at spawn,
+    // though it advertises no native-wrapper capability of its own (see
+    // `effectiveBrainHarness`).
+    agent?.harness === "claude-sdk"
   );
 }
 
@@ -1525,8 +1546,15 @@ export function AgentHarnessPicker({
     ? agentLabel
     : visibleModelText ||
       (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "");
+  // A bundle agent's secondary text names its SDK — unless its brain carries an
+  // explicit Model/Effort pick (claude-sdk only; those rows exist only once
+  // picked), which is what will actually pin the session, so it shows instead.
+  const triggerSdkPickText =
+    triggerSdk && (triggerModel || visibleEffortText)
+      ? [triggerModelText, visibleEffortText].filter(Boolean).join(" ")
+      : "";
   const triggerSecondaryText = triggerSdk
-    ? compactModelTriggerLabel(triggerSdk.value)
+    ? triggerSdkPickText || compactModelTriggerLabel(triggerSdk.value)
     : visibleEffortText;
   const previewOnly = loading && !interactiveWhileLoading;
   const cachedPreview = previewOnly ? readNewChatPickerCache(cacheKey) : null;
@@ -3050,10 +3078,22 @@ export function NewChatLandingScreen() {
   // The selected native harness persists and restores harness-specific model,
   // effort, and permission knobs.
   const selectedNativeHarness = nativeCodingAgentForAvailableAgent(selectedAgent)?.harness ?? null;
+  // A bundle agent whose effective brain harness is claude-sdk (e.g. polly) gets
+  // the Claude Model + Effort picker, though it advertises no native-wrapper
+  // capability of its own. Keyed off the DRAFT harness pick (`pickedHarness`)
+  // so the rows appear/disappear live as the SDK selector changes.
+  const hasSdkModelPicker =
+    !sandboxSelected &&
+    effectiveBrainHarness(selectedAgent?.harness, pickedHarness, brainHarnessLabelsAll) ===
+      "claude-sdk";
+  // The host model catalog the picker reads: the selected native harness's,
+  // or Claude's for a claude-sdk brain (it runs, and is validated against,
+  // the Claude catalog — never Pi's).
+  const catalogHarness = selectedNativeHarness ?? (hasSdkModelPicker ? "claude-native" : null);
   // Probe only the selected, available harness. Older hosts without readiness
   // metadata remain eligible, matching the picker's setup warnings.
   const canLoadHostModels = (harness: string) =>
-    selectedNativeHarness === harness &&
+    catalogHarness === harness &&
     hostSelected &&
     selectedHost?.status === "online" &&
     !harnessUnconfiguredOnHost(harness, selectedHost);
@@ -3096,7 +3136,7 @@ export function NewChatLandingScreen() {
     cached?: NativeModelOption[],
   ) =>
     models ??
-    (selectedNativeHarness !== harness ||
+    (catalogHarness !== harness ||
     loading ||
     hostReadinessPending ||
     harnessUnconfiguredOnHost(harness, selectedHost) ||
@@ -3209,7 +3249,8 @@ export function NewChatLandingScreen() {
   const supportsCursorMode = nativeAgentHasCapability(selectedAgent, "cursorMode");
   const supportsDevinPermission = nativeAgentHasCapability(selectedAgent, "devinPermission");
   const supportsAgySkipPermissions = nativeAgentHasCapability(selectedAgent, "skipPermissions");
-  const supportsModelPicker = nativeAgentHasCapability(selectedAgent, "modelPicker");
+  const supportsModelPicker =
+    nativeAgentHasCapability(selectedAgent, "modelPicker") || hasSdkModelPicker;
   const hideUnconfiguredHarnesses = useMemo(() => readHideUnconfiguredHarnesses(), []);
   // Smart Routing as a Model choice is offered on the two native harnesses
   // whose running CLI accepts a per-turn model switch (the server injects
@@ -3291,7 +3332,7 @@ export function NewChatLandingScreen() {
       // Routing inherits the picked harness's defaults, not a previous selection's mode.
       return [{ label: "Permission mode", value: AUTO_PERMISSION_MODE.label }];
     }
-    if (supportsModelPicker && !supportsPermissionMode) {
+    if (supportsModelPicker && !supportsPermissionMode && !hasSdkModelPicker) {
       const modelValue =
         piModelOptions.find((model) => model.id === pickedModel)?.displayName ??
         (sandboxInferenceConfigured ? defaultModelLabel(piModelOptions) : "Default");
@@ -3388,10 +3429,36 @@ export function NewChatLandingScreen() {
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
-      return [{ label: "SDK", value: brainHarnessLabelsAll[active] ?? active }, ...routingRow];
+      // A claude-sdk brain surfaces its Model/Effort only once PICKED. Its
+      // "no override" state isn't the catalog default — it's whatever the
+      // agent's spec configures, unknown client-side — so an unpicked brain
+      // shows no Model row rather than asserting the catalog default. A picked
+      // model names itself from the Claude catalog.
+      const sdkModelRows =
+        hasSdkModelPicker && pickedModel
+          ? [
+              {
+                label: "Model",
+                value: visibleModelLabel(
+                  claudeModelOptions.find((m) => m.id === pickedModel)?.displayName ?? pickedModel,
+                ),
+              },
+            ]
+          : [];
+      const sdkEffortRows =
+        hasSdkModelPicker && pickedEffort
+          ? [{ label: "Effort", value: normalizeEffortLabel(pickedEffort) }]
+          : [];
+      return [
+        ...sdkModelRows,
+        ...sdkEffortRows,
+        { label: "SDK", value: brainHarnessLabelsAll[active] ?? active },
+        ...routingRow,
+      ];
     }
     return routingRow;
   }, [
+    hasSdkModelPicker,
     sandboxInferenceConfigured,
     sandboxCatalog,
     sandboxModels.data?.provider_label,
@@ -3439,13 +3506,17 @@ export function NewChatLandingScreen() {
           ? piModelOptions
           : selectedNativeHarness === "codex-native"
             ? codexModelOptions
-            : [];
+            : // A claude-sdk brain's picks are validated and shown against the
+              // Claude catalog (the model it actually runs), not Pi's.
+              hasSdkModelPicker
+              ? claudeModelOptions
+              : [];
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
     (!sandboxSelected &&
       selectedHostId !== null &&
-      (selectedNativeHarness === "claude-native"
+      (catalogHarness === "claude-native"
         ? hostClaudeModelsLoading
         : selectedNativeHarness === "codex-native"
           ? hostCodexModelsLoading
@@ -3458,7 +3529,7 @@ export function NewChatLandingScreen() {
     ? sandboxCatalogError
       ? new Error(sandboxCatalogError)
       : null
-    : selectedNativeHarness === "claude-native"
+    : catalogHarness === "claude-native"
       ? hostClaudeModelsError
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
@@ -3583,7 +3654,9 @@ export function NewChatLandingScreen() {
               codexModelOptions,
               pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
             ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
-          : [];
+          : hasSdkModelPicker
+            ? CLAUDE_NATIVE_EFFORTS
+            : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({
@@ -3602,9 +3675,15 @@ export function NewChatLandingScreen() {
   const selectPickerModel = (model: string) => {
     const selectionHarness =
       selectedNativeHarness ?? (sandboxInferenceConfigured ? previewHarness : null);
-    if (!selectionHarness) return;
+    // A claude-sdk brain has no native harness to key an option store off, but
+    // its pick still flows through the shared `pickedModel` -> `model_override`
+    // create field, so it must not early-return here.
+    if (!selectionHarness && !hasSdkModelPicker) return;
     userPickedModelRef.current = true;
     if (model === MODEL_SELECT_SMART) {
+      // Smart Routing is a native-harness option; a claude-sdk brain never
+      // renders it (it isn't a routable native harness).
+      if (!selectionHarness) return;
       setPickedModel("");
       setPickedEffort("");
       setCostControlMode("on");
@@ -3614,7 +3693,11 @@ export function NewChatLandingScreen() {
     // Picking the Fusion family lands on its default combo id, which the Lead /
     // Effort / Sidekick selectors then refine.
     const fusionDescriptor = fusionOption(pickerModelOptions)?.fusion;
-    if (fusionDescriptor !== undefined && model === fusionOption(pickerModelOptions)?.id) {
+    if (
+      selectionHarness &&
+      fusionDescriptor !== undefined &&
+      model === fusionOption(pickerModelOptions)?.id
+    ) {
       setPickedModel(fusionDescriptor.default);
       setPickedEffort("");
       setCostControlMode(null);
@@ -3637,13 +3720,22 @@ export function NewChatLandingScreen() {
     setPickedModel(picked);
     setPickedEffort(effort);
     setCostControlMode(null);
-    rememberPickerOptions(selectionHarness, { model: picked, effort, routing: "off" });
+    // Only native harnesses remember a per-harness pick; a claude-sdk brain's
+    // pick lives in `pickedModel` for this composer visit and resets on an
+    // agent switch.
+    if (selectionHarness) {
+      rememberPickerOptions(selectionHarness, { model: picked, effort, routing: "off" });
+    }
   };
   const selectPickerEffort = (effort: string) => {
-    if (!selectedNativeHarness) return;
+    // A claude-sdk brain's effort pick flows through `pickedEffort` ->
+    // `reasoning_effort` without a native option store to remember it in.
+    if (!selectedNativeHarness && !hasSdkModelPicker) return;
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
     setPickedEffort(picked);
-    rememberPickerOptions(selectedNativeHarness, { effort: picked });
+    if (selectedNativeHarness) {
+      rememberPickerOptions(selectedNativeHarness, { effort: picked });
+    }
   };
   const handleSetPickedHarness = useCallback(
     (harness: string | null, agentId?: string) => {
@@ -3785,19 +3877,36 @@ export function NewChatLandingScreen() {
                     </>
                   ),
                   choices: [
-                    ...(!sandboxInferenceConfigured &&
-                    pickerModelOptions.length > 0 &&
-                    !pickerModelOptions.some((option) => option.isDefault)
+                    // A claude-sdk brain ALWAYS gets an explicit "Agent default"
+                    // entry — the only thing that clears the override, deferring
+                    // to the agent's spec model — even when the Claude catalog
+                    // marks a row isDefault, because that catalog default is
+                    // unrelated to the brain's own spec model. Native/Pi keep
+                    // their "Harness default" row, shown only when the catalog
+                    // itself carries no default row.
+                    ...(hasSdkModelPicker
                       ? [
                           {
                             key: "__default__",
-                            label: "Harness default",
-                            checked: !routingOn && pickedModel === "",
+                            label: "Agent default",
+                            checked: pickedModel === "",
                             onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
                             testId: "new-chat-landing-agent-model-default",
                           },
                         ]
-                      : []),
+                      : !sandboxInferenceConfigured &&
+                          pickerModelOptions.length > 0 &&
+                          !pickerModelOptions.some((option) => option.isDefault)
+                        ? [
+                            {
+                              key: "__default__",
+                              label: "Harness default",
+                              checked: !routingOn && pickedModel === "",
+                              onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                              testId: "new-chat-landing-agent-model-default",
+                            },
+                          ]
+                        : []),
                     ...pickerModelOptions
                       .filter((option) =>
                         pickerModelSearch
@@ -3811,13 +3920,19 @@ export function NewChatLandingScreen() {
                       .map((option) => ({
                         key: option.id,
                         label: visibleModelLabel(nativeModelLabel(option)),
-                        checked:
-                          !routingOn &&
-                          (option.fusion !== undefined
-                            ? isFusionModelUid(pickedModel) ||
-                              (pickedModel === "" && option.isDefault === true)
-                            : pickedModel === option.id ||
-                              (pickedModel === "" && option.isDefault === true)),
+                        // A claude-sdk brain selects its concrete model regardless
+                        // of the catalog's isDefault flag (an explicit Opus/Sonnet
+                        // pick must reach model_override, not collapse to the
+                        // no-override sentinel), and an unpicked brain checks
+                        // "Agent default" above rather than the catalog default.
+                        checked: hasSdkModelPicker
+                          ? pickedModel === option.id
+                          : !routingOn &&
+                            (option.fusion !== undefined
+                              ? isFusionModelUid(pickedModel) ||
+                                (pickedModel === "" && option.isDefault === true)
+                              : pickedModel === option.id ||
+                                (pickedModel === "" && option.isDefault === true)),
                         // The Fusion row always opens its Lead/Sidekick selectors,
                         // even when Fusion is the catalog default (routing it
                         // through MODEL_SELECT_DEFAULT would hide them).
@@ -3825,7 +3940,9 @@ export function NewChatLandingScreen() {
                           ? () => selectFusionModel(option.fusion!.default)
                           : () =>
                               selectPickerModel(
-                                option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
+                                !hasSdkModelPicker && option.isDefault
+                                  ? MODEL_SELECT_DEFAULT
+                                  : option.id,
                               ),
                         testId: `new-chat-landing-agent-model-${option.id}`,
                         title: nativeModelLabel(option),
@@ -3885,6 +4002,20 @@ export function NewChatLandingScreen() {
       const native = nativeCodingAgentForAvailableAgent(agent);
       if (!native) {
         const harness = agent.id === effectiveAgentId ? pickedHarness : readLastHarness(agent.id);
+        // The selected claude-sdk brain names its picked model/effort (a pick
+        // lives only for this composer visit, so only the selected row has one).
+        if (agent.id === effectiveAgentId && hasSdkModelPicker && (pickedModel || pickedEffort)) {
+          const pickedRow = claudeModelOptions.find((option) => option.id === pickedModel);
+          const modelLabel = pickedModel
+            ? compactModelTriggerLabel(
+                visibleModelLabel(pickedRow ? nativeModelLabel(pickedRow) : pickedModel),
+              )
+            : null;
+          const effortLabel = CLAUDE_NATIVE_EFFORTS.find(
+            (option) => option.value === pickedEffort,
+          )?.label;
+          return [agent.id, [modelLabel, effortLabel].filter(Boolean).join(" ")];
+        }
         return [agent.id, brainHarnessLabelsAll[harness ?? agent.harness ?? ""] ?? "Default"];
       }
       const saved = readHarnessOptions(native.harness);
@@ -3977,7 +4108,16 @@ export function NewChatLandingScreen() {
     userPickedModelRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
-  }, [effectiveAgentId, setCostControlMode]);
+    // A picked model/effort is per-agent-instance too. The harness seed below
+    // early-returns for a non-native agent (a claude-sdk brain has no
+    // `selectedNativeHarness`), so without this reset a pick made for the
+    // PREVIOUS agent would silently ride along onto the newly selected one —
+    // pinning a bundle agent the picker was never opened for. A native agent
+    // is reseeded from its own remembered pick right after (the seed effect is
+    // keyed on the agent id too), so this never strands it on "Default".
+    setPickedModel("");
+    setPickedEffort("");
+  }, [effectiveAgentId, setCostControlMode, setPickedModel]);
   // A project-configured default model (Project settings) outranks the user's
   // remembered per-harness pick — but only while the composer sits on the
   // project's configured agent; switching to another agent falls back to the
@@ -4130,7 +4270,10 @@ export function NewChatLandingScreen() {
     // Reseed on harness changes, when the selected host's catalog resolves,
     // and when the project's configured default model settles (its config
     // loads async, so the first run may see it as null); capability flags are
-    // derived from the same harness and stay omitted.
+    // derived from the same harness and stay omitted. Keyed on the agent too
+    // (not just the harness) so it re-runs after the agent-change reset above
+    // clears the picked model — including a switch between two agents that
+    // share a native harness, where `selectedNativeHarness` alone wouldn't change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4139,6 +4282,7 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    effectiveAgentId,
   ]);
   useEffect(() => {
     if (!sandboxInferenceConfigured || sandboxModels.data?.status !== "ready") return;
@@ -5231,6 +5375,13 @@ export function NewChatLandingScreen() {
       const agentSupportsAgySkip = nativeAgentHasCapability(agent, "skipPermissions");
       const agentSupportsDevinPermission = nativeAgentHasCapability(agent, "devinPermission");
       const agentSupportsModelPicker = nativeAgentHasCapability(agent, "modelPicker");
+      // A bundle agent whose effective brain is claude-sdk carries its picked
+      // model/effort through the same `model_override` / `reasoning_effort`
+      // create fields claude-native uses, with no native-wrapper capability.
+      const agentBrainIsSdk =
+        !sandboxSelected &&
+        effectiveBrainHarness(agent?.harness, pickedHarness, brainHarnessLabelsAll) ===
+          "claude-sdk";
       // Smart Routing — server-side. The fully-auto harness always routes
       // (harness + model), so send "on" to keep the persisted state consistent
       // with the lit routing icon. Otherwise only send it when routing is
@@ -5280,7 +5431,8 @@ export function NewChatLandingScreen() {
         (sandboxInferenceConfigured ||
           agentSupportsModelPicker ||
           nativeAgent?.harness === "codex-native" ||
-          nativeAgent?.harness === "devin-native") &&
+          nativeAgent?.harness === "devin-native" ||
+          agentBrainIsSdk) &&
         submittedModel
           ? submittedModel
           : null;
@@ -5290,13 +5442,18 @@ export function NewChatLandingScreen() {
         (agentSupportsPermissionMode ||
           selectedNativeHarness === "pi-native" ||
           nativeAgent?.harness === "codex-native" ||
-          nativeAgent?.harness === "devin-native") &&
+          nativeAgent?.harness === "devin-native" ||
+          agentBrainIsSdk) &&
         pickedEffort
           ? pickedEffort
           : null;
       // Resolved default (shown when nothing is pinned): the catalog's default
-      // row's provider-facing model id, else its row id.
-      const defaultModelRow = pickerModelOptions.find((option) => option.isDefault);
+      // row's provider-facing model id, else its row id. Not for a claude-sdk
+      // brain: its unpinned model is the agent spec's, unknown client-side, and
+      // the Claude catalog's default would misname it.
+      const defaultModelRow = agentBrainIsSdk
+        ? undefined
+        : pickerModelOptions.find((option) => option.isDefault);
       const resolvedDefaultModel = defaultModelRow?.model ?? defaultModelRow?.id ?? null;
 
       // Prepend each "@"-tagged path as an attachment marker on its own line —
