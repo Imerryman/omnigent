@@ -292,7 +292,7 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # still consuming the paste gets folded in as a newline instead of
 # submitting — the draft then sits unsent. Polling for the draft makes
 # the handoff deterministic where the old fixed sleep raced it.
-_PASTE_COMMIT_TIMEOUT_S = 5.0
+_PASTE_COMMIT_TIMEOUT_S = 20.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -423,6 +423,13 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
+# Titles that render INSIDE a bordered confirm/permission dialog box (the
+# switch/effort confirmation and every tool-permission prompt). Positive
+# overlay evidence requires one of these on a box-chrome row (see
+# :func:`_submit_popped_surface`), not merely somewhere in the pane — a title
+# echoed in the transcript, or a torn capture that just omits the composer, is
+# not proof a dialog replaced it.
+_BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -2546,6 +2553,12 @@ def augment_claude_args(
     _write_json_file(settings_path, hook_settings)
     args.extend(
         [
+            # Omnigent worker panes load ONLY the bridge relay (see
+            # build_mcp_config); strict mode prevents Claude from merging the
+            # user-scope ~/.claude.json MCP fleet (serena, postgres, playwright,
+            # glitchtip, code-agents) into every pane -> was ~1GB/pane -> OOM.
+            # Only affects omnigent-spawned panes; hand-launched claude is untouched.
+            "--strict-mcp-config",
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
@@ -4049,27 +4062,29 @@ def _paste_and_submit(
     # into a paste; an Enter that arrives while it is still consuming
     # the paste becomes a newline inside the draft instead of a submit,
     # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
+    # load / large payloads); polling is deterministic.
     draft_seen = False
     deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
+        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle) is True:
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    # Fail BEFORE the submit Enter, never after. The draft was never confirmed
+    # in the box (e.g. an unidentifiable draft whose needle is empty), so its
+    # delivery cannot be verified — and pressing Enter first would submit, and
+    # so possibly execute, the very message this then reports as undelivered.
+    if not draft_seen:
+        raise RuntimeError(
+            "Claude Code's pasted draft could not be confirmed in the input box. "
+            "The message was not delivered."
+        )
     time.sleep(_PASTE_SETTLE_S)
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
     # the paste burst as a newline — re-send it (the retry lands well
@@ -4086,7 +4101,7 @@ def _paste_and_submit(
         return
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
+        "(submission could not be confirmed). The message was not delivered."
     )
 
 
@@ -4126,7 +4141,34 @@ def _verify_submit_accepted(
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
+        draft_present = _draft_in_input_box(pane, needle)
+        if draft_present is None:
+            # ``_draft_in_input_box`` returns None whenever it cannot read the
+            # composer, which has two very different meanings for a submit:
+            #  - a confirm dialog, model picker, or tool-permission prompt now
+            #    sits where the composer was. That surface only appears once the
+            #    submit popped it, so the draft is gone and the submit landed —
+            #    count it accepted (see inject_slash_command: "the dialog
+            #    replacing the composer counts, since submission pops it"). A
+            #    permission prompt is included: its default answer approves the
+            #    tool, so an Enter must never be sent into it, and treating it
+            #    as ambiguous instead failed a delivered turn after the full
+            #    window. ``_submit_popped_surface`` requires the composer to be
+            #    gone (a live composer with the draft is vetoed by the tri-state
+            #    ``True`` case above) and matches only boxed dialog chrome.
+            #  - a torn or not-yet-rendered capture. Its absence proves
+            #    nothing, so keep waiting without re-sending Enter rather than
+            #    mistaking the ambiguity for acceptance.
+            if _submit_popped_surface(pane):
+                if warned:
+                    _logger.info(
+                        "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                        what,
+                        time.monotonic() - start,
+                    )
+                return True
+            continue
+        if draft_present is False:
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -5444,6 +5486,53 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
+def _submit_popped_surface(pane: str) -> bool:
+    """
+    Return whether a submit popped a boxed dialog/permission over the composer.
+
+    A submitted turn can immediately replace the composer with the
+    switch/effort confirmation or a tool-permission prompt; that surface
+    appearing is proof the draft left the box. This is what a submit-
+    verification loop treats as acceptance (and it must NOT press Enter into
+    such a surface — its default answer commits something unasked-for).
+
+    The genuine "draft still present" veto is enforced by the composer region,
+    not by scanning the whole pane for the draft text:
+
+    - A live composer row means the active bottom region IS the input box, so
+      this returns not-popped; its draft is then handled by the tri-state
+      :func:`_draft_in_input_box` (``True`` -> the caller keeps retrying, never
+      accepting). A whole-pane needle scan was wrong here: the submitted text
+      also appears *inside* a permission box (the command being approved) and in
+      transcript echoes of the just-sent message, so it vetoed real, successful
+      submits that popped a permission surface.
+
+    Only past that gate is the surface's own chrome consulted — the boxed
+    confirm/permission title on a vertical-rule (``│``) row. The interactive
+    ``/model`` picker footer is deliberately NOT detected: its footer is plain
+    text a prose how-to can forge, upstream drives model switching through the
+    non-interactive ``/model <id>`` command rather than the picker, and box
+    chrome is far harder to fake.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a recognized boxed surface has replaced the composer.
+    """
+    # A live composer means the active region is the input box — not a popped
+    # overlay — and its draft (if any) is vetoed by the tri-state in the caller.
+    if _composer_row(pane) is not None:
+        return False
+    # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
+    for raw in pane.splitlines():
+        stripped = raw.strip()
+        if (
+            stripped[:1]
+            and stripped[0] in _VERTICAL_RULE_GLYPHS
+            and any(hint in stripped for hint in _BOXED_DIALOG_HINTS)
+        ):
+            return True
+    return False
+
+
 def _claude_prompt_rendered(pane: str) -> bool:
     """
     Return whether Claude Code's chat input is rendered in a pane.
@@ -5580,32 +5669,55 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
+def _draft_in_input_box(pane: str, needle: str) -> bool | None:
+    """Locate the draft in the framed composer, including continuation rows.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
+    Return None when the capture cannot establish whether the draft remains.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
-        return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
-        return True
-    return bool(needle) and needle in tail
+    # Only the absence of a rendered composer makes the draft's state
+    # unknowable here. A confirm dialog / model picker / permission prompt that
+    # replaced the composer already trips this (no composer row renders), and
+    # anchoring on the composer this way is what keeps ordinary text — a pasted
+    # ``"Explain Switch model?"`` draft, or a hint echoed in the transcript —
+    # from being read as an active dialog while the composer is plainly up. A
+    # bare whole-pane substring check returned None for such a draft, so the
+    # verifier then called the still-present, unsent draft delivered.
+    if not _claude_prompt_rendered(pane):
+        return None
+
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    # The composer is always the last framed box at the bottom of the pane.
+    # Check the last rule first; fall back to the second-to-last rule when
+    # the last rule's row is the footer (e.g. a continuation-line composer
+    # where the row after the closing rule is the footer, not the composer).
+    candidates: list[int] = []
+    if rules:
+        candidates.append(rules[-1] + 1)
+    if len(rules) >= 2:
+        candidates.append(rules[-2] + 1)
+
+    for start in candidates:
+        if start >= len(lines):
+            continue
+        row = lines[start].strip()
+        if not row.startswith(_CLAUDE_PROMPT_GLYPH):
+            continue
+        end = next((i for i in rules if i > start), len(lines))
+        body = "\n".join([row.removeprefix(_CLAUDE_PROMPT_GLYPH), *lines[start + 1 : end]])
+        # Folding whitespace also handles terminal wrapping within the needle.
+        folded_body = "".join(body.split())
+        folded_needle = "".join(needle.split())
+        if _PASTED_PLACEHOLDER_PREFIX in body or (folded_needle and folded_needle in folded_body):
+            return True
+        # A closing rule immediately after the composer row means the box
+        # is definitively empty (not ambiguous).
+        if end < len(lines) and lines[end].strip():
+            return False
+        # Without a closing rule, the remaining draft may be below the pane.
+        return None
+
+    return None
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
