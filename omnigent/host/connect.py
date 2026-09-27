@@ -716,33 +716,59 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
-        # Timeout / reaper tuning knobs. Every entry below is a plain
-        # numeric duration (not a secret) read deep inside the runner, the
-        # harness processes it spawns, or the panes those spawn:
-        #   - native-pane reaper      omnigent/terminals/pane_reaper.py
-        #   - harness idle reaper     omnigent/runtime/harnesses/process_manager.py
-        #   - subagent launch deadline omnigent/runner/app.py
-        #   - harness turn watchdogs  omnigent/runtime/harnesses/_scaffold.py
-        #   - harness shutdown ceiling omnigent/runtime/harnesses/_runner.py
-        #   - ACP prompt idle timeout omnigent/inner/acp_executor.py
-        #   - gh subprocess timeout   omnigent/runner/github_resource.py
-        #   - git status timeout      omnigent/runtime/filesystem_registry.py
-        # They are set on the HOST (systemd drop-in, operator shell), but the
-        # runner re-execs with a cleared environment (runner/_zygote.py), so
-        # without an allowlist entry the strip here is SILENT: the operator
-        # sees the value on the unit, and every runner keeps using the
-        # in-code default. The harness layer inherits the runner's
-        # environment wholesale (_build_harness_spawn_env,
-        # process_manager.py), so a var stripped here is missing there too.
+        # Timeout / reaper tuning knobs. Every entry below is a numeric
+        # duration (not a secret) read deep inside the runner, the harness
+        # processes it spawns, or the panes those spawn. They are set on the
+        # HOST (systemd drop-in, operator shell), but the runner re-execs
+        # with a cleared environment (runner/_zygote.py), so without an
+        # allowlist entry the strip here is SILENT: the operator sees the
+        # value on the unit, and every runner keeps using the in-code
+        # default. The harness layer inherits the runner's environment
+        # wholesale (_build_harness_spawn_env, process_manager.py), so a var
+        # stripped here is missing there too.
+        #
+        # Each consumer coerces its value through ``float()`` and uses it
+        # only as a number — none is interpolated into a command, path or
+        # credential, so none can carry a payload. What DIFFERS is the
+        # handling of a malformed value, and operators should know which
+        # knob behaves which way:
+        #
+        #   Tolerant — a bad or negative value logs a warning and falls back
+        #   to the default, so an env typo cannot take the runner down or
+        #   make a reaper act on a bogus window:
+        #     OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S  terminals/pane_reaper.py:103
+        #     OMNIGENT_HARNESS_IDLE_TIMEOUT_S      runtime/harnesses/process_manager.py:121
+        #     OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S   runner/app.py:456
+        #     OMNIGENT_GH_TIMEOUT_SECONDS          runner/github_resource.py:94
+        #     OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS  runtime/filesystem_registry.py:61
+        #
+        #   Fail-loud — a bare ``float()`` at import time, so a malformed
+        #   value raises and ABORTS the process rather than degrading. Now
+        #   that these actually reach the runner, a typo on the unit is a
+        #   boot failure, not a silently ignored setting:
+        #     OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S  runtime/harnesses/_runner.py:75
+        #     OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S runtime/harnesses/_runner.py:90
+        #     HARNESS_TURN_TIMEOUT_S               runtime/harnesses/_scaffold.py:127
+        #     HARNESS_TURN_ABSOLUTE_TIMEOUT_S      runtime/harnesses/_scaffold.py:139
+        #     HARNESS_ACP_PROMPT_TIMEOUT_S         inner/acp_executor.py:162
+        #       (this one validates explicitly: non-finite or non-positive
+        #        raises a dedicated ValueError at ACP child startup)
+        #
+        # OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S is resolved in
+        # terminals/pane_reaper.py by a sibling change; allowlisted here so
+        # it is not inert on arrival.
+        #
         # Listed by exact name rather than by an ``OMNIGENT_``/``HARNESS_``
         # prefix — a blanket prefix would widen the passthrough far beyond
-        # these knobs, and the HARNESS_* names do not share the OMNIGENT_
-        # prefix anyway. Each value is parsed with ``float()`` and discarded
-        # unless positive, so none can smuggle a non-numeric payload.
+        # these knobs, the HARNESS_* names do not share the OMNIGENT_ prefix
+        # anyway, and HARNESS_* is the namespace where harness CREDENTIALS
+        # live.
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
+        "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S",
         "OMNIGENT_GH_TIMEOUT_SECONDS",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
         "HARNESS_TURN_TIMEOUT_S",
