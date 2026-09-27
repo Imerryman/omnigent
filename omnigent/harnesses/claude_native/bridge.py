@@ -3521,6 +3521,58 @@ def read_hook_events_from_offset(
     )
 
 
+def _user_prompt_reached_claude_since(bridge_dir: Path, start_event_count: int) -> bool:
+    """
+    Return whether Claude Code recorded a new user prompt after a hook cursor.
+
+    ``UserPromptSubmit`` is registered in :func:`_claude_hook_settings` as the
+    symmetric counterpart to ``Stop``: Claude Code runs it "when a new user
+    prompt reaches Claude (web-UI message via tmux send-keys, or direct
+    keystrokes into the embedded terminal)". A record appended after the
+    cursor captured before a submit is therefore Claude Code's own statement
+    that the message landed — the authoritative answer to the question
+    :func:`_verify_submit_accepted` otherwise has to infer from a screenshot.
+
+    It is written by a hook subprocess appending to ``hooks.jsonl``, not by
+    anything drawn in the pane, so no amount of assistant output can fabricate
+    it. That is the whole point: pane text is forgeable, this is not.
+
+    Subagent records are skipped the same way :func:`stop_hook_seen_since`
+    skips them, so a background Task agent's edge never answers for the
+    parent turn.
+
+    :param bridge_dir: Bridge directory path.
+    :param start_event_count: Hook record count captured before the submit.
+    :returns: ``True`` once a parent-process ``UserPromptSubmit`` hook has been
+        recorded after the cursor.
+    """
+    path = bridge_dir / _HOOKS_FILE
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle, start=1):
+                if index <= start_event_count:
+                    continue
+                try:
+                    envelope = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("hook_event_name") != "UserPromptSubmit":
+                    continue
+                transcript_path = payload.get("transcript_path")
+                if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    continue
+                return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _logger.debug("Could not read hook records for submit verification", exc_info=True)
+        return False
+    return False
+
+
 def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
@@ -4081,6 +4133,12 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    # Baseline for the delivery signal, captured STRICTLY BEFORE the keystroke:
+    # only a ``UserPromptSubmit`` record appended after this count can be this
+    # submit's. Reading it after the Enter races the hook both ways — a fast
+    # record lands before the baseline and is missed, and a late record from a
+    # previous prompt is counted as ours.
+    hooks_cursor = count_hook_events(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
@@ -4094,6 +4152,7 @@ def _paste_and_submit(
         needle=needle,
         what="submitted message",
         bridge_dir=bridge_dir,
+        hooks_cursor=hooks_cursor,
     ):
         return
     raise RuntimeError(
@@ -4159,6 +4218,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    hooks_cursor: int | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4177,7 +4237,16 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
-    :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param bridge_dir: Bridge whose pending questions protect submit retries and
+        whose hook records carry Claude Code's own delivery confirmation (see
+        :func:`_submit_reached_claude`). Without one, an ambiguous pane can only
+        be resolved by boxed chrome or by waiting the window out.
+    :param hooks_cursor: ``hooks.jsonl`` record count the caller captured
+        STRICTLY BEFORE the submit keystroke, from :func:`count_hook_events`.
+        Taking it here instead would race the keystroke in both directions — a
+        fast hook would land before the baseline and be missed, and a late hook
+        from a previous prompt would be counted as this submit's. ``None``
+        disables the signal rather than guessing.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4192,21 +4261,32 @@ def _verify_submit_accepted(
         if draft_present is None:
             # ``_draft_in_input_box`` returns None whenever it cannot read the
             # composer, which has two very different meanings for a submit:
-            #  - a confirm dialog, model picker, or tool-permission prompt now
-            #    sits where the composer was. That surface only appears once the
-            #    submit popped it, so the draft is gone and the submit landed —
-            #    count it accepted (see inject_slash_command: "the dialog
-            #    replacing the composer counts, since submission pops it"). A
-            #    permission prompt is included: its default answer approves the
-            #    tool, so an Enter must never be sent into it, and treating it
-            #    as ambiguous instead failed a delivered turn after the full
-            #    window. ``_submit_popped_surface`` requires the composer to be
-            #    gone (a live composer with the draft is vetoed by the tri-state
-            #    ``True`` case above) and matches only boxed dialog chrome.
+            #  - a confirm dialog or tool-permission prompt now sits where the
+            #    composer was. That surface only appears once the submit popped
+            #    it, so the draft is gone and the submit landed — count it
+            #    accepted (see inject_slash_command: "the dialog replacing the
+            #    composer counts, since submission pops it"). A permission
+            #    prompt is included: its default answer approves the tool, so an
+            #    Enter must never be sent into it, and treating it as ambiguous
+            #    instead failed a delivered turn after the full window.
+            #    ``_submit_popped_surface`` requires the composer to be gone (a
+            #    live composer with the draft is vetoed by the tri-state ``True``
+            #    case above) and matches only boxed dialog chrome.
             #  - a torn or not-yet-rendered capture. Its absence proves
             #    nothing, so keep waiting without re-sending Enter rather than
             #    mistaking the ambiguity for acceptance.
-            if _submit_popped_surface(pane):
+            #  - Claude's question/selection surface, which draws NO box chrome,
+            #    so the scan above cannot see it. A turn that immediately asks a
+            #    question landed just as surely as one that pops a permission
+            #    box, and failing to say so burned the whole window and then
+            #    raised "the message was not delivered" on a delivered turn.
+            #    Nothing about how that surface LOOKS is consulted, though: its
+            #    chrome is plain text an assistant can print, and a false accept
+            #    is worse than this bug because it drops a message in silence.
+            #    The landing is read from Claude Code itself instead — its
+            #    ``UserPromptSubmit`` hook, which fires when a prompt reaches it
+            #    and therefore before any question that prompt raises.
+            if _submit_popped_surface(pane) or _submit_reached_claude(bridge_dir, hooks_cursor):
                 if warned:
                     _logger.info(
                         "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4463,6 +4543,9 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    # Captured before the keystroke, for the same reason as in
+    # :func:`inject_user_message`.
+    hooks_cursor = count_hook_events(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -4473,6 +4556,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            hooks_cursor=hooks_cursor,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5539,6 +5623,43 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
+def _submit_reached_claude(bridge_dir: Path | None, hooks_cursor: int | None) -> bool:
+    """
+    Report whether Claude Code itself recorded the prompt this submit sent.
+
+    This is the ONLY positive acceptance signal for an unreadable pane besides
+    boxed chrome, and it is deliberately the only one: it is the single piece of
+    evidence here that pane text cannot produce. ``UserPromptSubmit`` is written
+    to ``hooks.jsonl`` by a hook subprocess Claude Code executes, out-of-band
+    from anything drawn in the terminal (see
+    :func:`_user_prompt_reached_claude_since`).
+
+    An earlier revision also accepted "a permission hook is parked on a verdict
+    right now, and the pane shows a selection surface". That was unsound with no
+    adversary in sight: when Claude is already parked on a QUESTION from a
+    previous prompt, a draft sent into that surface is swallowed — genuinely not
+    delivered — while the marker is fresh and the surface is on screen, so a
+    dropped message was reported as delivered. The marker only ever proved that
+    Claude is waiting, never that THIS submit is why. It is gone; nothing
+    replaced it, because the target case does not need it: the message lands, so
+    ``UserPromptSubmit`` fires, so *delivered* is true on its own.
+
+    :param bridge_dir: Bridge directory, or ``None`` when the caller has none —
+        there is no out-of-band channel then, so this is ``False``.
+    :param hooks_cursor: ``hooks.jsonl`` record count captured strictly BEFORE
+        the submit keystroke, or ``None`` when the caller did not capture one.
+        Without a baseline taken before the keystroke this signal is unsound in
+        both directions (a previous prompt's record would count as ours, and a
+        fast record would be missed), so ``None`` is ``False`` rather than a
+        guess.
+    :returns: ``True`` when a parent-process ``UserPromptSubmit`` record has
+        landed after *hooks_cursor*.
+    """
+    if bridge_dir is None or hooks_cursor is None:
+        return False
+    return _user_prompt_reached_claude_since(bridge_dir, hooks_cursor)
+
+
 def _submit_popped_surface(pane: str) -> bool:
     """
     Return whether a submit popped a boxed dialog/permission over the composer.
@@ -5566,6 +5687,11 @@ def _submit_popped_surface(pane: str) -> bool:
     text a prose how-to can forge, upstream drives model switching through the
     non-interactive ``/model <id>`` command rather than the picker, and box
     chrome is far harder to fake.
+
+    The unboxed question/selection surface is NOT accepted here either, for the
+    same reason: its chrome is plain text too. A submit that pops one is
+    accepted on :func:`_submit_reached_claude` instead — evidence Claude Code
+    produced off-screen — never on how that surface looks.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when a recognized boxed surface has replaced the composer.
