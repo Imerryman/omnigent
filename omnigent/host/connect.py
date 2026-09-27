@@ -712,9 +712,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # through ``float()`` and uses it only as a number — none is
         # interpolated into a command, path or credential, so none can carry
         # a payload. What DIFFERS is what a MALFORMED value does, and it
-        # differs three ways. Operators editing a drop-in should know which
-        # knob behaves which way, because only one family tells you when you
-        # got it wrong:
+        # differs four ways. Operators editing a drop-in should know which
+        # knob behaves which way, because three of the four families tell you
+        # when you got it wrong and one stays silent about it:
         #
         #   (1) Warn and fall back to the default. Non-numeric or negative
         #   logs at WARNING; ``0`` is honored as "disabled". An env typo can
@@ -722,7 +722,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         #   window, and it leaves a trace in the log:
         #     OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S  terminals/pane_reaper.py:103
         #     OMNIGENT_HARNESS_IDLE_TIMEOUT_S      runtime/harnesses/process_manager.py:121
-        #     OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S   terminals/pane_reaper.py (sibling change)
+        #     OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S   terminals/pane_reaper.py
+        #       (resolved by a sibling change; allowlisted here so it is not
+        #        inert on arrival)
         #
         #   (2) Warn and fall back, but negative is MEANINGFUL. Non-numeric
         #   and non-finite (nan/inf) warn and default; ``<= 0`` deliberately
@@ -732,8 +734,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         #   (3) Fall back SILENTLY — no log at all. Non-numeric and
         #   non-positive both yield the default with nothing emitted, so a
         #   typo here is invisible: the operator sees the value on the unit
-        #   and gets the default with no diagnostic. Least friendly of the
-        #   three; do not assume a warning will appear:
+        #   and gets the default with no diagnostic. Least diagnosable of the
+        #   four — (4) is harsher in impact but at least reports itself;
+        #   do not assume a warning will appear here:
         #     OMNIGENT_GH_TIMEOUT_SECONDS          runner/github_resource.py:94
         #     OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS  runtime/filesystem_registry.py:61
         #
@@ -752,10 +755,6 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Harmonizing (1)-(4) onto one tolerant shape would mean editing
         # _runner.py, _scaffold.py and acp_executor.py; that is deliberately
         # a separate change, not smuggled into an allowlist fix.
-        #
-        # OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S is resolved by a sibling change
-        # to terminals/pane_reaper.py; allowlisted here so it is not inert
-        # on arrival.
         #
         # Listed by exact name rather than by an ``OMNIGENT_``/``HARNESS_``
         # prefix — a blanket prefix would widen the passthrough far beyond
