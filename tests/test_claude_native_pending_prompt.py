@@ -298,10 +298,18 @@ def test_accepted_submit_can_immediately_raise_a_question(
     hooks = native_bridge / "hooks.jsonl"
 
     def capture(*_: str) -> str:
-        hooks.write_text(
-            json.dumps({"recorded_at": 1.0, "payload": {"hook_event_name": "UserPromptSubmit"}})
-            + "\n"
-        )
+        # APPEND, matching record_hook_event (bridge.py) — do not "simplify" this
+        # to write_text. The two are equivalent only while the file starts empty:
+        # the moment a test seeds a pre-existing record, write_text clobbers it
+        # and this test silently exercises a different scenario than its name
+        # claims, green and wrong. That is the failure mode this whole PR is about.
+        with hooks.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"recorded_at": 1.0, "payload": {"hook_event_name": "UserPromptSubmit"}}
+                )
+                + "\n"
+            )
         return _QUESTION
 
     monkeypatch.setattr(bridge, "_capture_pane", capture)
