@@ -9,6 +9,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
 
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
@@ -304,7 +305,7 @@ async def test_pane_with_cpu_active_descendant_is_not_reaped(
     """
     clock = _FixedClock()
     # 60s apart, +6000 ticks == 60 CPU-seconds == a descendant pinning one core.
-    ticks = iter([(5_000, 2), (11_000, 2)])
+    ticks = iter([{11: 5_000, 12: 100}, {11: 11_000, 12: 100}])
     monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: next(ticks))
     app = _silent_pane_app(monkeypatch, tmp_path)
     app.state.native_pane_cpu_probe = pane_cpu.PaneDescendantCpuProbe(clock=clock)
@@ -325,7 +326,7 @@ async def test_pane_with_quiet_descendant_is_still_reapable(
     """An idle TUI's housekeeping CPU must not pin the pane forever."""
     clock = _FixedClock()
     # 60s apart, +60 ticks == 0.6 CPU-seconds == 1% of a core: below threshold.
-    ticks = iter([(5_000, 2), (5_060, 2)])
+    ticks = iter([{11: 5_000, 12: 100}, {11: 5_060, 12: 100}])
     monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: next(ticks))
     app = _silent_pane_app(monkeypatch, tmp_path)
     app.state.native_pane_cpu_probe = pane_cpu.PaneDescendantCpuProbe(clock=clock)
@@ -386,7 +387,7 @@ async def test_dead_pane_is_still_reaped(
     a real reaper loop (including its pre-teardown re-check), not just the
     predicate, so a signal that wrongly latched "busy" would fail here.
     """
-    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: (5_000, 2))
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 5_000})
     app = _silent_pane_app(monkeypatch, tmp_path)
     pane = _pane("conv_dead")
     reaped: list[str] = []
@@ -474,3 +475,90 @@ def test_stream_progress_unknown_conversation_is_none() -> None:
     assert pane_progress.stream_progress_age_s("conv_never", now=130.0) == 30.0
     pane_progress.clear_stream_progress("conv_never")
     assert pane_progress.stream_progress_age_s("conv_never") is None
+
+
+async def test_authoritative_codex_status_wins_over_descendant_cpu(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A codex session the server calls idle IS idle, whatever its subtree burns.
+
+    The codex app-server is the one component that actually knows whether a
+    session has a turn in flight; descendant CPU is a proxy for that question.
+    Letting the proxy override a confirmed-idle verdict would make a codex pane
+    with a runaway child immortal. ``NullServerClient`` answers 200 with no
+    status, i.e. authoritatively not running.
+    """
+    clock = _FixedClock()
+    # A descendant pinning a full core: enough to spare any non-codex pane.
+    ticks = iter([{11: 5_000}, {11: 11_000}, {11: 5_000}, {11: 11_000}])
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: next(ticks))
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    app.state.native_pane_cpu_probe = pane_cpu.PaneDescendantCpuProbe(clock=clock)
+    reaper = app.state.native_pane_reaper
+
+    codex_pane = _pane("conv_codex", "codex")
+    claude_pane = _pane("conv_claude", "claude")
+    assert not await reaper._is_busy(codex_pane)  # baseline sample
+    assert not await reaper._is_busy(claude_pane)  # baseline sample
+    clock.now += 60.0
+    # Same CPU evidence, opposite verdicts: codex defers to its server.
+    assert not await reaper._is_busy(codex_pane)
+    assert await reaper._is_busy(claude_pane)
+
+
+async def test_sparing_on_cpu_alone_logs_the_culprit_pid_and_rate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A pane spared SOLELY by descendant CPU says so, with the pid and the rate.
+
+    Accepted tradeoff of acceptance item 1: a dead agent with a busy-looping
+    descendant (a wedged MCP server, a polling sidecar) above the threshold stays
+    alive while it burns CPU. Not redesigned — made observable, so the case is
+    diagnosable from the log rather than mysterious.
+    """
+    clock = _FixedClock()
+    ticks = iter([{11: 0, 12: 0}, {11: 600, 12: 5_400}])
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: next(ticks))
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    app.state.native_pane_cpu_probe = pane_cpu.PaneDescendantCpuProbe(clock=clock)
+    reaper = app.state.native_pane_reaper
+    pane = _pane("conv_runaway")
+
+    await reaper._is_busy(pane)
+    clock.now += 60.0
+    with caplog.at_level(logging.INFO):
+        assert await reaper._is_busy(pane)
+
+    logged = [r.getMessage() for r in caplog.records if "descendant CPU alone" in r.getMessage()]
+    assert len(logged) == 1
+    assert "conv_runaway" in logged[0]
+    assert "busiest pid 12" in logged[0]
+    assert "90.0%" in logged[0]  # pid 12's share of the 100%-of-a-core total
+
+
+async def test_session_cleanup_clears_both_liveness_ledgers(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cleanly-ended session leaves no liveness residue behind.
+
+    Both ledgers were previously cleared only on the reaper's own teardown path,
+    so a normal session end left stale entries alive until eviction.
+    """
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 5_000})
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    probe = app.state.native_pane_cpu_probe
+
+    pane_progress.note_stream_progress("conv_ending")
+    probe.is_cpu_active("conv_ending", 4242)
+    assert pane_progress.stream_progress_age_s("conv_ending") is not None
+    assert "conv_ending" in probe._samples
+
+    client = TestClient(app)
+    client.delete("/v1/sessions/conv_ending")
+
+    assert pane_progress.stream_progress_age_s("conv_ending") is None
+    assert "conv_ending" not in probe._samples

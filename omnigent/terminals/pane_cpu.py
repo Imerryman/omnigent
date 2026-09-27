@@ -44,6 +44,7 @@ import os
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import NamedTuple
 
 _logger = logging.getLogger(__name__)
 
@@ -70,6 +71,15 @@ _DEFAULT_MIN_CPU_FRACTION = 0.05
 # ``harnesses/antigravity_native/rpc.py``'s pane-subtree walk.
 _MAX_SUBTREE_DEPTH = 32
 _MAX_SUBTREE_NODES = 512
+
+# Cap on conversations holding a cached CPU baseline, matching
+# ``pane_progress._MAX_TRACKED``. Baselines are normally dropped by ``forget`` on
+# reap and on session cleanup; this is the backstop for a conversation that
+# vanishes without either (a crashed runner path, a pane closed out from under
+# us). Evicted oldest-sample-first, so eviction only ever discards a
+# conversation nobody has scanned in a long time -- and the cost of evicting a
+# live one is a single extra cold-cache scan, which abstains.
+_MAX_TRACKED = 512
 
 # Clock ticks per second for /proc/<pid>/stat's utime/stime fields. Resolved once
 # at import; POSIX guarantees it is constant for the life of the process.
@@ -174,14 +184,41 @@ def _cpu_ticks(pid: int) -> int:
     return total
 
 
-def _subtree_cpu_ticks(pane_pid: int) -> tuple[int, int]:
-    """Summed CPU ticks over *pane_pid*'s descendants, and how many there are.
+def _subtree_cpu_ticks(pane_pid: int) -> dict[int, int]:
+    """CPU ticks PER descendant of *pane_pid*.
+
+    Per-pid rather than one aggregate for two reasons: a descendant exiting can
+    no longer mask a sibling's work behind a shrinking grand total (each pid's
+    delta is clamped independently), and the busiest pid is available to name in
+    the log line the reaper emits when this signal alone spares a pane.
 
     :param pane_pid: The tmux pane's process id.
-    :returns: ``(total_ticks, descendant_count)``.
+    :returns: ``{pid: ticks}``, empty when there are no descendants.
     """
-    descendants = _descendant_pids(pane_pid)
-    return sum(_cpu_ticks(pid) for pid in descendants), len(descendants)
+    return {pid: _cpu_ticks(pid) for pid in _descendant_pids(pane_pid)}
+
+
+class CpuActivity(NamedTuple):
+    """One descendant-CPU verdict, with the evidence behind it.
+
+    :param active: ``True`` only on positive evidence of CPU work. ``False``
+        means "this signal has no evidence", never "the pane is dead".
+    :param cpu_fraction: Fraction of one core the whole subtree averaged over the
+        interval, or ``0.0`` when no rate could be computed.
+    :param busiest_pid: The descendant that contributed the most CPU, or ``None``.
+    :param busiest_fraction: That descendant's own fraction of one core.
+    :param descendants: How many descendants were sampled.
+    """
+
+    active: bool
+    cpu_fraction: float = 0.0
+    busiest_pid: int | None = None
+    busiest_fraction: float = 0.0
+    descendants: int = 0
+
+
+#: The "no evidence" verdict, returned whenever no rate can be derived.
+NO_CPU_ACTIVITY = CpuActivity(active=False)
 
 
 class PaneDescendantCpuProbe:
@@ -205,52 +242,74 @@ class PaneDescendantCpuProbe:
     ) -> None:
         self._min_cpu_fraction = min_cpu_fraction
         self._clock: Callable[[], float] = clock if clock is not None else time.monotonic
-        # conversation_id -> (monotonic sample time, summed descendant ticks)
-        self._samples: dict[str, tuple[float, int]] = {}
+        # conversation_id -> (monotonic sample time, {descendant pid: ticks}).
+        # Insertion order tracks recency so the bound below evicts oldest-first.
+        self._samples: dict[str, tuple[float, dict[int, int]]] = {}
 
-    def is_cpu_active(self, conversation_id: str, pane_pid: int | None) -> bool:
+    def is_cpu_active(self, conversation_id: str, pane_pid: int | None) -> CpuActivity:
         """Whether *conversation_id*'s pane has a descendant burning CPU.
 
         :param conversation_id: AP-allocated conversation id, e.g. ``"conv_abc"``.
         :param pane_pid: The tmux pane's process id, or ``None`` when it could not
             be resolved (the pane is gone, or ``tmux`` failed) — then there is
             nothing to measure and the probe abstains.
-        :returns: ``True`` only on positive evidence of CPU work. ``False`` means
-            "this signal has no evidence", never "the pane is dead" — the caller's
-            other signals still apply.
+        :returns: A :class:`CpuActivity`. ``active`` is ``True`` only on positive
+            evidence of CPU work; ``False`` means "this signal has no evidence",
+            never "the pane is dead" — the caller's other signals still apply.
         """
         if pane_pid is None:
             self._samples.pop(conversation_id, None)
-            return False
+            return NO_CPU_ACTIVITY
         now = self._clock()
-        ticks, descendants = _subtree_cpu_ticks(pane_pid)
-        previous = self._samples.get(conversation_id)
+        ticks = _subtree_cpu_ticks(pane_pid)
+        previous = self._samples.pop(conversation_id, None)
         self._samples[conversation_id] = (now, ticks)
-        if descendants == 0:
+        while len(self._samples) > _MAX_TRACKED:
+            del self._samples[next(iter(self._samples))]
+        if not ticks:
             # Nothing under the shell at all: no /proc, or the vendor CLI is gone.
-            return False
+            return NO_CPU_ACTIVITY
         if previous is None:
-            return False  # first sample: baseline recorded, abstain (see module docs)
+            # First sample: baseline recorded, abstain (see the module docstring).
+            return NO_CPU_ACTIVITY
         last_at, last_ticks = previous
         elapsed = now - last_at
         if elapsed <= 0:
-            return False
-        # A descendant exiting can drop the running total; clamp rather than
-        # reading a negative delta as activity.
-        delta_ticks = max(0, ticks - last_ticks)
-        cpu_fraction = (delta_ticks / _CLOCK_TICKS_PER_S) / elapsed
-        active = cpu_fraction >= self._min_cpu_fraction
-        if active:
+            return NO_CPU_ACTIVITY
+        total_delta = 0
+        busiest_pid: int | None = None
+        busiest_delta = 0
+        for pid, value in ticks.items():
+            # Clamped per pid: a descendant whose total shrinks (it exited and a
+            # recycled pid took its place) is not evidence of work, and must not
+            # cancel out a sibling that really is working. A pid with no previous
+            # sample started within the interval, so all of its ticks accrued
+            # inside it and counting them in full is correct.
+            delta = max(0, value - last_ticks.get(pid, 0))
+            total_delta += delta
+            if delta > busiest_delta:
+                busiest_delta, busiest_pid = delta, pid
+        scale = _CLOCK_TICKS_PER_S * elapsed
+        activity = CpuActivity(
+            active=(total_delta / scale) >= self._min_cpu_fraction,
+            cpu_fraction=total_delta / scale,
+            busiest_pid=busiest_pid,
+            busiest_fraction=busiest_delta / scale,
+            descendants=len(ticks),
+        )
+        if activity.active:
             _logger.debug(
                 "pane cpu probe: conversation %s busy (%.1f%% of a core over %.1fs, "
-                "%d descendants)",
+                "%d descendants, busiest pid %s at %.1f%%)",
                 conversation_id,
-                cpu_fraction * 100.0,
+                activity.cpu_fraction * 100.0,
                 elapsed,
-                descendants,
+                activity.descendants,
+                activity.busiest_pid,
+                activity.busiest_fraction * 100.0,
             )
-        return active
+        return activity
 
     def forget(self, conversation_id: str) -> None:
-        """Drop *conversation_id*'s cached baseline (its pane is gone)."""
+        """Drop *conversation_id*'s cached baseline (its pane or session is gone)."""
         self._samples.pop(conversation_id, None)
