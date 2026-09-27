@@ -3504,6 +3504,70 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
     assert env["OMNIGENT_DISABLE_KEYRING"] == "1"
 
 
+def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
+    """The reaper / turn-timeout knobs reach the runner.
+
+    Regression guard: these are read deep inside the runner and the panes it
+    spawns (pane reaper, harness idle reaper, subagent launch deadline, turn
+    watchdogs), but they are SET on the host — a systemd drop-in or the
+    operator's shell. The runner re-execs with a cleared environment, so an
+    unlisted knob is stripped SILENTLY: ``systemctl show`` reports the tuned
+    value on the unit while every runner keeps logging the in-code default.
+    That made a production pane-reaper mitigation inert.
+    """
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "7200",
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "5400",
+        "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S": "600",
+        "HARNESS_TURN_TIMEOUT_S": "3600",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S": "14400",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"] == "7200"
+    assert env["OMNIGENT_HARNESS_IDLE_TIMEOUT_S"] == "5400"
+    assert env["OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"] == "600"
+    assert env["HARNESS_TURN_TIMEOUT_S"] == "3600"
+    assert env["HARNESS_TURN_ABSOLUTE_TIMEOUT_S"] == "14400"
+
+
+def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> None:
+    """Allowlisting the timeout knobs by name must not open the whole
+    ``OMNIGENT_`` / ``HARNESS_`` namespace.
+
+    The allowlist is the boundary that keeps the host owner's environment out
+    of runners. An arbitrary unlisted var with the same prefix as a knob we DO
+    forward still has to be stripped — otherwise the five explicit literals
+    have quietly become a prefix rule.
+    """
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "7200",
+        "OMNIGENT_NOT_A_REAL_KNOB": "leaked",
+        "OMNIGENT_SOME_FUTURE_SECRET": "leaked",
+        "HARNESS_NOT_A_REAL_KNOB": "leaked",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"] == "7200"
+    assert "OMNIGENT_NOT_A_REAL_KNOB" not in env
+    assert "OMNIGENT_SOME_FUTURE_SECRET" not in env
+    assert "HARNESS_NOT_A_REAL_KNOB" not in env
+
+
 # ── host.list_dir handler ───────────────────────────────
 
 
