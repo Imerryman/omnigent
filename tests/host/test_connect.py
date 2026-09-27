@@ -4059,7 +4059,9 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "7200",
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "5400",
         "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S": "15",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S": "20",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S": "600",
+        "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S": "180",
         "OMNIGENT_GH_TIMEOUT_SECONDS": "120",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS": "45",
         "HARNESS_TURN_TIMEOUT_S": "3600",
@@ -4077,7 +4079,11 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
     assert env["OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"] == "7200"
     assert env["OMNIGENT_HARNESS_IDLE_TIMEOUT_S"] == "5400"
     assert env["OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S"] == "15"
+    assert env["OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S"] == "20"
     assert env["OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"] == "600"
+    # Resolved by a sibling change to terminals/pane_reaper.py; allowlisted
+    # here so the knob is not inert the moment that lands.
+    assert env["OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S"] == "180"
     assert env["OMNIGENT_GH_TIMEOUT_SECONDS"] == "120"
     assert env["OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS"] == "45"
     assert env["HARNESS_TURN_TIMEOUT_S"] == "3600"
@@ -4105,6 +4111,7 @@ def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> N
         "OMNIGENT_HARNESS_IDLE_TIMEOUT": "leaked",
         "HARNESS_TURN_TIMEOUT": "leaked",
         "HARNESS_ACP_PROMPT_TIMEOUT_S_EXTRA": "leaked",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S_EXTRA": "leaked",
     }
     env = _build_runner_env(
         base,
@@ -4121,6 +4128,7 @@ def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> N
     assert "OMNIGENT_HARNESS_IDLE_TIMEOUT" not in env
     assert "HARNESS_TURN_TIMEOUT" not in env
     assert "HARNESS_ACP_PROMPT_TIMEOUT_S_EXTRA" not in env
+    assert "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S_EXTRA" not in env
 
 
 # ── host.list_dir handler ───────────────────────────────
