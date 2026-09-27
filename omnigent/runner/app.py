@@ -13120,13 +13120,29 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import (
+            _list_tmux_clients,
+            _tmux_pane_pid,
+            _tmux_window_activity_at,
+        )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+        from omnigent.terminals.pane_cpu import PaneDescendantCpuProbe
+        from omnigent.terminals.pane_progress import clear_stream_progress, stream_progress_age_s
         from omnigent.terminals.pane_reaper import (
-            PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             PaneRef,
+            resolve_pane_output_busy_window_s,
         )
+
+        # Resolved once at app build, like the reaper's idle window: the knob is
+        # a deployment setting, not something to re-read from the environment on
+        # every pane on every scan.
+        _pane_output_busy_window_s = resolve_pane_output_busy_window_s()
+        # Holds one CPU baseline per conversation across scans so the busy
+        # predicate can derive a rate without ever sleeping inside itself. Kept
+        # on ``app.state`` (like ``native_pane_reaper``) so a test can swap in a
+        # probe with an injected clock instead of racing a real one.
+        app.state.native_pane_cpu_probe = PaneDescendantCpuProbe()
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -13160,6 +13176,25 @@ def create_runner_app(
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
                 return True
+            # Harness STREAM progress. The qwen forwarder tails qwen's
+            # stream-json output every 0.4s and stamps
+            # ``pane_progress.note_stream_progress`` on every new byte, so a
+            # long autonomous turn that has gone quiet on every signal above is
+            # still visibly producing tokens here. One dict lookup, no I/O, so
+            # it is the cheapest of all the signals and runs first. ``None``
+            # means "never recorded" (not qwen, or no turn yet) and falls
+            # through rather than reading as idle.
+            try:
+                progress_age = stream_progress_age_s(conv_id)
+                if progress_age is not None and progress_age < _pane_output_busy_window_s:
+                    return True
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: stream-progress check failed for %s; "
+                    "treating pane as busy",
+                    conv_id,
+                )
+                return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:
                 return True
@@ -13170,7 +13205,31 @@ def create_runner_app(
             activity_at = await asyncio.to_thread(
                 _tmux_window_activity_at, str(pane.socket_path), "main"
             )
-            if activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S:
+            if activity_at is not None and time.time() - activity_at < _pane_output_busy_window_s:
+                return True
+            # CHILD-PROCESS liveness. Every signal above is output-shaped: they
+            # all answer "did something appear recently?". A worker blocked
+            # inside ONE long silent child -- ``mypy .``, ``alembic upgrade
+            # head``, a full pytest run -- emits nothing, reports no turn, and
+            # reads idle on all of them while being perfectly healthy. So ask
+            # the process table instead: does the pane's subtree contain a
+            # descendant actually burning CPU? The probe caches a per-conversation
+            # tick baseline and derives a rate across scans, so it neither sleeps
+            # nor blocks (see omnigent/terminals/pane_cpu.py). Ordered AFTER the
+            # in-process checks because it costs one tmux call plus a handful of
+            # /proc reads; it runs only for a pane already quiet on everything
+            # cheaper.
+            try:
+                pane_pid = await asyncio.to_thread(_tmux_pane_pid, str(pane.socket_path), "main")
+                _cpu_probe = app.state.native_pane_cpu_probe
+                if await asyncio.to_thread(_cpu_probe.is_cpu_active, conv_id, pane_pid):
+                    return True
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: descendant-CPU check failed for %s; "
+                    "treating pane as busy",
+                    conv_id,
+                )
                 return True
             # Belt-and-suspenders for codex: its _native_pane_status is fed by an
             # out-of-process forwarder that posts to the server only, so a quiet
@@ -13192,6 +13251,12 @@ def create_runner_app(
             return False
 
         async def _reap_native_pane(pane: PaneRef) -> None:
+            # The pane is going away, so drop the liveness state keyed on it:
+            # its CPU baseline would be stale (and its pid recycled) when the
+            # pane is re-created, and its stream stamp belongs to a stream that
+            # no longer exists.
+            app.state.native_pane_cpu_probe.forget(pane.conversation_id)
+            clear_stream_progress(pane.conversation_id)
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
             finally:
