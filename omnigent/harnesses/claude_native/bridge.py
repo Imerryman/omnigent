@@ -442,24 +442,6 @@ _FOREIGN_DIALOG_HINTS = (
 # echoed in the transcript, or a torn capture that just omits the composer, is
 # not proof a dialog replaced it.
 _BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
-# Claude Code's question/selection surface (AskUserQuestion and the unboxed
-# permission prompt) draws NO ``│`` border, so :data:`_BOXED_DIALOG_HINTS`
-# cannot see it. Its key-hint footer is the shape :func:`_selection_prompt_shown`
-# looks for. Both spellings are real: a single-choice question commits with
-# "Enter to select", a multi-select one with "Space to select · Enter to
-# submit". The cancel hint must ride the same row — an interactive surface
-# always offers the escape.
-_SELECTION_FOOTER_COMMIT_HINTS = ("Enter to select", "Enter to submit")
-_SELECTION_FOOTER_CANCEL_HINT = "Esc to cancel"
-# The highlighted option of a live selection surface: the cursor glyph leading
-# a numbered choice row.
-#
-# These are pane CHARACTERS, so they are forgeable — an assistant can print
-# them, and one working on this very file can do so by accident. Six rounds of
-# such heuristics were defeated that way (see 37f82c0f7's chain and
-# b99b08b16). They are only ever a supporting condition here, never the reason
-# a submit is accepted; see :func:`_submit_confirmed_out_of_band`.
-_SELECTION_CURSOR_ROW_RE = re.compile(rf"{re.escape(_CLAUDE_PROMPT_GLYPH)}\s+\d+[.)]")
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -4151,6 +4133,12 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    # Baseline for the delivery signal, captured STRICTLY BEFORE the keystroke:
+    # only a ``UserPromptSubmit`` record appended after this count can be this
+    # submit's. Reading it after the Enter races the hook both ways — a fast
+    # record lands before the baseline and is missed, and a late record from a
+    # previous prompt is counted as ours.
+    hooks_cursor = count_hook_events(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     # Verify the submit took: a successful Enter clears the input box.
     # If the draft is still sitting there the Enter was swallowed into
@@ -4164,6 +4152,7 @@ def _paste_and_submit(
         needle=needle,
         what="submitted message",
         bridge_dir=bridge_dir,
+        hooks_cursor=hooks_cursor,
     ):
         return
     raise RuntimeError(
@@ -4229,6 +4218,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    hooks_cursor: int | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4249,8 +4239,14 @@ def _verify_submit_accepted(
     :param what: Label for log lines, e.g. ``"submitted message"``.
     :param bridge_dir: Bridge whose pending questions protect submit retries and
         whose hook records carry Claude Code's own delivery confirmation (see
-        :func:`_submit_confirmed_out_of_band`). Without one, an ambiguous pane
-        can only be resolved by boxed chrome or by waiting the window out.
+        :func:`_submit_reached_claude`). Without one, an ambiguous pane can only
+        be resolved by boxed chrome or by waiting the window out.
+    :param hooks_cursor: ``hooks.jsonl`` record count the caller captured
+        STRICTLY BEFORE the submit keystroke, from :func:`count_hook_events`.
+        Taking it here instead would race the keystroke in both directions — a
+        fast hook would land before the baseline and be missed, and a late hook
+        from a previous prompt would be counted as this submit's. ``None``
+        disables the signal rather than guessing.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4258,10 +4254,6 @@ def _verify_submit_accepted(
     last_enter = start
     retry_interval = _SUBMIT_RETRY_INTERVAL_S
     warned = False
-    # Baseline for the authoritative delivery signal: only a ``UserPromptSubmit``
-    # hook recorded AFTER this point can be ours. Read once, before the submit's
-    # own record could land, so a prior turn's record never answers for this one.
-    hooks_cursor = count_hook_events(bridge_dir) if bridge_dir is not None else None
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
@@ -4288,21 +4280,13 @@ def _verify_submit_accepted(
             #    question landed just as surely as one that pops a permission
             #    box, and failing to say so burned the whole window and then
             #    raised "the message was not delivered" on a delivered turn.
-            #    Its chrome is plain text an assistant can print, though, so
-            #    recognising it on screen is NOT enough on its own — that is the
-            #    hazard b99b08b16 deleted the picker footer over, and a false
-            #    accept is worse than this bug, because it drops a message in
-            #    silence. Acceptance therefore needs evidence from Claude Code
-            #    itself, off-screen: either its ``UserPromptSubmit`` hook fired
-            #    after our cursor (delivery, full stop — no pane needed), or a
-            #    permission/question hook is parked on a verdict right now and
-            #    the pane independently shows the surface it is parked on.
-            delivered, awaiting_answer = _submit_confirmed_out_of_band(bridge_dir, hooks_cursor)
-            if (
-                _submit_popped_surface(pane)
-                or delivered
-                or (awaiting_answer and _selection_prompt_shown(pane))
-            ):
+            #    Nothing about how that surface LOOKS is consulted, though: its
+            #    chrome is plain text an assistant can print, and a false accept
+            #    is worse than this bug because it drops a message in silence.
+            #    The landing is read from Claude Code itself instead — its
+            #    ``UserPromptSubmit`` hook, which fires when a prompt reaches it
+            #    and therefore before any question that prompt raises.
+            if _submit_popped_surface(pane) or _submit_reached_claude(bridge_dir, hooks_cursor):
                 if warned:
                     _logger.info(
                         "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4559,6 +4543,9 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    # Captured before the keystroke, for the same reason as in
+    # :func:`inject_user_message`.
+    hooks_cursor = count_hook_events(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -4569,6 +4556,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            hooks_cursor=hooks_cursor,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5635,92 +5623,41 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
-def _selection_prompt_shown(pane: str) -> bool:
+def _submit_reached_claude(bridge_dir: Path | None, hooks_cursor: int | None) -> bool:
     """
-    Return whether the pane LOOKS like Claude's unboxed question/selection UI.
+    Report whether Claude Code itself recorded the prompt this submit sent.
 
-    Claude Code renders ``AskUserQuestion`` and its unboxed permission prompt
-    without ``│`` chrome, so :func:`_submit_popped_surface` cannot see them.
-    This recognises their shape: inside the framed region below the surface's
-    opening rule, a key-hint footer row (:data:`_SELECTION_FOOTER_COMMIT_HINTS`
-    plus :data:`_SELECTION_FOOTER_CANCEL_HINT` on one row) and the rendered
-    selection cursor on a numbered option (:data:`_SELECTION_CURSOR_ROW_RE`).
+    This is the ONLY positive acceptance signal for an unreadable pane besides
+    boxed chrome, and it is deliberately the only one: it is the single piece of
+    evidence here that pane text cannot produce. ``UserPromptSubmit`` is written
+    to ``hooks.jsonl`` by a hook subprocess Claude Code executes, out-of-band
+    from anything drawn in the terminal (see
+    :func:`_user_prompt_reached_claude_since`).
 
-    .. warning::
+    An earlier revision also accepted "a permission hook is parked on a verdict
+    right now, and the pane shows a selection surface". That was unsound with no
+    adversary in sight: when Claude is already parked on a QUESTION from a
+    previous prompt, a draft sent into that surface is swallowed — genuinely not
+    delivered — while the marker is fresh and the surface is on screen, so a
+    dropped message was reported as delivered. The marker only ever proved that
+    Claude is waiting, never that THIS submit is why. It is gone; nothing
+    replaced it, because the target case does not need it: the message lands, so
+    ``UserPromptSubmit`` fires, so *delivered* is true on its own.
 
-       This is a TEXT match and is therefore FORGEABLE. Everything it looks at
-       is characters an assistant can print into its own transcript — by
-       accident while working on this file, or on purpose. It is deliberately
-       **never sufficient** to accept a submit: :func:`_verify_submit_accepted`
-       pairs it with :func:`_submit_confirmed_out_of_band`, evidence Claude
-       Code itself produced off-screen. Six rounds of pane-text heuristics were
-       already defeated this way, which is why ``b99b08b16`` deleted the
-       ``/model`` picker footer detection outright. Do not promote this to a
-       standalone acceptance signal.
-
-    Neither the footer nor the cursor is required to be the last row, so a
-    spinner, status line, or repaint artifact rendered under the surface does
-    not silently stop recognition (which would restore the 20s hang).
-
-    The interactive ``/model`` picker stays unrecognised: it commits with
-    "Enter to set as default", none of the commit hints.
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the pane carries a selection surface's shape.
+    :param bridge_dir: Bridge directory, or ``None`` when the caller has none —
+        there is no out-of-band channel then, so this is ``False``.
+    :param hooks_cursor: ``hooks.jsonl`` record count captured strictly BEFORE
+        the submit keystroke, or ``None`` when the caller did not capture one.
+        Without a baseline taken before the keystroke this signal is unsound in
+        both directions (a previous prompt's record would count as ours, and a
+        fast record would be missed), so ``None`` is ``False`` rather than a
+        guess.
+    :returns: ``True`` when a parent-process ``UserPromptSubmit`` record has
+        landed after *hooks_cursor*.
     """
-    lines = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
-    if not rules:
+    if bridge_dir is None or hooks_cursor is None:
         return False
-    # Same region convention as :func:`_user_prompt_visible`: the surface opens
-    # at its own rule, so with a closing rule on screen too the opening one is
-    # the second from the bottom.
-    region = [line.strip() for line in lines[(rules[-2] if len(rules) >= 2 else rules[-1]) + 1 :]]
-    footer = any(
-        _SELECTION_FOOTER_CANCEL_HINT in row
-        and any(hint in row for hint in _SELECTION_FOOTER_COMMIT_HINTS)
-        for row in region
-    )
-    return footer and any(_SELECTION_CURSOR_ROW_RE.match(row) for row in region)
-
-
-def _submit_confirmed_out_of_band(
-    bridge_dir: Path | None, hooks_cursor: int | None
-) -> tuple[bool, bool]:
-    """
-    Report evidence, produced by Claude Code itself, that a submit landed.
-
-    Pane text cannot produce either signal: both are written by hook processes
-    Claude Code executes out-of-band from the TUI, not by anything rendered
-    into the terminal. That is what makes them usable where a screenshot is
-    not — an assistant can print a convincing question surface into its own
-    transcript, but it cannot make Claude Code run a ``UserPromptSubmit`` hook
-    or park a permission hook on a verdict.
-
-    Two signals, deliberately of different strength:
-
-    - **delivered** — Claude Code's own ``UserPromptSubmit`` hook fired after
-      *hooks_cursor*, the record count captured before this submit. That hook
-      is "fires when a new user prompt reaches Claude" (see
-      :func:`_claude_hook_settings`), so a record after our cursor IS delivery.
-      Nothing about the screen is needed alongside it.
-    - **awaiting_answer** — a permission/question hook is parked on this
-      session's verdict right now (:func:`_has_approval_wait`). That proves
-      Claude is blocked on a person, but not by itself that OUR draft is what
-      started it, so the caller pairs it with the on-screen surface.
-
-    :param bridge_dir: Bridge directory, or ``None`` when the caller has none
-      (no out-of-band channel exists then, so both signals are ``False``).
-    :param hooks_cursor: ``hooks.jsonl`` record count captured before the
-      submit, or ``None`` when it could not be read.
-    :returns: ``(delivered, awaiting_answer)``.
-    """
-    if bridge_dir is None:
-        return (False, False)
-    delivered = hooks_cursor is not None and _user_prompt_reached_claude_since(
-        bridge_dir, hooks_cursor
-    )
-    return (delivered, _has_approval_wait(bridge_dir))
+    return _user_prompt_reached_claude_since(bridge_dir, hooks_cursor)
 
 
 def _submit_popped_surface(pane: str) -> bool:
@@ -5752,9 +5689,9 @@ def _submit_popped_surface(pane: str) -> bool:
     chrome is far harder to fake.
 
     The unboxed question/selection surface is NOT accepted here either, for the
-    same reason: its chrome is plain text too. It is recognised by
-    :func:`_selection_prompt_shown`, which the caller may only trust alongside
-    out-of-band evidence (:func:`_submit_confirmed_out_of_band`).
+    same reason: its chrome is plain text too. A submit that pops one is
+    accepted on :func:`_submit_reached_claude` instead — evidence Claude Code
+    produced off-screen — never on how that surface looks.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when a recognized boxed surface has replaced the composer.
