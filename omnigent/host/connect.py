@@ -716,6 +716,25 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Reaper / turn-timeout tuning knobs. These are plain numeric
+        # durations (not secrets) read deep inside the runner and the panes
+        # it spawns: the native-pane reaper
+        # (omnigent/terminals/pane_reaper.py), the harness process-manager
+        # idle reaper (omnigent/runtime/harnesses/process_manager.py), the
+        # subagent launch deadline (omnigent/runner/app.py) and the harness
+        # turn watchdogs (omnigent/runtime/harnesses/_scaffold.py). They are
+        # set on the HOST (systemd drop-in, operator shell), but the runner
+        # re-execs with a cleared environment (runner/_zygote.py), so without
+        # an allowlist entry the strip here is SILENT: the operator sees the
+        # value on the unit while every runner keeps using the in-code
+        # default. Listed by exact name rather than by an ``OMNIGENT_``
+        # prefix — a blanket prefix would widen the passthrough far beyond
+        # these knobs, and HARNESS_TURN_* does not share the prefix anyway.
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
+        "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
+        "HARNESS_TURN_TIMEOUT_S",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.
