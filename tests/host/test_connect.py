@@ -3519,9 +3519,13 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
         "PATH": "/usr/bin:/bin",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "7200",
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "5400",
+        "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S": "15",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S": "600",
+        "OMNIGENT_GH_TIMEOUT_SECONDS": "120",
+        "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS": "45",
         "HARNESS_TURN_TIMEOUT_S": "3600",
         "HARNESS_TURN_ABSOLUTE_TIMEOUT_S": "14400",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S": "900",
     }
     env = _build_runner_env(
         base,
@@ -3533,9 +3537,13 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
     )
     assert env["OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"] == "7200"
     assert env["OMNIGENT_HARNESS_IDLE_TIMEOUT_S"] == "5400"
+    assert env["OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S"] == "15"
     assert env["OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"] == "600"
+    assert env["OMNIGENT_GH_TIMEOUT_SECONDS"] == "120"
+    assert env["OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS"] == "45"
     assert env["HARNESS_TURN_TIMEOUT_S"] == "3600"
     assert env["HARNESS_TURN_ABSOLUTE_TIMEOUT_S"] == "14400"
+    assert env["HARNESS_ACP_PROMPT_TIMEOUT_S"] == "900"
 
 
 def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> None:
@@ -3553,6 +3561,11 @@ def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> N
         "OMNIGENT_NOT_A_REAL_KNOB": "leaked",
         "OMNIGENT_SOME_FUTURE_SECRET": "leaked",
         "HARNESS_NOT_A_REAL_KNOB": "leaked",
+        # Near-misses on names we DO forward: a prefix rule (or a sloppy
+        # startswith) would let these through.
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT": "leaked",
+        "HARNESS_TURN_TIMEOUT": "leaked",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S_EXTRA": "leaked",
     }
     env = _build_runner_env(
         base,
@@ -3566,6 +3579,9 @@ def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> N
     assert "OMNIGENT_NOT_A_REAL_KNOB" not in env
     assert "OMNIGENT_SOME_FUTURE_SECRET" not in env
     assert "HARNESS_NOT_A_REAL_KNOB" not in env
+    assert "OMNIGENT_HARNESS_IDLE_TIMEOUT" not in env
+    assert "HARNESS_TURN_TIMEOUT" not in env
+    assert "HARNESS_ACP_PROMPT_TIMEOUT_S_EXTRA" not in env
 
 
 # ── host.list_dir handler ───────────────────────────────
