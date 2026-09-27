@@ -22,6 +22,7 @@ from websockets.http11 import Response
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
+    _RUNNER_ENV_ALLOWLIST,
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
@@ -3502,6 +3503,43 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
         parent_pid=42,
     )
     assert env["OMNIGENT_DISABLE_KEYRING"] == "1"
+
+
+def test_runner_env_allowlist_timeout_knob_set_is_pinned() -> None:
+    """The set of timeout/reaper knobs in ``_RUNNER_ENV_ALLOWLIST`` is exact.
+
+    The propagation test below enumerates these names, which catches a
+    REMOVAL — the lookup would KeyError. It does not catch an ADDITION: a new
+    knob quietly appended to the allowlist would widen the host→runner
+    passthrough with no test failure and nothing to review against.
+
+    This pins the set in both directions. Adding or removing a timeout knob
+    fails here until the expected set is updated deliberately, which is the
+    point: each entry is a decision that a host-set value may cross into the
+    runner, and that decision should not be reachable by accident.
+    """
+    expected = {
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
+        "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
+        "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S",
+        "OMNIGENT_GH_TIMEOUT_SECONDS",
+        "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
+        "HARNESS_TURN_TIMEOUT_S",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S",
+    }
+    actual = {name for name in _RUNNER_ENV_ALLOWLIST if "TIMEOUT" in name or "BUSY_WINDOW" in name}
+    assert actual == expected, (
+        "The timeout/reaper knobs in _RUNNER_ENV_ALLOWLIST changed. "
+        f"Unexpectedly added: {sorted(actual - expected)}. "
+        f"Unexpectedly removed: {sorted(expected - actual)}. "
+        "Each entry lets a host-set value cross into the runner — update this "
+        "expected set only alongside a reviewed allowlist change, and cover "
+        "the new name in test_build_runner_env_propagates_reaper_and_turn_timeouts."
+    )
 
 
 def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
