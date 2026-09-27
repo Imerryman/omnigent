@@ -442,6 +442,21 @@ _FOREIGN_DIALOG_HINTS = (
 # echoed in the transcript, or a torn capture that just omits the composer, is
 # not proof a dialog replaced it.
 _BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
+# Claude Code's question/selection surface (AskUserQuestion and the unboxed
+# permission prompt) draws NO ``│`` border, so :data:`_BOXED_DIALOG_HINTS`
+# cannot see it. It is recognised instead by the key-hint footer it renders at
+# the very bottom of the pane while it owns the keyboard. Both spellings are
+# real: a single-choice question commits with "Enter to select", a multi-select
+# one with "Space to select · Enter to submit". The cancel hint must ride the
+# same row — an interactive surface always offers the escape.
+_SELECTION_FOOTER_COMMIT_HINTS = ("Enter to select", "Enter to submit")
+_SELECTION_FOOTER_CANCEL_HINT = "Esc to cancel"
+# The highlighted option of a live selection surface: the cursor glyph leading a
+# numbered choice row. Six rounds of footer-text heuristics were defeated by
+# assistant PROSE that mimics a picker (see 37f82c0f7's chain and b99b08b16),
+# which is why the footer alone is never enough here — it must be the bottom
+# row of a framed region that also carries this rendered cursor.
+_SELECTION_CURSOR_ROW_RE = re.compile(rf"{re.escape(_CLAUDE_PROMPT_GLYPH)}\s+\d+[.)]")
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -4192,17 +4207,21 @@ def _verify_submit_accepted(
         if draft_present is None:
             # ``_draft_in_input_box`` returns None whenever it cannot read the
             # composer, which has two very different meanings for a submit:
-            #  - a confirm dialog, model picker, or tool-permission prompt now
-            #    sits where the composer was. That surface only appears once the
+            #  - a confirm dialog, tool-permission prompt, or question now sits
+            #    where the composer was. That surface only appears once the
             #    submit popped it, so the draft is gone and the submit landed —
             #    count it accepted (see inject_slash_command: "the dialog
             #    replacing the composer counts, since submission pops it"). A
             #    permission prompt is included: its default answer approves the
             #    tool, so an Enter must never be sent into it, and treating it
             #    as ambiguous instead failed a delivered turn after the full
-            #    window. ``_submit_popped_surface`` requires the composer to be
-            #    gone (a live composer with the draft is vetoed by the tri-state
-            #    ``True`` case above) and matches only boxed dialog chrome.
+            #    window. The same held for a turn that immediately asked a
+            #    question: its surface draws no box, so it went unrecognised and
+            #    a delivered turn raised after the full window.
+            #    ``_submit_popped_surface`` requires the composer to be gone (a
+            #    live composer with the draft is vetoed by the tri-state ``True``
+            #    case above) and then positive chrome — boxed dialog border, or
+            #    a rendered question/selection surface.
             #  - a torn or not-yet-rendered capture. Its absence proves
             #    nothing, so keep waiting without re-sending Enter rather than
             #    mistaking the ambiguity for acceptance.
@@ -5539,9 +5558,59 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
+def _selection_prompt_shown(pane: str) -> bool:
+    """
+    Return whether a live, unboxed question/selection surface owns the pane.
+
+    Claude Code renders :func:`AskUserQuestion` and its plain permission prompt
+    without ``│`` box chrome, so :func:`_submit_popped_surface`'s boxed-title
+    scan cannot see them even though they are just as much proof that a submit
+    popped a surface over the composer.
+
+    The recognition is deliberately a CONJUNCTION of rendered structure, not a
+    text match: a footer's words alone are forgeable by assistant prose, which
+    is what defeated six rounds of picker-footer heuristics and got that
+    machinery deleted (``b99b08b16``). All three must hold:
+
+    1. The pane's last rendered row IS the surface's key-hint footer
+       (:data:`_SELECTION_FOOTER_COMMIT_HINTS` plus
+       :data:`_SELECTION_FOOTER_CANCEL_HINT` on that one row). A surface that
+       holds the keyboard sits at the bottom of the screen; transcript prose is
+       followed by more transcript and, once rendered, the composer's frame.
+    2. A box rule is on screen above it, so the footer belongs to a framed
+       region rather than to loose scrollback text.
+    3. That region carries the rendered selection cursor on a numbered option
+       (:data:`_SELECTION_CURSOR_ROW_RE`) — the highlight only a live list
+       draws, and the row Enter would act on.
+
+    The interactive ``/model`` picker stays undetected: it commits with "Enter
+    to set as default", none of the commit hints, which keeps b99b08b16's
+    scope reduction intact.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a live selection surface is rendered.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    if not lines:
+        return False
+    footer = lines[-1].strip()
+    if _SELECTION_FOOTER_CANCEL_HINT not in footer or not any(
+        hint in footer for hint in _SELECTION_FOOTER_COMMIT_HINTS
+    ):
+        return False
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if not rules:
+        return False
+    # Same region convention as :func:`_user_prompt_visible`: the surface opens
+    # at its own rule, so with a closing rule on screen too the opening one is
+    # the second from the bottom.
+    opening = rules[-2] if len(rules) >= 2 else rules[-1]
+    return any(_SELECTION_CURSOR_ROW_RE.match(line.strip()) for line in lines[opening + 1 :])
+
+
 def _submit_popped_surface(pane: str) -> bool:
     """
-    Return whether a submit popped a boxed dialog/permission over the composer.
+    Return whether a submit popped a dialog/question surface over the composer.
 
     A submitted turn can immediately replace the composer with the
     switch/effort confirmation or a tool-permission prompt; that surface
@@ -5560,15 +5629,27 @@ def _submit_popped_surface(pane: str) -> bool:
       transcript echoes of the just-sent message, so it vetoed real, successful
       submits that popped a permission surface.
 
-    Only past that gate is the surface's own chrome consulted — the boxed
-    confirm/permission title on a vertical-rule (``│``) row. The interactive
-    ``/model`` picker footer is deliberately NOT detected: its footer is plain
-    text a prose how-to can forge, upstream drives model switching through the
-    non-interactive ``/model <id>`` command rather than the picker, and box
-    chrome is far harder to fake.
+    Only past that gate is the surface's own chrome consulted, in two shapes:
+
+    - the boxed confirm/permission title on a vertical-rule (``│``) row; and
+    - the unboxed question/selection surface (:func:`_selection_prompt_shown`),
+      which draws no border at all and so is invisible to the boxed scan. A
+      submit that immediately raises a question landed just as surely as one
+      that pops a permission box; without this, such a turn burned the full
+      :data:`_SUBMIT_VERIFY_TIMEOUT_S` window and then raised "the message was
+      not delivered" on a turn that had already been delivered.
+
+    Both shapes are POSITIVE evidence of a rendered surface. An unreadable or
+    torn capture — the other reason :func:`_draft_in_input_box` returns ``None``
+    — matches neither and keeps the caller waiting, so absence of evidence never
+    becomes evidence of acceptance. The interactive ``/model`` picker footer is
+    deliberately NOT detected: its footer is plain text a prose how-to can
+    forge, upstream drives model switching through the non-interactive
+    ``/model <id>`` command rather than the picker, and box chrome is far
+    harder to fake.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when a recognized boxed surface has replaced the composer.
+    :returns: ``True`` when a recognized surface has replaced the composer.
     """
     # A live composer means the active region is the input box — not a popped
     # overlay — and its draft (if any) is vetoed by the tri-state in the caller.
@@ -5583,7 +5664,9 @@ def _submit_popped_surface(pane: str) -> bool:
             and any(hint in stripped for hint in _BOXED_DIALOG_HINTS)
         ):
             return True
-    return False
+    # Unboxed question / selection surface: no border to anchor on, recognised
+    # by its rendered footer + cursor instead.
+    return _selection_prompt_shown(pane)
 
 
 def _claude_prompt_rendered(pane: str) -> bool:

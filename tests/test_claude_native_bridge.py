@@ -4970,6 +4970,167 @@ def test_submit_popped_surface_distinguishes_overlay_from_transcript() -> None:
     assert _submit_popped_surface(_MODEL_PICKER_PANE) is False
 
 
+# Claude Code's AskUserQuestion surface, as captured from a live pane: a framed
+# region with a rendered selection cursor and the key-hint footer at the very
+# bottom. It carries NO ``│`` box chrome, which is why the boxed-title scan
+# alone could not see it.
+_QUESTION_SURFACE_PANE = """\
+────────────────────────────────────────────────────────────
+ ☐ Bridge
+Which bridge should we use?
+❯ 1. Keep overlay
+     Retain the existing environment
+  2. Try PYTHONPATH
+     Test a path bridge
+────────────────────────────────────────────────────────────
+  3. Chat about this
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
+
+# The same surface as a multi-select, which commits with "Enter to submit".
+_MULTISELECT_SURFACE_PANE = _QUESTION_SURFACE_PANE.replace(
+    "Enter to select", "Space to select · Enter to submit"
+)
+
+
+def test_submit_popped_surface_recognizes_the_unboxed_question_surface() -> None:
+    """A question that replaced the composer is a popped surface; prose is not.
+
+    Regression (@ _verify_submit_accepted): a submit that immediately raised a
+    question was reported as a delivery failure. ``_draft_in_input_box`` returns
+    None on that pane (no composer to read) and the None branch only accepted
+    BOXED chrome, which the question surface does not draw — so a delivered turn
+    burned the full window and raised "the message was not delivered".
+
+    Acceptance must stay POSITIVE evidence, never "the composer was unreadable,
+    so assume success": each negative below is also a pane with no readable
+    composer, and every one of them must still fail.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        _draft_in_input_box,
+        _submit_popped_surface,
+    )
+
+    # The composer really is unreadable on this pane — the None branch is what
+    # runs — and the surface is recognised on its own rendered structure.
+    assert _draft_in_input_box(_QUESTION_SURFACE_PANE, "Follow-up") is None
+    assert _submit_popped_surface(_QUESTION_SURFACE_PANE) is True
+    assert _submit_popped_surface(_MULTISELECT_SURFACE_PANE) is True
+
+    # Negatives — every one has no readable composer, so an "unreadable means
+    # accepted" fallback would pass them all.
+    assert _draft_in_input_box("", "Follow-up") is None
+    assert _submit_popped_surface("") is False  # empty / torn capture
+
+    garbage = "\x1b[2J  ⎿  \x00\x00 partial frame\n  ? for shortcuts\n"
+    assert _draft_in_input_box(garbage, "Follow-up") is None
+    assert _submit_popped_surface(garbage) is False
+
+    # Assistant prose that quotes the footer: the words are there, but no framed
+    # region with a rendered cursor is.
+    prose = (
+        "  ⎿  To answer one of these, use the arrow keys.\n"
+        "  1. Press Enter to select the highlighted option\n"
+        "  2. Press Esc to cancel\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
+    assert _submit_popped_surface(prose) is False
+
+    # Framed transcript output whose footer is quoted, but with no cursor row:
+    # nothing is highlighted, so nothing is awaiting a keypress.
+    no_cursor = (
+        "────────────────────────────────────────────────────────────\n"
+        "  1. Keep overlay\n"
+        "  2. Try PYTHONPATH\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    )
+    assert _submit_popped_surface(no_cursor) is False
+
+    # A real surface whose footer is no longer the bottom row has been scrolled
+    # into the transcript; the live region is elsewhere.
+    scrolled = _QUESTION_SURFACE_PANE + "  ⎿  Read 42 lines\n"
+    assert _submit_popped_surface(scrolled) is False
+
+
+def test_submit_that_pops_a_question_accepts_without_burning_the_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The question case accepts within a poll or two, not after 20s.
+
+    The bug's cost was latency as much as the raise: the loop ``continue``d on
+    every capture until _SUBMIT_VERIFY_TIMEOUT_S expired. With the real 20s
+    window in place, acceptance must come from the first captures — the capture
+    stub fails the test rather than letting a regression spin for 20 seconds.
+    """
+    captures = 0
+
+    def capture(*_: str) -> str:
+        nonlocal captures
+        captures += 1
+        assert captures <= 3, "the question surface must be accepted promptly, not polled out"
+        return _QUESTION_SURFACE_PANE
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *a: pytest.fail(f"sent {a}"))
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0)
+    assert claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S >= 20.0
+    started = time.monotonic()
+    assert claude_native_bridge._verify_submit_accepted(
+        "/tmp/example.sock",
+        "claude:0.0",
+        needle="Follow-up",
+        what="submitted message",
+        bridge_dir=tmp_path / "bridge",
+    )
+    elapsed = time.monotonic() - started
+    assert elapsed < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4, elapsed
+
+
+def test_submit_that_never_lands_still_fails_after_the_full_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hardening 37f82c0f7 added survives: an unreadable pane is not success.
+
+    A pane that never renders a composer and never renders a recognised surface
+    proves nothing, so the verifier keeps waiting and then fails loud. Teaching
+    the None branch about the question surface must not turn it into a rubber
+    stamp for every capture it cannot read.
+    """
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+
+    tui: dict[str, Any] = {"pane": _composer_pane()}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("never lands")
+        if cmd[-1] == "Enter":
+            # The submit is swallowed and the pane goes unreadable: no composer
+            # to read, and no surface popped either. Nothing was delivered.
+            tui["pane"] = "  ⎿  \x00 torn frame\n"
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="message was not delivered"):
+        inject_user_message(bridge_dir, content="never lands")
+
+
 def _accept_after_submit_reaches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
