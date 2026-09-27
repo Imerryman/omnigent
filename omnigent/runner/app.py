@@ -13181,9 +13181,10 @@ def create_runner_app(
             # ``pane_progress.note_stream_progress`` on every new byte, so a
             # long autonomous turn that has gone quiet on every signal above is
             # still visibly producing tokens here. One dict lookup, no I/O, so
-            # it is the cheapest of all the signals and runs first. ``None``
-            # means "never recorded" (not qwen, or no turn yet) and falls
-            # through rather than reading as idle.
+            # it sits with the other free in-process checks, ahead of every
+            # signal that does any I/O. ``None`` means "never recorded" (not
+            # qwen, or no turn yet) and falls through rather than reading as
+            # idle.
             try:
                 progress_age = stream_progress_age_s(conv_id)
                 if progress_age is not None and progress_age < _pane_output_busy_window_s:
