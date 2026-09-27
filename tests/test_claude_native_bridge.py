@@ -4971,9 +4971,8 @@ def test_submit_popped_surface_distinguishes_overlay_from_transcript() -> None:
 
 
 # Claude Code's AskUserQuestion surface, as captured from a live pane: a framed
-# region with a rendered selection cursor and the key-hint footer at the very
-# bottom. It carries NO ``│`` box chrome, which is why the boxed-title scan
-# alone could not see it.
+# region with a rendered selection cursor and the key-hint footer. It carries
+# NO ``│`` box chrome, which is why the boxed-title scan cannot see it.
 _QUESTION_SURFACE_PANE = """\
 ────────────────────────────────────────────────────────────
  ☐ Bridge
@@ -4992,76 +4991,203 @@ _MULTISELECT_SURFACE_PANE = _QUESTION_SURFACE_PANE.replace(
     "Enter to select", "Space to select · Enter to submit"
 )
 
+# The forged pane an adversarial reviewer built to defeat the first attempt at
+# this fix: ordinary assistant output that happens to satisfy every on-screen
+# condition. Nothing here is special — an agent working on THIS file can print
+# it by accident mid-verification-window.
+_FORGED_SURFACE_PANE = """\
+Here is the reproduction fixture you asked for:
+────────────────────────────────────────────
+❯ 1. Keep overlay
+  2. Try PYTHONPATH
+Enter to select · ↑/↓ to navigate · Esc to cancel
+"""
 
-def test_submit_popped_surface_recognizes_the_unboxed_question_surface() -> None:
-    """A question that replaced the composer is a popped surface; prose is not.
+# A transcript replaying an earlier, genuine question, and a PR body quoting the
+# fixture. Both are pane text that a real surface also produces.
+_TRANSCRIPT_REPLAY_PANE = "  ⎿  Replaying the last question:\n" + _QUESTION_SURFACE_PANE
+_QUOTED_FIXTURE_PANE = "  ⎿  The PR body contains:\n```\n" + _QUESTION_SURFACE_PANE + "```\n"
 
-    Regression (@ _verify_submit_accepted): a submit that immediately raised a
-    question was reported as a delivery failure. ``_draft_in_input_box`` returns
-    None on that pane (no composer to read) and the None branch only accepted
-    BOXED chrome, which the question surface does not draw — so a delivered turn
-    burned the full window and raised "the message was not delivered".
 
-    Acceptance must stay POSITIVE evidence, never "the composer was unreadable,
-    so assume success": each negative below is also a pane with no readable
-    composer, and every one of them must still fail.
+def _hook_record(bridge_dir: Path, event_name: str, **payload: object) -> None:
+    """Append one hooks.jsonl envelope the way the hook subprocess does."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    envelope = {"recorded_at": time.time(), "payload": {"hook_event_name": event_name, **payload}}
+    with (bridge_dir / "hooks.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(envelope) + "\n")
+
+
+def _park_approval_wait(bridge_dir: Path, session_id: str) -> Path:
+    """Park a permission hook on a verdict, as the hook subprocess does."""
+    bridge_dir.mkdir(parents=True, exist_ok=True)
+    (bridge_dir / "bridge.json").write_text(json.dumps({"active_session_id": session_id}))
+    marker = claude_native_bridge.approval_wait_marker_path(session_id, bridge_dir=bridge_dir)
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    claude_native_bridge.touch_approval_wait_marker(marker)
+    return marker
+
+
+def test_selection_surface_text_alone_never_accepts_a_submit(tmp_path: Path) -> None:
+    """Pane characters are not evidence: every forgeable pane is rejected.
+
+    Regression (@ _verify_submit_accepted None branch): the first attempt at
+    this fix accepted a submit on a three-way on-screen pattern (footer as the
+    bottom row + a box rule above it + a ``❯ 1.`` cursor row). An adversarial
+    reviewer defeated it in one try with _FORGED_SURFACE_PANE — ordinary
+    assistant output. Because the None branch treats acceptance as "delivered",
+    that would silently declare an UNDELIVERED message delivered, which is
+    strictly worse than the 20s hang this PR fixes: the hang is loud.
+
+    So the shape detector stays a shape detector. With no out-of-band evidence,
+    NOTHING on screen short of boxed chrome may accept.
     """
     from omnigent.harnesses.claude_native.bridge import (
         _draft_in_input_box,
+        _selection_prompt_shown,
+        _submit_confirmed_out_of_band,
         _submit_popped_surface,
     )
 
-    # The composer really is unreadable on this pane — the None branch is what
-    # runs — and the surface is recognised on its own rendered structure.
-    assert _draft_in_input_box(_QUESTION_SURFACE_PANE, "Follow-up") is None
-    assert _submit_popped_surface(_QUESTION_SURFACE_PANE) is True
-    assert _submit_popped_surface(_MULTISELECT_SURFACE_PANE) is True
+    forgeable = [
+        _QUESTION_SURFACE_PANE,
+        _MULTISELECT_SURFACE_PANE,
+        _FORGED_SURFACE_PANE,
+        _TRANSCRIPT_REPLAY_PANE,
+        _QUOTED_FIXTURE_PANE,
+    ]
+    for pane in forgeable:
+        # Each is a pane the composer cannot be read from — the None branch.
+        assert _draft_in_input_box(pane, "Follow-up") is None, pane
+        # The boxed scan never accepts any of them.
+        assert _submit_popped_surface(pane) is False, pane
 
-    # Negatives — every one has no readable composer, so an "unreadable means
-    # accepted" fallback would pass them all.
-    assert _draft_in_input_box("", "Follow-up") is None
-    assert _submit_popped_surface("") is False  # empty / torn capture
+    # A genuine surface and the forgery are INDISTINGUISHABLE on screen. That is
+    # the point: the shape detector cannot tell them apart, so it never decides.
+    assert _selection_prompt_shown(_QUESTION_SURFACE_PANE) is True
+    assert _selection_prompt_shown(_FORGED_SURFACE_PANE) is True
 
-    garbage = "\x1b[2J  ⎿  \x00\x00 partial frame\n  ? for shortcuts\n"
-    assert _draft_in_input_box(garbage, "Follow-up") is None
-    assert _submit_popped_surface(garbage) is False
+    # With no bridge dir there is no out-of-band channel at all, so no pane can
+    # produce evidence. With an empty bridge dir (no hook records, no parked
+    # hook) it is the same answer.
+    empty = tmp_path / "bridge"
+    empty.mkdir()
+    assert _submit_confirmed_out_of_band(None, 0) == (False, False)
+    assert _submit_confirmed_out_of_band(empty, 0) == (False, False)
 
-    # Assistant prose that quotes the footer: the words are there, but no framed
-    # region with a rendered cursor is.
-    prose = (
-        "  ⎿  To answer one of these, use the arrow keys.\n"
-        "  1. Press Enter to select the highlighted option\n"
-        "  2. Press Esc to cancel\n"
-        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+
+def test_out_of_band_evidence_cannot_be_produced_by_pane_content(tmp_path: Path) -> None:
+    """The chosen signals live outside the pane, so no capture can fabricate them.
+
+    ``UserPromptSubmit`` records are appended to hooks.jsonl by a hook process
+    Claude Code executes; the approval-wait marker is touched by a parked
+    permission hook. Writing either requires acting on the bridge directory —
+    not printing characters a capture-pane will read back.
+    """
+    from omnigent.harnesses.claude_native.bridge import _submit_confirmed_out_of_band
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    # Writing the entire forged pane, and a hand-rolled JSON line claiming the
+    # hook fired, into a file that is NOT the hook log changes nothing.
+    (bridge_dir / "pane.txt").write_text(_FORGED_SURFACE_PANE)
+    (bridge_dir / "not-hooks.jsonl").write_text(
+        json.dumps({"payload": {"hook_event_name": "UserPromptSubmit"}}) + "\n"
     )
-    assert _submit_popped_surface(prose) is False
+    assert _submit_confirmed_out_of_band(bridge_dir, 0) == (False, False)
 
-    # Framed transcript output whose footer is quoted, but with no cursor row:
-    # nothing is highlighted, so nothing is awaiting a keypress.
-    no_cursor = (
-        "────────────────────────────────────────────────────────────\n"
-        "  1. Keep overlay\n"
-        "  2. Try PYTHONPATH\n"
-        "Enter to select · ↑/↓ to navigate · Esc to cancel\n"
+    # Only Claude Code's own hook record flips the delivered signal, and only
+    # one recorded AFTER the cursor taken before the submit.
+    _hook_record(bridge_dir, "UserPromptSubmit")
+    assert _submit_confirmed_out_of_band(bridge_dir, 1) == (False, False), "cursor must exclude it"
+    assert _submit_confirmed_out_of_band(bridge_dir, 0)[0] is True
+
+    # A subagent's record never answers for the parent turn.
+    other = tmp_path / "other"
+    other.mkdir()
+    _hook_record(other, "UserPromptSubmit", transcript_path="/p/subagents/a.jsonl")
+    assert _submit_confirmed_out_of_band(other, 0) == (False, False)
+
+    # A different hook event is not a delivery either.
+    stopped = tmp_path / "stopped"
+    stopped.mkdir()
+    _hook_record(stopped, "Stop")
+    assert _submit_confirmed_out_of_band(stopped, 0) == (False, False)
+
+
+def test_forged_question_surface_does_not_accept_an_undelivered_submit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MANDATORY: the reviewer's forged pane must still fail verification.
+
+    The submit is swallowed and the pane then shows text that looks exactly like
+    a question surface. No hook fired and no hook is parked, so the message was
+    never delivered — the verifier must wait the window out and fail loud rather
+    than report the drop as a success.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: _FORGED_SURFACE_PANE)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_: None)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    for pane in (_FORGED_SURFACE_PANE, _TRANSCRIPT_REPLAY_PANE, _QUOTED_FIXTURE_PANE):
+        monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_, p=pane: p)
+        assert not claude_native_bridge._verify_submit_accepted(
+            "/tmp/example.sock",
+            "claude:0.0",
+            needle="Follow-up",
+            what="submitted message",
+            bridge_dir=bridge_dir,
+        ), pane
+
+
+def test_submit_accepted_when_claude_records_the_prompt_even_on_an_unreadable_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Claude Code's own UserPromptSubmit hook is delivery — no screen needed.
+
+    This is the signal the pane cannot forge, and it is strong enough to stand
+    alone: the pane here is a torn capture that shows nothing at all.
+    """
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    captures = 0
+
+    def capture(*_: str) -> str:
+        nonlocal captures
+        captures += 1
+        if captures == 2:
+            _hook_record(bridge_dir, "UserPromptSubmit")
+        return "  ⎿  \x00 torn frame\n"
+
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_: None)
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0)
+    assert claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S >= 20.0
+    started = time.monotonic()
+    assert claude_native_bridge._verify_submit_accepted(
+        "/tmp/example.sock",
+        "claude:0.0",
+        needle="Follow-up",
+        what="submitted message",
+        bridge_dir=bridge_dir,
     )
-    assert _submit_popped_surface(no_cursor) is False
-
-    # A real surface whose footer is no longer the bottom row has been scrolled
-    # into the transcript; the live region is elsewhere.
-    scrolled = _QUESTION_SURFACE_PANE + "  ⎿  Read 42 lines\n"
-    assert _submit_popped_surface(scrolled) is False
+    assert time.monotonic() - started < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4
 
 
 def test_submit_that_pops_a_question_accepts_without_burning_the_window(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The question case accepts within a poll or two, not after 20s.
+    """A parked question hook plus the surface on screen accepts promptly.
 
     The bug's cost was latency as much as the raise: the loop ``continue``d on
     every capture until _SUBMIT_VERIFY_TIMEOUT_S expired. With the real 20s
     window in place, acceptance must come from the first captures — the capture
     stub fails the test rather than letting a regression spin for 20 seconds.
     """
+    bridge_dir = tmp_path / "bridge"
+    _park_approval_wait(bridge_dir, "conv_question")
     captures = 0
 
     def capture(*_: str) -> str:
@@ -5080,10 +5206,47 @@ def test_submit_that_pops_a_question_accepts_without_burning_the_window(
         "claude:0.0",
         needle="Follow-up",
         what="submitted message",
-        bridge_dir=tmp_path / "bridge",
+        bridge_dir=bridge_dir,
     )
-    elapsed = time.monotonic() - started
-    assert elapsed < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4, elapsed
+    assert time.monotonic() - started < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4
+
+    # The marker alone is not enough either: with the surface gone from the pane
+    # there is nothing to corroborate what the parked hook is waiting on.
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_: "  ⎿  torn\n")
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", lambda *_: None)
+    assert not claude_native_bridge._verify_submit_accepted(
+        "/tmp/example.sock",
+        "claude:0.0",
+        needle="Follow-up",
+        what="submitted message",
+        bridge_dir=bridge_dir,
+    )
+
+
+def test_selection_prompt_shape_tolerates_rows_under_the_footer() -> None:
+    """A spinner or status row below the footer must not stop recognition.
+
+    Requiring the footer to be the very last rendered row made recognition
+    depend on a repaint race: a spinner tick, a wrapped footer, or a status line
+    silently reverted the question case to the 20s hang plus a false
+    RuntimeError on a delivered turn.
+    """
+    from omnigent.harnesses.claude_native.bridge import _selection_prompt_shown
+
+    assert _selection_prompt_shown(_QUESTION_SURFACE_PANE + "✳ Thinking… (3s · ↓ 1.2k tokens)\n")
+    assert _selection_prompt_shown(_QUESTION_SURFACE_PANE + "  ? for shortcuts\n")
+
+    # The /model picker stays unrecognised (b99b08b16's scope reduction): it
+    # commits with "Enter to set as default", not with a selection commit hint.
+    assert _selection_prompt_shown(_MODEL_PICKER_PANE) is False
+    # And nothing without the rendered cursor or the footer qualifies.
+    assert _selection_prompt_shown("") is False
+    assert _selection_prompt_shown("  ⎿  Press Enter to select, Esc to cancel\n") is False
+    framed_without_cursor = (
+        "────────────────────────────────\n  1. one\n  2. two\nEnter to select · Esc to cancel\n"
+    )
+    assert _selection_prompt_shown(framed_without_cursor) is False
 
 
 def test_submit_that_never_lands_still_fails_after_the_full_window(
@@ -5093,9 +5256,9 @@ def test_submit_that_never_lands_still_fails_after_the_full_window(
     """The hardening 37f82c0f7 added survives: an unreadable pane is not success.
 
     A pane that never renders a composer and never renders a recognised surface
-    proves nothing, so the verifier keeps waiting and then fails loud. Teaching
-    the None branch about the question surface must not turn it into a rubber
-    stamp for every capture it cannot read.
+    proves nothing, and no hook fired, so the verifier keeps waiting and then
+    fails loud. Teaching the None branch about the question surface must not
+    turn it into a rubber stamp for every capture it cannot read.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(
