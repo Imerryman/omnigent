@@ -8,15 +8,25 @@ panes have no idle reaper, so on a shared/multi-conversation runner memory grows
 without bound as idle conversations accumulate, independent of how many are
 actually active (#1349).
 
-This reaps a single native pane only when it is genuinely unused. "Busy" is the
-disjunction of three signals (any one spares the pane):
+This reaps a single native pane only when it is genuinely unused. "Busy" is a
+disjunction of signals wired by ``create_runner_app`` (any one spares the pane):
 
   * an in-flight runner turn (``has_active_turn``), OR
   * the pane's PTY watcher currently reports ``running`` — i.e. the vendor CLI is
     working autonomously *between* runner turns (native turns clear the runner's
     ``_active_turns`` right after the prompt is pasted, so this is the load-bearing
     signal for a long autonomous turn), OR
-  * a tmux client is attached (a human is watching the pane).
+  * the harness stream made progress recently
+    (:mod:`omnigent.terminals.pane_progress`), OR
+  * a tmux client is attached (a human is watching the pane), OR
+  * the pane's tmux window emitted output recently, OR
+  * the pane's process subtree contains a descendant burning CPU
+    (:mod:`omnigent.terminals.pane_cpu`).
+
+The last signal exists because every other one is *output-shaped*: they all ask
+"did something appear recently?". A worker blocked inside one long silent child
+process (``mypy .``, a migration, a full test run) produces nothing to see and
+was being reaped while perfectly healthy.
 
 A pane idle on all three for longer than the window is reaped, with a **second
 busy re-check immediately before teardown** to close the select→reap race. The
@@ -45,8 +55,10 @@ _logger = logging.getLogger(__name__)
 # A pane whose window emitted output this recently counts as busy. tmux's own
 # activity clock is evidence independent of the harness status pipeline, whose
 # silent stall must not get a live, producing terminal reaped. Two reaper scan
-# intervals, so any output between scans re-arms the idle clock.
+# intervals, so any output between scans re-arms the idle clock. This is the
+# DEFAULT; ``resolve_pane_output_busy_window_s`` applies the env override.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
+_OUTPUT_BUSY_WINDOW_ENV = "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S"
 
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the
@@ -130,6 +142,45 @@ def resolve_native_pane_idle_timeout_s() -> float:
             _DEFAULT_IDLE_TIMEOUT_S,
         )
         return float(_DEFAULT_IDLE_TIMEOUT_S)
+    return value
+
+
+def resolve_pane_output_busy_window_s() -> float:
+    """Resolve the pane "recent progress" window in seconds.
+
+    Honors :envvar:`OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S`; otherwise
+    :data:`PANE_OUTPUT_BUSY_WINDOW_S`. Same shape and same failure policy as
+    :func:`resolve_native_pane_idle_timeout_s` — an unparseable or negative value
+    logs and falls back to the default rather than letting an env typo widen or
+    (worse) collapse the window the busy predicate trusts.
+
+    This window governs every "did something happen recently?" signal the busy
+    predicate has: the tmux output clock and the harness stream-progress ledger
+    (:mod:`omnigent.terminals.pane_progress`). Unlike the idle timeout, ``0`` is
+    not special-cased here — it simply means "only progress in the last zero
+    seconds counts", which disables these two signals without touching the rest.
+    """
+    raw = os.environ.get(_OUTPUT_BUSY_WINDOW_ENV)
+    if not raw:
+        return PANE_OUTPUT_BUSY_WINDOW_S
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not a number; using default %ss",
+            _OUTPUT_BUSY_WINDOW_ENV,
+            raw,
+            PANE_OUTPUT_BUSY_WINDOW_S,
+        )
+        return PANE_OUTPUT_BUSY_WINDOW_S
+    if value < 0:
+        _logger.warning(
+            "%s=%r is negative; using default %ss",
+            _OUTPUT_BUSY_WINDOW_ENV,
+            raw,
+            PANE_OUTPUT_BUSY_WINDOW_S,
+        )
+        return PANE_OUTPUT_BUSY_WINDOW_S
     return value
 
 

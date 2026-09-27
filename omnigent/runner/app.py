@@ -3317,6 +3317,23 @@ def create_runner_app(
         )
     app.state.session_resource_registry = resource_registry
 
+    def _clear_native_pane_liveness(session_id: str) -> None:
+        """Forget a session's native-pane liveness state (stream + CPU ledgers).
+
+        Called from session cleanup and from the reaper's own teardown. Both
+        ledgers are optional: the CPU probe only exists when the pane reaper was
+        wired (``resource_registry`` present), and neither is worth failing a
+        teardown over, so this never raises.
+        """
+        from omnigent.terminals.pane_progress import clear_stream_progress
+
+        with contextlib.suppress(Exception):
+            clear_stream_progress(session_id)
+        probe = getattr(app.state, "native_pane_cpu_probe", None)
+        if probe is not None:
+            with contextlib.suppress(Exception):
+                probe.forget(session_id)
+
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:
         if process_manager is not None:
             process_manager.note_activity(session_id)
@@ -4997,6 +5014,13 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        # Drop the native-pane liveness ledgers for this session. Both are keyed
+        # on conversation id and were previously cleared only on the reaper's own
+        # teardown path, so a session that ended CLEANLY left residue behind
+        # (bounded and evictable, but still stale state a later same-id session
+        # could read). The forwarder that writes the stream ledger is cancelled
+        # just below, so clearing here cannot race a live writer.
+        _clear_native_pane_liveness(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
@@ -13120,13 +13144,29 @@ def create_runner_app(
         and hasattr(_pane_reaper_registry, "native_panes")
     ):
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
-        from omnigent.native.native_cost_popup import _list_tmux_clients, _tmux_window_activity_at
+        from omnigent.native.native_cost_popup import (
+            _list_tmux_clients,
+            _tmux_pane_pid,
+            _tmux_window_activity_at,
+        )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+        from omnigent.terminals.pane_cpu import PaneDescendantCpuProbe
+        from omnigent.terminals.pane_progress import stream_progress_age_s
         from omnigent.terminals.pane_reaper import (
-            PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             PaneRef,
+            resolve_pane_output_busy_window_s,
         )
+
+        # Resolved once at app build, like the reaper's idle window: the knob is
+        # a deployment setting, not something to re-read from the environment on
+        # every pane on every scan.
+        _pane_output_busy_window_s = resolve_pane_output_busy_window_s()
+        # Holds one CPU baseline per conversation across scans so the busy
+        # predicate can derive a rate without ever sleeping inside itself. Kept
+        # on ``app.state`` (like ``native_pane_reaper``) so a test can swap in a
+        # probe with an injected clock instead of racing a real one.
+        app.state.native_pane_cpu_probe = PaneDescendantCpuProbe()
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -13160,6 +13200,26 @@ def create_runner_app(
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
                 return True
+            # Harness STREAM progress. The qwen forwarder tails qwen's
+            # stream-json output every 0.4s and stamps
+            # ``pane_progress.note_stream_progress`` on every new byte, so a
+            # long autonomous turn that has gone quiet on every signal above is
+            # still visibly producing tokens here. One dict lookup, no I/O, so
+            # it sits with the other free in-process checks, ahead of every
+            # signal that does any I/O. ``None`` means "never recorded" (not
+            # qwen, or no turn yet) and falls through rather than reading as
+            # idle.
+            try:
+                progress_age = stream_progress_age_s(conv_id)
+                if progress_age is not None and progress_age < _pane_output_busy_window_s:
+                    return True
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: stream-progress check failed for %s; "
+                    "treating pane as busy",
+                    conv_id,
+                )
+                return True
             clients = await asyncio.to_thread(_list_tmux_clients, str(pane.socket_path), "main")
             if clients:
                 return True
@@ -13170,7 +13230,7 @@ def create_runner_app(
             activity_at = await asyncio.to_thread(
                 _tmux_window_activity_at, str(pane.socket_path), "main"
             )
-            if activity_at is not None and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S:
+            if activity_at is not None and time.time() - activity_at < _pane_output_busy_window_s:
                 return True
             # Belt-and-suspenders for codex: its _native_pane_status is fed by an
             # out-of-process forwarder that posts to the server only, so a quiet
@@ -13189,9 +13249,71 @@ def create_runner_app(
                         return True
                 except Exception:  # noqa: BLE001 - never reap when liveness is unconfirmable
                     return True
+                # AUTHORITATIVE idle wins, so codex returns here rather than
+                # falling through to the descendant-CPU heuristic below. The
+                # codex app-server is the one component that actually knows
+                # whether this session has a turn in flight; CPU is a proxy for
+                # that question. Letting the proxy override a confirmed-idle
+                # verdict would make a codex pane with a runaway descendant (a
+                # wedged MCP server, a polling sidecar) immortal while it burns
+                # CPU -- the orphan pileup this reaper exists to prevent. Codex
+                # loses nothing by skipping the CPU signal: it is the only
+                # harness with an authoritative answer, which is strictly better
+                # evidence. This also keeps codex's verdict byte-identical to
+                # before the CPU signal was added.
+                return False
+            # CHILD-PROCESS liveness. Every signal above is output-shaped: they
+            # all answer "did something appear recently?". A worker blocked
+            # inside ONE long silent child -- ``mypy .``, ``alembic upgrade
+            # head``, a full pytest run -- emits nothing, reports no turn, and
+            # reads idle on all of them while being perfectly healthy. So ask
+            # the process table instead: does the pane's subtree contain a
+            # descendant actually burning CPU? The probe caches a per-conversation
+            # tick baseline and derives a rate across scans, so it neither sleeps
+            # nor blocks (see omnigent/terminals/pane_cpu.py). Ordered LAST: it
+            # is the only signal that costs a tmux call plus /proc reads, and it
+            # is the weakest evidence, so everything cheaper and more direct --
+            # including codex's authoritative status above -- decides first.
+            try:
+                pane_pid = await asyncio.to_thread(_tmux_pane_pid, str(pane.socket_path), "main")
+                _cpu_probe = app.state.native_pane_cpu_probe
+                cpu = await asyncio.to_thread(_cpu_probe.is_cpu_active, conv_id, pane_pid)
+                if cpu.active:
+                    # INFO, not debug: reaching here means every other signal
+                    # read idle and this pane is being spared SOLELY because
+                    # something in its subtree is burning CPU. That is usually a
+                    # healthy silent child, but it is also how a dead agent with
+                    # a runaway descendant (a wedged MCP server, a polling
+                    # sidecar) stays alive indefinitely -- an accepted tradeoff
+                    # of acceptance item 1, so name the culprit pid and its rate
+                    # to make the case diagnosable instead of mysterious.
+                    _logger.info(
+                        "native pane reaper: sparing conversation %s (%s) on "
+                        "descendant CPU alone: %.1f%% of a core across %d "
+                        "descendants, busiest pid %s at %.1f%%",
+                        conv_id,
+                        pane.terminal_name,
+                        cpu.cpu_fraction * 100.0,
+                        cpu.descendants,
+                        cpu.busiest_pid,
+                        cpu.busiest_fraction * 100.0,
+                    )
+                    return True
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: descendant-CPU check failed for %s; "
+                    "treating pane as busy",
+                    conv_id,
+                )
+                return True
             return False
 
         async def _reap_native_pane(pane: PaneRef) -> None:
+            # The pane is going away, so drop the liveness state keyed on it:
+            # its CPU baseline would be stale (and its pid recycled) when the
+            # pane is re-created, and its stream stamp belongs to a stream that
+            # no longer exists. Same helper the normal session-cleanup path uses.
+            _clear_native_pane_liveness(pane.conversation_id)
             try:
                 await resource_registry.close_terminal(pane.conversation_id, pane.terminal_id)
             finally:
