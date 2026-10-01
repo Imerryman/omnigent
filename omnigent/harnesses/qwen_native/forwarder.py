@@ -481,6 +481,26 @@ async def forward_qwen_events_to_session(
     """
     target = events_file or events_file_path(bridge_dir)
     state = _read_state(bridge_dir)
+    # LIVENESS cursor, deliberately SEPARATE from the DELIVERY cursor
+    # (``state.offset``). ``state.offset`` only advances once
+    # ``_deliver_forward_actions`` has succeeded, so while a POST keeps failing --
+    # a mirror endpoint that is down, or one permanently-rejected action -- the
+    # loop re-reads the SAME bytes on every poll. Stamping pane liveness off that
+    # condition would renew the lease forever and make a genuinely dead pane
+    # immortal, which is the orphan pileup the reaper exists to prevent (and a
+    # worse failure than the reaped-while-healthy bug it replaces).
+    #
+    # This cursor instead tracks how far the FILE has actually been read, so each
+    # byte is counted as progress exactly ONCE regardless of how many delivery
+    # attempts it takes. A retry loop over unchanged file content therefore stops
+    # stamping and the pane ages out normally; a file that keeps growing keeps
+    # stamping even while delivery keeps failing, because a healthy generating
+    # qwen whose mirror is down is still alive.
+    #
+    # In-memory only, on purpose: it is liveness, not a durable cursor. A
+    # forwarder restart re-reads undelivered bytes and stamps once for them,
+    # which is correct -- the restart itself is recent activity.
+    progress_offset = state.offset
     timeout = httpx.Timeout(_POST_TIMEOUT_S)
     from omnigent.cli_auth import open_server_client
 
@@ -501,7 +521,7 @@ async def forward_qwen_events_to_session(
                     state.last_assistant_text,
                     state.last_assistant_stop_reason,
                 )
-                if new_offset != state.offset or actions:
+                if new_offset != progress_offset:
                     # Stamp BEFORE delivery: new stream bytes are already proof
                     # that qwen is producing, and the POST below can take up to
                     # _POST_TIMEOUT_S. This is the pane reaper's token-level
@@ -510,6 +530,12 @@ async def forward_qwen_events_to_session(
                     # this one. Any new bytes count, including records this
                     # forwarder ignores (control_request/response): they are
                     # still the harness making progress.
+                    #
+                    # Compared against ``progress_offset``, NOT ``state.offset``:
+                    # see the cursor's definition above. ``!=`` rather than ``>``
+                    # so a bridge relaunch truncating the event file (which
+                    # rewinds the read offset) also counts, once.
+                    progress_offset = new_offset
                     note_stream_progress(session_id)
                 await _deliver_forward_actions(
                     client,
