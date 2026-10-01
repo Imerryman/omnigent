@@ -697,6 +697,82 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
+        # Timeout / reaper tuning knobs. Every entry below is a numeric
+        # duration (not a secret) read deep inside the runner, the harness
+        # processes it spawns, or the panes those spawn. They are set on the
+        # HOST (systemd drop-in, operator shell), but the runner re-execs
+        # with a cleared environment (runner/_zygote.py), so without an
+        # allowlist entry the strip here is SILENT: the operator sees the
+        # value on the unit, and every runner keeps using the in-code
+        # default. The harness layer inherits the runner's environment
+        # wholesale (_build_harness_spawn_env, process_manager.py), so a var
+        # stripped here is missing there too.
+        #
+        # What is true of ALL of them: each consumer coerces its value
+        # through ``float()`` and uses it only as a number — none is
+        # interpolated into a command, path or credential, so none can carry
+        # a payload. What DIFFERS is what a MALFORMED value does, and it
+        # differs four ways. Operators editing a drop-in should know which
+        # knob behaves which way, because three of the four families tell you
+        # when you got it wrong and one stays silent about it:
+        #
+        #   (1) Warn and fall back to the default. Non-numeric or negative
+        #   logs at WARNING; ``0`` is honored as "disabled". An env typo can
+        #   neither take the runner down nor make a reaper act on a bogus
+        #   window, and it leaves a trace in the log:
+        #     OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S  terminals/pane_reaper.py:103
+        #     OMNIGENT_HARNESS_IDLE_TIMEOUT_S      runtime/harnesses/process_manager.py:121
+        #     OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S   terminals/pane_reaper.py
+        #       (resolved by a sibling change; allowlisted here so it is not
+        #        inert on arrival)
+        #
+        #   (2) Warn and fall back, but negative is MEANINGFUL. Non-numeric
+        #   and non-finite (nan/inf) warn and default; ``<= 0`` deliberately
+        #   DISABLES the reaper rather than being treated as invalid:
+        #     OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S   runner/app.py:456
+        #
+        #   (3) Fall back SILENTLY — no log at all. Non-numeric and
+        #   non-positive both yield the default with nothing emitted, so a
+        #   typo here is invisible: the operator sees the value on the unit
+        #   and gets the default with no diagnostic. Least diagnosable of the
+        #   four — (4) is harsher in impact but at least reports itself;
+        #   do not assume a warning will appear here:
+        #     OMNIGENT_GH_TIMEOUT_SECONDS          runner/github_resource.py:94
+        #     OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS  runtime/filesystem_registry.py:61
+        #
+        #   (4) Fail-loud — a bare ``float()`` at import, so a malformed
+        #   value raises and ABORTS the process rather than degrading. Now
+        #   that these actually reach the runner, a typo on the unit is a
+        #   startup failure, not a silently ignored setting:
+        #     OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S  runtime/harnesses/_runner.py:75
+        #     OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S runtime/harnesses/_runner.py:90
+        #     HARNESS_TURN_TIMEOUT_S               runtime/harnesses/_scaffold.py:127
+        #     HARNESS_TURN_ABSOLUTE_TIMEOUT_S      runtime/harnesses/_scaffold.py:139
+        #     HARNESS_ACP_PROMPT_TIMEOUT_S         inner/acp_executor.py:162
+        #       (this one validates explicitly: non-finite or non-positive
+        #        raises a dedicated ValueError at ACP child startup)
+        #
+        # Harmonizing (1)-(4) onto one tolerant shape would mean editing
+        # _runner.py, _scaffold.py and acp_executor.py; that is deliberately
+        # a separate change, not smuggled into an allowlist fix.
+        #
+        # Listed by exact name rather than by an ``OMNIGENT_``/``HARNESS_``
+        # prefix — a blanket prefix would widen the passthrough far beyond
+        # these knobs, the HARNESS_* names do not share the OMNIGENT_ prefix
+        # anyway, and HARNESS_* is the namespace where harness CREDENTIALS
+        # live. tests/host/test_connect.py pins this set exactly, so adding
+        # or removing an entry here fails the suite until reviewed.
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
+        "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
+        "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S",
+        "OMNIGENT_GH_TIMEOUT_SECONDS",
+        "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
+        "HARNESS_TURN_TIMEOUT_S",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S",
     }
     # Windows system / profile constants (SYSTEMROOT is mandatory for Winsock,
     # USERPROFILE for Path.home(), etc.); a no-op on POSIX. See _platform.

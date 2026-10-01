@@ -296,6 +296,18 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+# A selection dialog Claude Code stacks ABOVE a still-rendered composer (e.g.
+# 2.1.280's "Teach auto mode about your environment?", opened as a turn ends)
+# takes the keyboard: a paste lands in the dialog, not the input box. It is
+# framed by a rule above and the composer's opening rule below, lists numbered
+# options behind the ``❯`` selector, and its last row is the footer naming
+# Escape as the way out.
+_STACKED_DIALOG_FOOTER_RE = re.compile(
+    r"enter to \w+\s*·\s*esc to (cancel|exit)\s*$", re.IGNORECASE
+)
+_STACKED_DIALOG_OPTION_RE = re.compile(r"^\s*" + re.escape("❯") + r"\s*\d+\.")
+# Taller framed regions are transcript, not a dialog.
+_STACKED_DIALOG_MAX_LINES = 14
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -305,7 +317,7 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # still consuming the paste gets folded in as a newline instead of
 # submitting — the draft then sits unsent. Polling for the draft makes
 # the handoff deterministic where the old fixed sleep raced it.
-_PASTE_COMMIT_TIMEOUT_S = 5.0
+_PASTE_COMMIT_TIMEOUT_S = 20.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -436,6 +448,13 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
+# Titles that render INSIDE a bordered confirm/permission dialog box (the
+# switch/effort confirmation and every tool-permission prompt). Positive
+# overlay evidence requires one of these on a box-chrome row (see
+# :func:`_submit_popped_surface`), not merely somewhere in the pane — a title
+# echoed in the transcript, or a torn capture that just omits the composer, is
+# not proof a dialog replaced it.
+_BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -2603,6 +2622,12 @@ def augment_claude_args(
     _write_json_file(settings_path, hook_settings)
     args.extend(
         [
+            # Omnigent worker panes load ONLY the bridge relay (see
+            # build_mcp_config); strict mode prevents Claude from merging the
+            # user-scope ~/.claude.json MCP fleet (serena, postgres, playwright,
+            # glitchtip, code-agents) into every pane -> was ~1GB/pane -> OOM.
+            # Only affects omnigent-spawned panes; hand-launched claude is untouched.
+            "--strict-mcp-config",
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
@@ -3553,6 +3578,58 @@ def read_hook_events_from_offset(
     )
 
 
+def _user_prompt_reached_claude_since(bridge_dir: Path, start_event_count: int) -> bool:
+    """
+    Return whether Claude Code recorded a new user prompt after a hook cursor.
+
+    ``UserPromptSubmit`` is registered in :func:`_claude_hook_settings` as the
+    symmetric counterpart to ``Stop``: Claude Code runs it "when a new user
+    prompt reaches Claude (web-UI message via tmux send-keys, or direct
+    keystrokes into the embedded terminal)". A record appended after the
+    cursor captured before a submit is therefore Claude Code's own statement
+    that the message landed — the authoritative answer to the question
+    :func:`_verify_submit_accepted` otherwise has to infer from a screenshot.
+
+    It is written by a hook subprocess appending to ``hooks.jsonl``, not by
+    anything drawn in the pane, so no amount of assistant output can fabricate
+    it. That is the whole point: pane text is forgeable, this is not.
+
+    Subagent records are skipped the same way :func:`stop_hook_seen_since`
+    skips them, so a background Task agent's edge never answers for the
+    parent turn.
+
+    :param bridge_dir: Bridge directory path.
+    :param start_event_count: Hook record count captured before the submit.
+    :returns: ``True`` once a parent-process ``UserPromptSubmit`` hook has been
+        recorded after the cursor.
+    """
+    path = bridge_dir / _HOOKS_FILE
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle, start=1):
+                if index <= start_event_count:
+                    continue
+                try:
+                    envelope = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("hook_event_name") != "UserPromptSubmit":
+                    continue
+                transcript_path = payload.get("transcript_path")
+                if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    continue
+                return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _logger.debug("Could not read hook records for submit verification", exc_info=True)
+        return False
+    return False
+
+
 def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
@@ -4097,6 +4174,94 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before sending a message."
         )
+    _paste_draft(bridge_dir, socket_path, tmux_target, text=text)
+    # Wait until the TUI has visibly committed the paste into its input
+    # box before submitting. Claude Code coalesces rapid stdin bursts
+    # into a paste; an Enter that arrives while it is still consuming
+    # the paste becomes a newline inside the draft instead of a submit,
+    # and the message sits unsent. A fixed sleep raced this (lost under
+    # load / large payloads); polling is deterministic.
+    draft_seen = False
+    repasted = False
+    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _draft_in_input_box(pane, needle) is True:
+            draft_seen = True
+            break
+        if _stacked_dialog_headline(pane) is not None:
+            # A dialog opened above the composer after the pre-paste restore
+            # (they appear as a turn ends) and swallowed the paste. Dismiss it
+            # through the same verified-Escape path and paste once more; a
+            # dialog that will not go away is named now instead of costing
+            # the full commit timeout.
+            if not repasted:
+                _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+            headline = _stacked_dialog_headline(_capture_pane(socket_path, tmux_target))
+            if headline is not None:
+                raise ClaudeTerminalDialog(
+                    f"Claude Code is waiting for an answer in its terminal ({headline}). "
+                    "The message was not delivered."
+                )
+            if not repasted:
+                _paste_draft(bridge_dir, socket_path, tmux_target, text=text)
+                repasted = True
+                deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+                continue
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    # Fail BEFORE the submit Enter, never after. The draft was never confirmed
+    # in the box (e.g. an unidentifiable draft whose needle is empty), so its
+    # delivery cannot be verified — and pressing Enter first would submit, and
+    # so possibly execute, the very message this then reports as undelivered.
+    if not draft_seen:
+        raise RuntimeError(
+            "Claude Code's pasted draft could not be confirmed in the input box. "
+            "The message was not delivered."
+        )
+    time.sleep(_PASTE_SETTLE_S)
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
+    # Baseline for the delivery signal, captured STRICTLY BEFORE the keystroke:
+    # only a ``UserPromptSubmit`` record appended after this count can be this
+    # submit's. Reading it after the Enter races the hook both ways — a fast
+    # record lands before the baseline and is missed, and a late record from a
+    # previous prompt is counted as ours.
+    hooks_cursor = count_hook_events(bridge_dir)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    # Verify the submit took: a successful Enter clears the input box.
+    # If the draft is still sitting there the Enter was swallowed into
+    # the paste burst as a newline — re-send it (the retry lands well
+    # after the burst, so it submits). Each Enter only fires while the
+    # draft is verifiably still present, so a retry can never hit an
+    # empty prompt or a permission dialog of the started turn.
+    if _verify_submit_accepted(
+        socket_path,
+        tmux_target,
+        needle=needle,
+        what="submitted message",
+        bridge_dir=bridge_dir,
+        hooks_cursor=hooks_cursor,
+    ):
+        return
+    raise RuntimeError(
+        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
+        "(submission could not be confirmed). The message was not delivered."
+    )
+
+
+def _paste_draft(bridge_dir: Path, socket_path: str, tmux_target: str, *, text: str) -> None:
+    """
+    Clear the input box and bracketed-paste *text* into it (no submit).
+
+    :param bridge_dir: Bridge directory path (hosts the paste temp file).
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param text: Exact text to paste (already escaped as needed).
+    :returns: None.
+    :raises RuntimeError: If a ``tmux`` invocation fails.
+    """
     # Clear any leftover text in Claude's input field before typing.
     # After Escape-cancel, Claude Code re-populates the prompt area
     # with the previous input for re-editing. Without this clear,
@@ -4134,50 +4299,6 @@ def _paste_and_submit(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
-    # Wait until the TUI has visibly committed the paste into its input
-    # box before submitting. Claude Code coalesces rapid stdin bursts
-    # into a paste; an Enter that arrives while it is still consuming
-    # the paste becomes a newline inside the draft instead of a submit,
-    # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
-    draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    time.sleep(_PASTE_SETTLE_S)
-    if has_pending_user_prompt(bridge_dir):
-        raise ClaudeUserPromptPending(
-            "Claude is waiting for an explicit answer; message not sent."
-        )
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    if not draft_seen:
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    if _verify_submit_accepted(
-        socket_path,
-        tmux_target,
-        needle=needle,
-        what="submitted message",
-        bridge_dir=bridge_dir,
-    ):
-        return
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
-    )
 
 
 def _verify_submit_accepted(
@@ -4187,6 +4308,7 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    hooks_cursor: int | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4205,7 +4327,16 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
-    :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param bridge_dir: Bridge whose pending questions protect submit retries and
+        whose hook records carry Claude Code's own delivery confirmation (see
+        :func:`_submit_reached_claude`). Without one, an ambiguous pane can only
+        be resolved by boxed chrome or by waiting the window out.
+    :param hooks_cursor: ``hooks.jsonl`` record count the caller captured
+        STRICTLY BEFORE the submit keystroke, from :func:`count_hook_events`.
+        Taking it here instead would race the keystroke in both directions — a
+        fast hook would land before the baseline and be missed, and a late hook
+        from a previous prompt would be counted as this submit's. ``None``
+        disables the signal rather than guessing.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4216,7 +4347,45 @@ def _verify_submit_accepted(
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
-        if not _draft_in_input_box(pane, needle):
+        draft_present = _draft_in_input_box(pane, needle)
+        if draft_present is None:
+            # ``_draft_in_input_box`` returns None whenever it cannot read the
+            # composer, which has two very different meanings for a submit:
+            #  - a confirm dialog or tool-permission prompt now sits where the
+            #    composer was. That surface only appears once the submit popped
+            #    it, so the draft is gone and the submit landed — count it
+            #    accepted (see inject_slash_command: "the dialog replacing the
+            #    composer counts, since submission pops it"). A permission
+            #    prompt is included: its default answer approves the tool, so an
+            #    Enter must never be sent into it, and treating it as ambiguous
+            #    instead failed a delivered turn after the full window.
+            #    ``_submit_popped_surface`` requires the composer to be gone (a
+            #    live composer with the draft is vetoed by the tri-state ``True``
+            #    case above) and matches only boxed dialog chrome.
+            #  - a torn or not-yet-rendered capture. Its absence proves
+            #    nothing, so keep waiting without re-sending Enter rather than
+            #    mistaking the ambiguity for acceptance.
+            #  - Claude's question/selection surface, which draws NO box chrome,
+            #    so the scan above cannot see it. A turn that immediately asks a
+            #    question landed just as surely as one that pops a permission
+            #    box, and failing to say so burned the whole window and then
+            #    raised "the message was not delivered" on a delivered turn.
+            #    Nothing about how that surface LOOKS is consulted, though: its
+            #    chrome is plain text an assistant can print, and a false accept
+            #    is worse than this bug because it drops a message in silence.
+            #    The landing is read from Claude Code itself instead — its
+            #    ``UserPromptSubmit`` hook, which fires when a prompt reaches it
+            #    and therefore before any question that prompt raises.
+            if _submit_popped_surface(pane) or _submit_reached_claude(bridge_dir, hooks_cursor):
+                if warned:
+                    _logger.info(
+                        "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                        what,
+                        time.monotonic() - start,
+                    )
+                return True
+            continue
+        if draft_present is False:
             if warned:
                 _logger.info(
                     "claude-native: %s accepted after %.1fs of an unresponsive TUI",
@@ -4464,6 +4633,9 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    # Captured before the keystroke, for the same reason as in
+    # :func:`inject_user_message`.
+    hooks_cursor = count_hook_events(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -4474,6 +4646,7 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            hooks_cursor=hooks_cursor,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5537,6 +5710,12 @@ def _occupying_surface(pane: str) -> str | None:
     row = _composer_row(pane)
     if row is None:
         return "an overlay"
+    # A dialog stacked above the composer owns the keyboard even though the
+    # box is rendered; its footer names Escape as the non-committal way out
+    # (for the auto-mode setup prompt, Escape is "Not now").
+    headline = _stacked_dialog_headline(pane)
+    if headline is not None:
+        return f"a dialog above the input box ({headline})"
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return "shell mode"
@@ -5580,6 +5759,95 @@ def _composer_row(pane: str) -> str | None:
         if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return row
     return None
+
+
+def _submit_reached_claude(bridge_dir: Path | None, hooks_cursor: int | None) -> bool:
+    """
+    Report whether Claude Code itself recorded the prompt this submit sent.
+
+    This is the ONLY positive acceptance signal for an unreadable pane besides
+    boxed chrome, and it is deliberately the only one: it is the single piece of
+    evidence here that pane text cannot produce. ``UserPromptSubmit`` is written
+    to ``hooks.jsonl`` by a hook subprocess Claude Code executes, out-of-band
+    from anything drawn in the terminal (see
+    :func:`_user_prompt_reached_claude_since`).
+
+    An earlier revision also accepted "a permission hook is parked on a verdict
+    right now, and the pane shows a selection surface". That was unsound with no
+    adversary in sight: when Claude is already parked on a QUESTION from a
+    previous prompt, a draft sent into that surface is swallowed — genuinely not
+    delivered — while the marker is fresh and the surface is on screen, so a
+    dropped message was reported as delivered. The marker only ever proved that
+    Claude is waiting, never that THIS submit is why. It is gone; nothing
+    replaced it, because the target case does not need it: the message lands, so
+    ``UserPromptSubmit`` fires, so *delivered* is true on its own.
+
+    :param bridge_dir: Bridge directory, or ``None`` when the caller has none —
+        there is no out-of-band channel then, so this is ``False``.
+    :param hooks_cursor: ``hooks.jsonl`` record count captured strictly BEFORE
+        the submit keystroke, or ``None`` when the caller did not capture one.
+        Without a baseline taken before the keystroke this signal is unsound in
+        both directions (a previous prompt's record would count as ours, and a
+        fast record would be missed), so ``None`` is ``False`` rather than a
+        guess.
+    :returns: ``True`` when a parent-process ``UserPromptSubmit`` record has
+        landed after *hooks_cursor*.
+    """
+    if bridge_dir is None or hooks_cursor is None:
+        return False
+    return _user_prompt_reached_claude_since(bridge_dir, hooks_cursor)
+
+
+def _submit_popped_surface(pane: str) -> bool:
+    """
+    Return whether a submit popped a boxed dialog/permission over the composer.
+
+    A submitted turn can immediately replace the composer with the
+    switch/effort confirmation or a tool-permission prompt; that surface
+    appearing is proof the draft left the box. This is what a submit-
+    verification loop treats as acceptance (and it must NOT press Enter into
+    such a surface — its default answer commits something unasked-for).
+
+    The genuine "draft still present" veto is enforced by the composer region,
+    not by scanning the whole pane for the draft text:
+
+    - A live composer row means the active bottom region IS the input box, so
+      this returns not-popped; its draft is then handled by the tri-state
+      :func:`_draft_in_input_box` (``True`` -> the caller keeps retrying, never
+      accepting). A whole-pane needle scan was wrong here: the submitted text
+      also appears *inside* a permission box (the command being approved) and in
+      transcript echoes of the just-sent message, so it vetoed real, successful
+      submits that popped a permission surface.
+
+    Only past that gate is the surface's own chrome consulted — the boxed
+    confirm/permission title on a vertical-rule (``│``) row. The interactive
+    ``/model`` picker footer is deliberately NOT detected: its footer is plain
+    text a prose how-to can forge, upstream drives model switching through the
+    non-interactive ``/model <id>`` command rather than the picker, and box
+    chrome is far harder to fake.
+
+    The unboxed question/selection surface is NOT accepted here either, for the
+    same reason: its chrome is plain text too. A submit that pops one is
+    accepted on :func:`_submit_reached_claude` instead — evidence Claude Code
+    produced off-screen — never on how that surface looks.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a recognized boxed surface has replaced the composer.
+    """
+    # A live composer means the active region is the input box — not a popped
+    # overlay — and its draft (if any) is vetoed by the tri-state in the caller.
+    if _composer_row(pane) is not None:
+        return False
+    # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
+    for raw in pane.splitlines():
+        stripped = raw.strip()
+        if (
+            stripped[:1]
+            and stripped[0] in _VERTICAL_RULE_GLYPHS
+            and any(hint in stripped for hint in _BOXED_DIALOG_HINTS)
+        ):
+            return True
+    return False
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
@@ -5718,32 +5986,55 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
+def _draft_in_input_box(pane: str, needle: str) -> bool | None:
+    """Locate the draft in the framed composer, including continuation rows.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
-
-    :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
+    Return None when the capture cannot establish whether the draft remains.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
-        return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
-        return True
-    return bool(needle) and needle in tail
+    # Only the absence of a rendered composer makes the draft's state
+    # unknowable here. A confirm dialog / model picker / permission prompt that
+    # replaced the composer already trips this (no composer row renders), and
+    # anchoring on the composer this way is what keeps ordinary text — a pasted
+    # ``"Explain Switch model?"`` draft, or a hint echoed in the transcript —
+    # from being read as an active dialog while the composer is plainly up. A
+    # bare whole-pane substring check returned None for such a draft, so the
+    # verifier then called the still-present, unsent draft delivered.
+    if not _claude_prompt_rendered(pane):
+        return None
+
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    # The composer is always the last framed box at the bottom of the pane.
+    # Check the last rule first; fall back to the second-to-last rule when
+    # the last rule's row is the footer (e.g. a continuation-line composer
+    # where the row after the closing rule is the footer, not the composer).
+    candidates: list[int] = []
+    if rules:
+        candidates.append(rules[-1] + 1)
+    if len(rules) >= 2:
+        candidates.append(rules[-2] + 1)
+
+    for start in candidates:
+        if start >= len(lines):
+            continue
+        row = lines[start].strip()
+        if not row.startswith(_CLAUDE_PROMPT_GLYPH):
+            continue
+        end = next((i for i in rules if i > start), len(lines))
+        body = "\n".join([row.removeprefix(_CLAUDE_PROMPT_GLYPH), *lines[start + 1 : end]])
+        # Folding whitespace also handles terminal wrapping within the needle.
+        folded_body = "".join(body.split())
+        folded_needle = "".join(needle.split())
+        if _PASTED_PLACEHOLDER_PREFIX in body or (folded_needle and folded_needle in folded_body):
+            return True
+        # A closing rule immediately after the composer row means the box
+        # is definitively empty (not ambiguous).
+        if end < len(lines) and lines[end].strip():
+            return False
+        # Without a closing rule, the remaining draft may be below the pane.
+        return None
+
+    return None
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
@@ -5803,6 +6094,57 @@ def _terminal_dialog_headline(pane: str) -> str | None:
         line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region
     )
     if not has_selector and "press enter" not in footer.lower():
+        return None
+    return " ".join(region[0].strip().strip("│").split())[:120]
+
+
+def _stacked_dialog_headline(pane: str) -> str | None:
+    """
+    Name a selection dialog stacked above a live composer, or ``None``.
+
+    :func:`_terminal_dialog_headline` covers dialogs drawn *instead of* the
+    input box. Some open *above* it while the composer stays rendered — the
+    "Teach auto mode about your environment?" prompt Claude Code 2.1.280
+    shows as a turn ends — yet still own the keyboard, so a pasted message
+    is swallowed by the dialog and the composer stays empty. Every structural
+    check still passes (the composer row is there), which is why delivery
+    used to wait out the paste-commit timeout instead of seeing the dialog.
+
+    The read is structural and deliberately narrow, because the answer draws
+    an Escape: the region between the composer's opening rule and the rule
+    above it must be short (:data:`_STACKED_DIALOG_MAX_LINES`), hold a
+    numbered ``❯ 1.`` option row, and END with an "Enter to … · Esc to
+    cancel/exit" footer directly on the composer's rule. Transcript text
+    echoing such a dialog never ends flush against the composer frame with
+    a numbered selector inside one short framed region.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The dialog's first line, e.g.
+        ``"Teach auto mode about your environment?"``, or ``None``.
+    """
+    if not pane.strip():
+        return None
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    opening = next(
+        (
+            r
+            for r in (rules[-2:] if len(rules) >= 2 else rules)
+            if r + 1 < len(lines) and lines[r + 1].strip().startswith(_CLAUDE_PROMPT_GLYPH)
+        ),
+        None,
+    )
+    if opening is None:
+        return None
+    above = [r for r in rules if r < opening]
+    if not above:
+        return None
+    region = lines[above[-1] + 1 : opening]
+    if not region or len(region) > _STACKED_DIALOG_MAX_LINES:
+        return None
+    if not _STACKED_DIALOG_FOOTER_RE.search(region[-1].strip()):
+        return None
+    if not any(_STACKED_DIALOG_OPTION_RE.match(line) for line in region):
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
 

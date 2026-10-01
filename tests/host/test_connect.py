@@ -22,6 +22,7 @@ from websockets.http11 import Response
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.connect import (
+    _RUNNER_ENV_ALLOWLIST,
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
@@ -4041,6 +4042,131 @@ def test_build_runner_env_propagates_disable_keyring() -> None:
         parent_pid=42,
     )
     assert env["OMNIGENT_DISABLE_KEYRING"] == "1"
+
+
+def test_runner_env_allowlist_timeout_knob_set_is_pinned() -> None:
+    """The set of timeout/reaper knobs in ``_RUNNER_ENV_ALLOWLIST`` is exact.
+
+    The propagation test below enumerates these names, which catches a
+    REMOVAL — the lookup would KeyError. It does not catch an ADDITION: a new
+    knob quietly appended to the allowlist would widen the host→runner
+    passthrough with no test failure and nothing to review against.
+
+    This pins the set in both directions. Adding or removing a timeout knob
+    fails here until the expected set is updated deliberately, which is the
+    point: each entry is a decision that a host-set value may cross into the
+    runner, and that decision should not be reachable by accident.
+    """
+    expected = {
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
+        "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
+        "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
+        "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S",
+        "OMNIGENT_GH_TIMEOUT_SECONDS",
+        "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
+        "HARNESS_TURN_TIMEOUT_S",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S",
+    }
+    actual = {name for name in _RUNNER_ENV_ALLOWLIST if "TIMEOUT" in name or "BUSY_WINDOW" in name}
+    assert actual == expected, (
+        "The timeout/reaper knobs in _RUNNER_ENV_ALLOWLIST changed. "
+        f"Unexpectedly added: {sorted(actual - expected)}. "
+        f"Unexpectedly removed: {sorted(expected - actual)}. "
+        "Each entry lets a host-set value cross into the runner — update this "
+        "expected set only alongside a reviewed allowlist change, and cover "
+        "the new name in test_build_runner_env_propagates_reaper_and_turn_timeouts."
+    )
+
+
+def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
+    """The reaper / turn-timeout knobs reach the runner.
+
+    Regression guard: these are read deep inside the runner and the panes it
+    spawns (pane reaper, harness idle reaper, subagent launch deadline, turn
+    watchdogs), but they are SET on the host — a systemd drop-in or the
+    operator's shell. The runner re-execs with a cleared environment, so an
+    unlisted knob is stripped SILENTLY: ``systemctl show`` reports the tuned
+    value on the unit while every runner keeps logging the in-code default.
+    That made a production pane-reaper mitigation inert.
+    """
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "7200",
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "5400",
+        "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S": "15",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S": "20",
+        "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S": "600",
+        "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S": "180",
+        "OMNIGENT_GH_TIMEOUT_SECONDS": "120",
+        "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS": "45",
+        "HARNESS_TURN_TIMEOUT_S": "3600",
+        "HARNESS_TURN_ABSOLUTE_TIMEOUT_S": "14400",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S": "900",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"] == "7200"
+    assert env["OMNIGENT_HARNESS_IDLE_TIMEOUT_S"] == "5400"
+    assert env["OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S"] == "15"
+    assert env["OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S"] == "20"
+    assert env["OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S"] == "600"
+    # Resolved by a sibling change to terminals/pane_reaper.py; allowlisted
+    # here so the knob is not inert the moment that lands.
+    assert env["OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S"] == "180"
+    assert env["OMNIGENT_GH_TIMEOUT_SECONDS"] == "120"
+    assert env["OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS"] == "45"
+    assert env["HARNESS_TURN_TIMEOUT_S"] == "3600"
+    assert env["HARNESS_TURN_ABSOLUTE_TIMEOUT_S"] == "14400"
+    assert env["HARNESS_ACP_PROMPT_TIMEOUT_S"] == "900"
+
+
+def test_build_runner_env_allowlist_is_not_a_blanket_omnigent_passthrough() -> None:
+    """Allowlisting the timeout knobs by name must not open the whole
+    ``OMNIGENT_`` / ``HARNESS_`` namespace.
+
+    The allowlist is the boundary that keeps the host owner's environment out
+    of runners. An arbitrary unlisted var with the same prefix as a knob we DO
+    forward still has to be stripped — otherwise the five explicit literals
+    have quietly become a prefix rule.
+    """
+    base = {
+        "PATH": "/usr/bin:/bin",
+        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "7200",
+        "OMNIGENT_NOT_A_REAL_KNOB": "leaked",
+        "OMNIGENT_SOME_FUTURE_SECRET": "leaked",
+        "HARNESS_NOT_A_REAL_KNOB": "leaked",
+        # Near-misses on names we DO forward: a prefix rule (or a sloppy
+        # startswith) would let these through.
+        "OMNIGENT_HARNESS_IDLE_TIMEOUT": "leaked",
+        "HARNESS_TURN_TIMEOUT": "leaked",
+        "HARNESS_ACP_PROMPT_TIMEOUT_S_EXTRA": "leaked",
+        "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S_EXTRA": "leaked",
+    }
+    env = _build_runner_env(
+        base,
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"] == "7200"
+    assert "OMNIGENT_NOT_A_REAL_KNOB" not in env
+    assert "OMNIGENT_SOME_FUTURE_SECRET" not in env
+    assert "HARNESS_NOT_A_REAL_KNOB" not in env
+    assert "OMNIGENT_HARNESS_IDLE_TIMEOUT" not in env
+    assert "HARNESS_TURN_TIMEOUT" not in env
+    assert "HARNESS_ACP_PROMPT_TIMEOUT_S_EXTRA" not in env
+    assert "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S_EXTRA" not in env
 
 
 # ── host.list_dir handler ───────────────────────────────
