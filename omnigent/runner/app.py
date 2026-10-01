@@ -13639,9 +13639,10 @@ def create_runner_app(
             # codex pane's local status stays a stale "running" after it goes
             # idle and would pin it forever. Trust the in-runner status
             # short-circuit for harnesses whose forwarder runs in-process
-            # (claude/qwen); for codex, fall through to the attached-client +
+            # (claude/qwen); for codex, fall through to the viewer-input +
             # tmux window-activity evidence below, which reflect a genuinely
-            # working pane (its TUI redraws every turn) and go quiet when idle.
+            # working pane (its TUI redraws every turn) and go quiet when idle,
+            # then to the authoritative server status.
             if pane.terminal_name != "codex" and _native_pane_status.get(conv_id) == "running":
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
