@@ -615,3 +615,190 @@ async def test_session_cleanup_clears_both_liveness_ledgers(
 
     assert pane_progress.stream_progress_age_s("conv_ending") is None
     assert "conv_ending" not in probe._samples
+
+
+# ---------------------------------------------------------------------------
+# Composition with #8320 (an attached viewer is busy only on recent input).
+#
+# The liveness signals above are layered onto upstream's viewer model, not in
+# place of it: a viewer that is merely attached must never spare a pane, and
+# neither new signal may read the tmux clients. Otherwise a tab left open
+# overnight pins every idle native stack until the host runs out of memory.
+# ---------------------------------------------------------------------------
+
+
+def _idle_viewer_app(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    conv_id: str,
+) -> tuple[object, TerminalInstance]:
+    """A runner app whose pane has a CLI and a web viewer attached, both idle.
+
+    The CLI client attached (its last keypress) eight hours ago, the web
+    bridge's last event is equally stale, and ``_list_tmux_clients`` reports
+    the attached client — so any code that treated "a client is attached" as
+    busy would spare this pane.
+    """
+    monkeypatch.setattr(native_cost_popup, "_list_tmux_clients", lambda *_args: ["/dev/pts/7"])
+    monkeypatch.setattr(
+        native_cost_popup, "_tmux_last_client_input_at", lambda *_args: time.time() - 8 * 3600.0
+    )
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_pane_pid", lambda *_args: 4242)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    pane_progress.reset_stream_progress()
+    registry = TerminalRegistry()
+    instance = TerminalInstance(
+        name="claude",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    instance._last_client_interaction_at = time.monotonic() - 8 * 3600.0
+    registry._by_conversation[conv_id] = {("claude", "main"): instance}
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    return app, instance
+
+
+async def test_attached_idle_viewer_without_cpu_or_stream_is_reaped(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for #8320: an attached-but-idle viewer does not pin the pane.
+
+    A CLI client and a web viewer are attached, neither has taken input in
+    hours, the pane's subtree is idle (flat CPU ticks) and its stream never
+    progressed. The process- and stream-level signals must not resurrect the
+    "client attached means busy" rule, so the pane is reaped — driven through a
+    real reaper loop, including its pre-teardown re-check.
+    """
+    clock = _FixedClock()
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 5_000, 12: 100})
+    app, _instance = _idle_viewer_app(monkeypatch, tmp_path, "conv_viewed_idle")
+    app.state.native_pane_cpu_probe = pane_cpu.PaneDescendantCpuProbe(clock=clock)
+    pane = PaneRef(
+        "conv_viewed_idle",
+        terminal_resource_id("claude", "main"),
+        "claude",
+        tmp_path / "tmux.sock",
+    )
+
+    busy = app.state.native_pane_reaper._is_busy
+    assert not await busy(pane)  # CPU baseline
+    clock.now += 60.0
+    assert not await busy(pane)  # flat ticks: no CPU evidence either
+
+    reaped: list[str] = []
+    reaper = NativePaneReaper(
+        list_native_panes=lambda: [pane],
+        is_busy=busy,
+        reap=lambda p: _record_reaped(reaped, p),
+        idle_timeout_s=0.0001,
+        reaper_interval_s=0.01,
+    )
+    await reaper._scan_once()  # arms the idle clock
+    await asyncio.sleep(0.01)
+    clock.now += 60.0
+    await reaper._scan_once()  # window elapsed -> reap
+    await reaper.shutdown()
+
+    assert reaped == ["conv_viewed_idle"]
+
+
+async def test_idle_viewer_pane_is_spared_only_by_real_liveness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With an idle viewer attached, only stream, CPU or fresh input spare the pane.
+
+    Proves the new signals compose with #8320 rather than replace it: each one
+    independently flips the verdict to busy, and removing it flips it back.
+    """
+    clock = _FixedClock()
+    ticks = iter([{11: 5_000}, {11: 11_000}, {11: 11_000}])
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: next(ticks))
+    app, instance = _idle_viewer_app(monkeypatch, tmp_path, "conv_viewed_live")
+    app.state.native_pane_cpu_probe = pane_cpu.PaneDescendantCpuProbe(clock=clock)
+    busy = app.state.native_pane_reaper._is_busy
+    pane = PaneRef(
+        "conv_viewed_live",
+        terminal_resource_id("claude", "main"),
+        "claude",
+        tmp_path / "tmux.sock",
+    )
+
+    assert not await busy(pane)  # idle viewer + CPU baseline: not busy
+    # A descendant pinning a core spares it...
+    clock.now += 60.0
+    assert await busy(pane)
+    # ...and once that work stops, the idle viewer alone does not.
+    clock.now += 60.0
+    assert not await busy(pane)
+    # Fresh stream bytes spare it.
+    pane_progress.note_stream_progress("conv_viewed_live")
+    assert await busy(pane)
+    pane_progress.clear_stream_progress("conv_viewed_live")
+    # A fresh web-bridge event (#8320's own signal) still spares it.
+    instance.note_client_interaction()
+    assert await busy(pane)
+
+
+async def test_output_busy_window_env_reaches_the_busy_predicate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S`` changes the predicate's verdict.
+
+    host/connect.py allowlists the knob into the runner env, so it must not be
+    inert: a 10-minute window spares a pane whose stream or tmux output last
+    moved 5 minutes ago, which the 120s default would not. The viewer-input
+    signal deliberately stays on the fixed default, so input 5 minutes old does
+    not spare the pane even under the widened window.
+    """
+    five_min_ago_mono = time.monotonic() - 300.0
+    five_min_ago_wall = time.time() - 300.0
+    window_activity: dict[str, float | None] = {"at": None}
+    input_at: dict[str, float | None] = {"at": None}
+
+    def _build(window: str | None) -> object:
+        if window is None:
+            monkeypatch.delenv("OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S", raising=False)
+        else:
+            monkeypatch.setenv("OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S", window)
+        # The predicate binds the probes by name at app build, so stub first.
+        monkeypatch.setattr(
+            native_cost_popup, "_tmux_window_activity_at", lambda *_args: window_activity["at"]
+        )
+        monkeypatch.setattr(
+            native_cost_popup, "_tmux_last_client_input_at", lambda *_args: input_at["at"]
+        )
+        monkeypatch.setattr(native_cost_popup, "_tmux_pane_pid", lambda *_args: None)
+        monkeypatch.setattr(
+            claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits"
+        )
+        registry = TerminalRegistry()
+        return create_runner_app(
+            terminal_registry=registry,
+            resource_registry=SessionResourceRegistry(terminal_registry=registry),
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+        )
+
+    pane = _pane("conv_window")
+
+    for window, expect_spared in ((None, False), ("600", True)):
+        busy = _build(window).state.native_pane_reaper._is_busy
+        pane_progress.reset_stream_progress()
+        pane_progress.note_stream_progress("conv_window", now=five_min_ago_mono)
+        assert await busy(pane) is expect_spared, f"stream, window={window}"
+        pane_progress.reset_stream_progress()
+        window_activity["at"] = five_min_ago_wall
+        assert await busy(pane) is expect_spared, f"tmux output, window={window}"
+        window_activity["at"] = None
+        input_at["at"] = five_min_ago_wall
+        assert not await busy(pane), f"viewer input, window={window}"
+        input_at["at"] = None
