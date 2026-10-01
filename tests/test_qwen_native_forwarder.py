@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -44,6 +45,7 @@ from omnigent.harnesses.qwen_native.forwarder import (
     _write_state,
     clear_qwen_bridge_state,
 )
+from omnigent.terminals import pane_progress
 
 _AGENT = "qwen-native-ui"
 
@@ -915,3 +917,162 @@ async def test_supervise_restarts_then_propagates_cancel(
 
     assert calls["n"] == 2
     assert sleeps == [1.0]  # initial backoff before the one restart
+
+
+# ---------------------------------------------------------------------------
+# Pane-reaper liveness wiring (issue #1349).
+#
+# The forwarder's stream cursor is the reaper's only token-level evidence that a
+# qwen pane is alive. Two cursors are involved and they must NOT be conflated:
+# ``state.offset`` is the DELIVERY cursor and only advances once the mirror POST
+# succeeds, while the liveness cursor tracks how far the FILE has been read. If
+# liveness were stamped off the delivery cursor, a permanently-failing POST would
+# re-stamp the same bytes on every poll and a dead pane would never be reapable.
+# ---------------------------------------------------------------------------
+
+
+async def _run_forward_loop(
+    bridge: Path,
+    *,
+    until: Callable[[], bool],
+    max_waits: int = 400,
+) -> None:
+    """Drive the real forward loop until *until* holds (bounded), then stop it."""
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(max_waits):
+            if until():
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_forward_loop_records_stream_progress_for_the_pane_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real loop populates the real ledger the pane reaper reads.
+
+    Asserted against ``pane_progress`` itself rather than a stubbed
+    ``note_stream_progress``, so a refactor that severs the wiring fails here
+    instead of passing silently.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    posted: list[str] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        posted.append(item.response_id)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    pane_progress.reset_stream_progress()
+    assert pane_progress.stream_progress_age_s("conv") is None
+
+    await _run_forward_loop(bridge, until=lambda: bool(posted))
+
+    assert posted == ["qwen:u1"]
+    assert pane_progress.stream_progress_age_s("conv") is not None
+    pane_progress.reset_stream_progress()
+
+
+async def test_failed_delivery_stamps_progress_once_then_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: a retry loop over unchanged bytes must let a pane age out.
+
+    ``state.offset`` never advances while delivery fails, so the loop re-reads the
+    same bytes forever. Stamping liveness off that condition renewed the pane's
+    lease on every poll and made a dead pane immortal — worse than the
+    reaped-while-healthy bug the stream signal was added to fix.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    stamps: list[str] = []
+    attempts: list[int] = []
+    monkeypatch.setattr(fwd, "note_stream_progress", lambda sid: stamps.append(sid))
+
+    async def _delivery_fails(*_args: object, **_kwargs: object) -> None:
+        attempts.append(1)
+        raise RuntimeError("mirror endpoint down")
+
+    monkeypatch.setattr(fwd, "_deliver_forward_actions", _delivery_fails)
+
+    # Run until the loop has retried the SAME bytes several times. Driving off
+    # the retry count rather than a wall-clock settle keeps this deterministic:
+    # each failed poll logs a traceback, so the retry cadence is not the poll
+    # interval.
+    await _run_forward_loop(bridge, until=lambda: len(attempts) >= 4, max_waits=2000)
+
+    # The loop really did keep retrying the same bytes...
+    assert len(attempts) >= 4
+    # ...and stamped liveness exactly ONCE for them, so the pane ages out.
+    assert stamps == ["conv"]
+    # The delivery cursor is still parked, which is what made the bug possible.
+    assert _read_state(bridge).offset == 0
+
+
+async def test_growing_file_keeps_stamping_while_delivery_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live generation with a broken mirror must still be spared.
+
+    The distinction is once per NEW BYTE, not once per delivery attempt: qwen
+    still producing tokens is alive even when the mirror endpoint is down.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events = events_file_path(bridge)
+    events.write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    stamps: list[str] = []
+    monkeypatch.setattr(fwd, "note_stream_progress", lambda sid: stamps.append(sid))
+
+    async def _delivery_fails(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("mirror endpoint down")
+
+    monkeypatch.setattr(fwd, "_deliver_forward_actions", _delivery_fails)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(400):
+            if stamps:
+                break
+            await asyncio.sleep(0.005)
+        assert stamps == ["conv"]
+        # qwen keeps generating even though every POST keeps failing.
+        with events.open("ab") as handle:
+            handle.write(_ev_bytes(_asst_ev("a1", [{"type": "text", "text": "still working"}])))
+        for _ in range(400):
+            if len(stamps) > 1:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert stamps == ["conv", "conv"]

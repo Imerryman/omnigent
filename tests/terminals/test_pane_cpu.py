@@ -27,11 +27,11 @@ class _Clock:
 
 def _probe_with(
     monkeypatch: pytest.MonkeyPatch,
-    samples: list[tuple[int, int]],
+    samples: list[dict[int, int]],
     clock: _Clock,
     **kwargs: float,
 ) -> PaneDescendantCpuProbe:
-    """A probe whose subtree sampler yields *samples* in order."""
+    """A probe whose per-pid subtree sampler yields *samples* in order."""
     queue = list(samples)
     monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: queue.pop(0))
     return PaneDescendantCpuProbe(clock=clock, **kwargs)
@@ -45,28 +45,28 @@ def test_first_sample_abstains(monkeypatch: pytest.MonkeyPatch) -> None:
     the whole idle window (twenty scans at the defaults) before it is reapable.
     """
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(5_000, 2)], clock)
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    probe = _probe_with(monkeypatch, [{11: 5_000, 12: 100}], clock)
+    assert probe.is_cpu_active("conv_a", 4242).active is False
 
 
 def test_busy_descendant_is_detected(monkeypatch: pytest.MonkeyPatch) -> None:
     """A descendant pinning a core across the scan interval reads busy."""
     clock = _Clock()
     # 60s later, +6000 ticks == 60 CPU-seconds == 100% of one core.
-    probe = _probe_with(monkeypatch, [(5_000, 2), (11_000, 2)], clock)
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    probe = _probe_with(monkeypatch, [{11: 5_000, 12: 100}, {11: 11_000, 12: 100}], clock)
+    assert probe.is_cpu_active("conv_a", 4242).active is False
     clock.now += 60.0
-    assert probe.is_cpu_active("conv_a", 4242) is True
+    assert probe.is_cpu_active("conv_a", 4242).active is True
 
 
 def test_idle_descendant_below_threshold_is_not_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     """An idle TUI's housekeeping (well under 5% of a core) is not work."""
     clock = _Clock()
     # 60s later, +60 ticks == 0.6 CPU-seconds == 1% of one core.
-    probe = _probe_with(monkeypatch, [(5_000, 2), (5_060, 2)], clock)
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    probe = _probe_with(monkeypatch, [{11: 5_000, 12: 100}, {11: 5_060, 12: 100}], clock)
+    assert probe.is_cpu_active("conv_a", 4242).active is False
     clock.now += 60.0
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    assert probe.is_cpu_active("conv_a", 4242).active is False
 
 
 def test_threshold_is_the_documented_five_percent() -> None:
@@ -77,19 +77,21 @@ def test_threshold_is_the_documented_five_percent() -> None:
 def test_threshold_is_configurable(monkeypatch: pytest.MonkeyPatch) -> None:
     """The same 1%-of-a-core sample reads busy under a 0.5% threshold."""
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(5_000, 2), (5_060, 2)], clock, min_cpu_fraction=0.005)
+    probe = _probe_with(
+        monkeypatch, [{11: 5_000, 12: 100}, {11: 5_060, 12: 100}], clock, min_cpu_fraction=0.005
+    )
     probe.is_cpu_active("conv_a", 4242)
     clock.now += 60.0
-    assert probe.is_cpu_active("conv_a", 4242) is True
+    assert probe.is_cpu_active("conv_a", 4242).active is True
 
 
 def test_no_descendants_is_not_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Nothing under the pane shell (or no ``/proc``) is no evidence of work."""
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(0, 0), (0, 0)], clock)
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    probe = _probe_with(monkeypatch, [{}, {}], clock)
+    assert probe.is_cpu_active("conv_a", 4242).active is False
     clock.now += 60.0
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    assert probe.is_cpu_active("conv_a", 4242).active is False
 
 
 def test_missing_pane_pid_is_not_busy_and_drops_baseline(
@@ -97,33 +99,33 @@ def test_missing_pane_pid_is_not_busy_and_drops_baseline(
 ) -> None:
     """An unresolvable pane pid leaves nothing to measure; the baseline is dropped."""
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(5_000, 2)], clock)
+    probe = _probe_with(monkeypatch, [{11: 5_000, 12: 100}], clock)
     probe.is_cpu_active("conv_a", 4242)
     assert "conv_a" in probe._samples
-    assert probe.is_cpu_active("conv_a", None) is False
+    assert probe.is_cpu_active("conv_a", None).active is False
     assert "conv_a" not in probe._samples
 
 
 def test_tick_total_dropping_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
     """A CPU-heavy descendant exiting shrinks the total; that is not activity."""
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(9_000, 3), (1_000, 1)], clock)
+    probe = _probe_with(monkeypatch, [{11: 9_000}, {11: 1_000}], clock)
     probe.is_cpu_active("conv_a", 4242)
     clock.now += 60.0
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    assert probe.is_cpu_active("conv_a", 4242).active is False
 
 
 def test_zero_elapsed_is_not_busy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Two samples at the same instant yield no rate, so no evidence."""
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(5_000, 2), (99_000, 2)], clock)
+    probe = _probe_with(monkeypatch, [{11: 5_000}, {11: 99_000}], clock)
     probe.is_cpu_active("conv_a", 4242)
-    assert probe.is_cpu_active("conv_a", 4242) is False
+    assert probe.is_cpu_active("conv_a", 4242).active is False
 
 
 def test_forget_drops_the_baseline(monkeypatch: pytest.MonkeyPatch) -> None:
     clock = _Clock()
-    probe = _probe_with(monkeypatch, [(5_000, 2)], clock)
+    probe = _probe_with(monkeypatch, [{11: 5_000, 12: 100}], clock)
     probe.is_cpu_active("conv_a", 4242)
     probe.forget("conv_a")
     assert "conv_a" not in probe._samples
@@ -134,17 +136,17 @@ def test_baselines_are_per_conversation(monkeypatch: pytest.MonkeyPatch) -> None
     clock = _Clock()
     counts = {"conv_hot": [5_000, 11_000], "conv_cold": [5_000, 5_000]}
 
-    def _sample(pid: int) -> tuple[int, int]:
+    def _sample(pid: int) -> dict[int, int]:
         key = "conv_hot" if pid == 1 else "conv_cold"
-        return counts[key].pop(0), 2
+        return {pid * 100: counts[key].pop(0)}
 
     monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", _sample)
     probe = PaneDescendantCpuProbe(clock=clock)
     probe.is_cpu_active("conv_hot", 1)
     probe.is_cpu_active("conv_cold", 2)
     clock.now += 60.0
-    assert probe.is_cpu_active("conv_hot", 1) is True
-    assert probe.is_cpu_active("conv_cold", 2) is False
+    assert probe.is_cpu_active("conv_hot", 1).active is True
+    assert probe.is_cpu_active("conv_cold", 2).active is False
 
 
 def test_subtree_walk_is_node_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -202,10 +204,88 @@ def test_real_descendants_and_cpu_are_observed() -> None:
             time.sleep(0.05)
         assert descendants, "the busy grandchild was not found under the shell"
         probe = PaneDescendantCpuProbe()
-        assert probe.is_cpu_active("conv_real", parent.pid) is False  # baseline
+        assert probe.is_cpu_active("conv_real", parent.pid).active is False  # baseline
         time.sleep(0.5)
-        assert probe.is_cpu_active("conv_real", parent.pid) is True
+        assert probe.is_cpu_active("conv_real", parent.pid).active is True
     finally:
         with contextlib.suppress(OSError):
             os.killpg(os.getpgid(parent.pid), signal.SIGKILL)
         parent.wait(timeout=5)
+
+
+def test_exiting_hot_descendant_does_not_mask_a_working_sibling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-pid clamping: one descendant leaving must not cancel another's work.
+
+    With a single aggregate total, pid 11 (9000 ticks) exiting while pid 12 does
+    60 CPU-seconds of real work nets out NEGATIVE and reads idle.
+    """
+    clock = _Clock()
+    probe = _probe_with(monkeypatch, [{11: 9_000, 12: 100}, {12: 6_100}], clock)
+    probe.is_cpu_active("conv_a", 4242)
+    clock.now += 60.0
+    activity = probe.is_cpu_active("conv_a", 4242)
+    assert activity.active is True
+    assert activity.busiest_pid == 12
+
+
+def test_activity_reports_the_busiest_descendant(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The verdict names the culprit pid and its rate, for the reaper's log line."""
+    clock = _Clock()
+    probe = _probe_with(
+        monkeypatch,
+        [{11: 0, 12: 0}, {11: 600, 12: 5_400}],
+        clock,
+    )
+    probe.is_cpu_active("conv_a", 4242)
+    clock.now += 60.0
+    activity = probe.is_cpu_active("conv_a", 4242)
+    assert activity.active is True
+    assert activity.busiest_pid == 12
+    assert activity.descendants == 2
+    # 6000 ticks / 100 per s / 60s == 100% of a core; pid 12 supplied 90% of it.
+    assert activity.cpu_fraction == pytest.approx(1.0)
+    assert activity.busiest_fraction == pytest.approx(0.9)
+
+
+def test_no_evidence_verdict_carries_no_rate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An abstaining verdict reports no pid and no rate to log."""
+    clock = _Clock()
+    probe = _probe_with(monkeypatch, [{11: 5_000}], clock)
+    activity = probe.is_cpu_active("conv_a", 4242)
+    assert activity == pane_cpu.NO_CPU_ACTIVITY
+    assert activity.busiest_pid is None
+    assert activity.cpu_fraction == 0.0
+
+
+def test_sample_map_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The baseline map evicts oldest-first so it cannot grow without bound.
+
+    ``forget`` covers the reap and session-cleanup paths; this is the backstop for
+    a conversation that vanishes without either.
+    """
+    clock = _Clock()
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 1})
+    probe = PaneDescendantCpuProbe(clock=clock)
+    for index in range(pane_cpu._MAX_TRACKED + 10):
+        clock.now += 1.0
+        probe.is_cpu_active(f"conv_{index}", 4242)
+    assert len(probe._samples) == pane_cpu._MAX_TRACKED
+    assert "conv_0" not in probe._samples
+    assert f"conv_{pane_cpu._MAX_TRACKED + 9}" in probe._samples
+
+
+def test_rescanning_a_conversation_refreshes_its_eviction_position(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A conversation scanned every cycle is never the one evicted."""
+    clock = _Clock()
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 1})
+    probe = PaneDescendantCpuProbe(clock=clock)
+    probe.is_cpu_active("conv_keep", 4242)
+    for index in range(pane_cpu._MAX_TRACKED + 10):
+        clock.now += 1.0
+        probe.is_cpu_active(f"conv_{index}", 4242)
+        probe.is_cpu_active("conv_keep", 4242)
+    assert "conv_keep" in probe._samples
