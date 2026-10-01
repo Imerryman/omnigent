@@ -64,6 +64,7 @@ import httpx
 
 from omnigent.harnesses.qwen_native.bridge import events_file_path
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
+from omnigent.terminals.pane_progress import note_stream_progress
 
 _logger = logging.getLogger(__name__)
 
@@ -500,6 +501,16 @@ async def forward_qwen_events_to_session(
                     state.last_assistant_text,
                     state.last_assistant_stop_reason,
                 )
+                if new_offset != state.offset or actions:
+                    # Stamp BEFORE delivery: new stream bytes are already proof
+                    # that qwen is producing, and the POST below can take up to
+                    # _POST_TIMEOUT_S. This is the pane reaper's token-level
+                    # liveness evidence -- a long autonomous turn goes quiet on
+                    # every output-shaped signal the reaper had, but never on
+                    # this one. Any new bytes count, including records this
+                    # forwarder ignores (control_request/response): they are
+                    # still the harness making progress.
+                    note_stream_progress(session_id)
                 await _deliver_forward_actions(
                     client,
                     session_id=session_id,
