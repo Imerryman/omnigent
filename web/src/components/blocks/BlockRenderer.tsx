@@ -491,14 +491,58 @@ function textLength(items: readonly RenderItem[]): number {
 /**
  * Whether a process-trace text item is worth keeping on screen when the
  * turn's answer doesn't carry it: long enough to be a real write-up, or
- * asking the user something. A `?` counts only before whitespace or the
- * end, so URL query strings don't qualify; short narration ("Let me look
- * at the code.", "Dispatching two sub-agents.") still folds.
+ * asking the user something (`asksQuestion`). Short narration ("Let me
+ * look at the code.", "Dispatching two sub-agents.") still folds.
  */
 function isSubstantialText(item: RenderItem): boolean {
   if (item.kind !== "text") return false;
   const text = item.text.trim();
-  return text.length >= KEPT_TEXT_MIN_CHARS || /\?(\s|$)/.test(text);
+  return text.length >= KEPT_TEXT_MIN_CHARS || asksQuestion(text);
+}
+
+// A `?` that ends a question: optionally closed by Markdown emphasis /
+// code / bracket / quote characters (`**Q?**`, `_Q?_`, `Q?)`, `“Q?”`),
+// then whitespace or the end. A URL query (`?x=1`) is followed by a
+// word character, so it never matches.
+const QUESTION_END = /\?[*_`)\]”"'’]*(?:\s|$)/;
+// A Markdown link target, `](url)` or `](url "title")` — dropped so a
+// linked question (`[Q?](url)`) reads as `[Q?]`.
+const LINK_TARGET = /\]\([^)\s]*(?:\s+"[^"]*")?\)/g;
+// An inline code span: a backtick run closed by a run of the same length.
+const INLINE_CODE = /(`+)[\s\S]*?\1/g;
+
+/**
+ * Whether Markdown text asks a question. Code — fenced blocks and inline
+ * spans — is stripped first: a `?` there is syntax (`a ? b : c`,
+ * `x?.y`), not a question.
+ */
+export function asksQuestion(markdown: string): boolean {
+  const prose = stripFencedCode(markdown).replace(INLINE_CODE, " ").replace(LINK_TARGET, "]");
+  return QUESTION_END.test(prose);
+}
+
+/**
+ * Drop fenced code blocks (``` or ~~~, up to three spaces of indent; an
+ * unclosed fence runs to the end, as CommonMark renders it).
+ */
+function stripFencedCode(markdown: string): string {
+  const kept: string[] = [];
+  let fence: { char: string; length: number } | null = null;
+  for (const line of markdown.split("\n")) {
+    const marker = /^ {0,3}(`{3,}|~{3,})/.exec(line)?.[1];
+    if (fence === null) {
+      if (marker) fence = { char: marker[0]!, length: marker.length };
+      else kept.push(line);
+    } else if (
+      marker &&
+      marker[0] === fence.char &&
+      marker.length >= fence.length &&
+      line.trim() === marker
+    ) {
+      fence = null;
+    }
+  }
+  return kept.join("\n");
 }
 
 // Bookkeeping tools some harnesses append AFTER the turn's final

@@ -4,11 +4,16 @@ import { useChatStore } from "@/store/chatStore";
 import type { Bubble } from "@/lib/renderItems";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import { BubbleView, WorkingIndicator } from "./ChatPage";
+import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import {
   ConnectionIndicator,
   RunnerStartingIndicator,
   SandboxFailedIndicator,
 } from "./ChatIndicators";
+
+// Fork-dialog opener for the per-message "Fork from here" action. Module
+// scope so the provider value is a constant (jsx-no-constructed-context-values).
+const FORK_DIALOG = { canFork: true, openForkDialog: () => {} };
 
 // Render-level coverage for the chat surface's status bands and bubble
 // dispatcher. These exercise the branches that the pure-helper tests can't:
@@ -405,23 +410,42 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 
-  it("keeps copy on a continued turn whose substantial narration stays visible", () => {
+  it("keeps copy and fork on a continued turn whose substantial narration stays visible", () => {
     // WHY: a turn that wrote a long message (or asked questions) and then
     // yielded to await sub-agents used to collapse to a bare "Worked for"
     // row — hiding the message AND its copy/fork actions. The kept text is
     // visible, so the bubble is no longer fold-only.
     const question = "Before I continue: should the reaper also cover idle panes?";
     render(
-      <BubbleView
-        bubble={foldOnlyBubble([
-          { kind: "text", itemId: "t3", text: question, final: false },
-          toolItem("c6"),
-        ])}
-      />,
+      <ForkDialogContextProvider value={FORK_DIALOG}>
+        <BubbleView
+          bubble={foldOnlyBubble([
+            { kind: "text", itemId: "t3", text: question, final: false },
+            toolItem("c6"),
+          ])}
+        />
+      </ForkDialogContextProvider>,
     );
     expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
     expect(screen.getByText(question)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+    expect(screen.getByTestId("fork-from-response")).toBeInTheDocument();
+    cleanup();
+
+    // Contrast: the same continued bubble with only short narration is
+    // still fold-only, so it has no fork action to show.
+    render(
+      <ForkDialogContextProvider value={FORK_DIALOG}>
+        <BubbleView
+          bubble={foldOnlyBubble([
+            { kind: "text", itemId: "t4", text: "Let me look at the code.", final: false },
+            toolItem("c7"),
+          ])}
+        />
+      </ForkDialogContextProvider>,
+    );
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.queryByTestId("fork-from-response")).not.toBeInTheDocument();
   });
 
   it("renders the compacting shimmer for a compaction_loading bubble", () => {
