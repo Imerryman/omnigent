@@ -1006,6 +1006,114 @@ describe("BlockRenderer dispatch", () => {
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
     });
 
+    describe("keeps substantial narration visible above a missing or short answer", () => {
+      // WHY: the fold keeps only the trailing text run. An orchestrator
+      // that wrote a long message (or asked questions), then ran one
+      // more tool and closed with a one-liner — or yielded to await
+      // sub-agents — had that message folded behind "Worked for Xs".
+      const longText =
+        "Here is where things stand. " +
+        "The migration plan has three open decisions that need your call before I continue. ".repeat(
+          4,
+        );
+
+      it("keeps a long message visible when a tool call and a short closing line follow", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Looking into it.", final: true },
+          tool(1),
+          { kind: "text", itemId: "m1", text: longText, final: true },
+          tool(2, "Agent"),
+          { kind: "text", itemId: "m2", text: "Waiting on the reviewer.", final: true },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+        expect(screen.getByText(/three open decisions/)).toBeDefined();
+        expect(screen.getByText("Waiting on the reviewer.")).toBeDefined();
+        // Earlier, non-substantial narration still folds.
+        expect(screen.queryByText("Looking into it.")).toBeNull();
+        // The kept text renders ABOVE the answer, below the fold row.
+        const sections = screen.getAllByTestId("assistant-text-section");
+        expect(sections.map((el) => el.textContent)).toEqual([
+          expect.stringContaining("three open decisions"),
+          "Waiting on the reviewer.",
+        ]);
+        expect(sections[1]).toHaveClass("mt-2");
+
+        // Expanding replays the trace without duplicating the kept text.
+        fireEvent.click(screen.getByText("Worked"));
+        expect(screen.getByText("Looking into it.")).toBeDefined();
+        expect(screen.getAllByText(/three open decisions/)).toHaveLength(1);
+      });
+
+      it("keeps a short question visible when a tool call follows it", () => {
+        const items: RenderItem[] = [
+          {
+            kind: "text",
+            itemId: "m0",
+            text: "Should I target main or the release branch?",
+            final: true,
+          },
+          tool(1),
+          { kind: "text", itemId: "m1", text: "Paused for your answer.", final: true },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+        expect(screen.getByText("Should I target main or the release branch?")).toBeDefined();
+        expect(screen.getByText("Paused for your answer.")).toBeDefined();
+      });
+
+      it("keeps a continued bubble's long message visible instead of folding everything", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: longText, final: true },
+          tool(1, "Agent"),
+          tool(2, "Agent"),
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" continued workedForS={42} />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.getByText("Worked for 42s")).toBeDefined();
+        expect(screen.getByText(/three open decisions/)).toBeDefined();
+        expect(screen.queryByText(/Called 2 tools/)).toBeNull();
+      });
+
+      it("folds the trace as before when the answer is already substantial", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: longText, final: true },
+          tool(1),
+          { kind: "text", itemId: "m1", text: `Final: ${longText}`, final: true },
+        ];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+        expect(screen.getAllByTestId("assistant-text-section")).toHaveLength(1);
+        expect(screen.getByText(/^Final: /)).toBeDefined();
+      });
+
+      it("leaves a pure-tool continued turn folded to the bare Worked row", () => {
+        const items: RenderItem[] = [tool(1, "Agent"), tool(2, "Agent")];
+        render(
+          <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+            <BlockRenderer items={items} sessionStatus="idle" continued />
+          </FileViewerContext.Provider>,
+        );
+        expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+        expect(screen.queryAllByTestId("assistant-text-section")).toHaveLength(0);
+      });
+    });
+
     it("never folds the last assistant bubble while the session is running", async () => {
       // A mid-turn (re)connect can miss the edge that names the turn, so
       // the LIVE turn's lifecycle reads "completed" — folding it made the

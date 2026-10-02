@@ -405,6 +405,25 @@ describe("BubbleView dispatch", () => {
     expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
   });
 
+  it("keeps copy on a continued turn whose substantial narration stays visible", () => {
+    // WHY: a turn that wrote a long message (or asked questions) and then
+    // yielded to await sub-agents used to collapse to a bare "Worked for"
+    // row — hiding the message AND its copy/fork actions. The kept text is
+    // visible, so the bubble is no longer fold-only.
+    const question = "Before I continue: should the reaper also cover idle panes?";
+    render(
+      <BubbleView
+        bubble={foldOnlyBubble([
+          { kind: "text", itemId: "t3", text: question, final: false },
+          toolItem("c6"),
+        ])}
+      />,
+    );
+    expect(screen.getByTestId("turn-worked-fold")).toBeInTheDocument();
+    expect(screen.getByText(question)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Copy" })).toBeInTheDocument();
+  });
+
   it("renders the compacting shimmer for a compaction_loading bubble", () => {
     // WHY: the compaction_loading branch owns the busy slot during context
     // compaction — it must show its own indicator.

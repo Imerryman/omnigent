@@ -23,6 +23,10 @@
 //    routing/dispatch cards stay visible outside the fold; a turn
 //    with no trailing answer (interrupted / failed / tool-only step
 //    bubbles) keeps its trace expanded.
+//
+//    A turn whose trailing answer is missing or short keeps its last
+//    SUBSTANTIAL narration (long, or asking a question) visible outside
+//    the fold, above the answer — see `KEPT_TEXT_MIN_CHARS`.
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -70,6 +74,17 @@ const FOLD_RECENT_MOUNT_DEBOUNCE_MS = 3_000;
 // index.css) with slack — anchoring would otherwise pin the answer
 // below the fold and glide the growing trace off the top.
 const FOLD_EXPAND_ANCHOR_HOLD_MS = 400;
+
+// A trailing answer shorter than this (trimmed chars, summed over its
+// text items) doesn't carry the turn on its own: the turn likely SAID
+// its piece earlier — a long write-up or a set of questions — then ran
+// one more tool, closed with a one-liner, or yielded to await
+// sub-agents. Folding that earlier text hid the orchestrator's
+// questions behind "Worked for Xs". Such a turn keeps its last
+// substantial text item visible (see `isSubstantialText`). 280 is
+// roughly two or three sentences: past a closing line ("Done.",
+// "Waiting on the reviewer."), short of a real answer.
+const KEPT_TEXT_MIN_CHARS = 280;
 
 interface BlockRendererProps {
   items: RenderItem[];
@@ -207,6 +222,10 @@ function hasFoldableShape(
  * Shape and liveness only — no debounce. Across `BlockRenderer`'s settle
  * window the two answers may differ for a beat; on a bubble with no
  * answer to anchor them to, that costs nothing visible.
+ *
+ * A continued bubble that keeps substantial narration visible (see
+ * `TurnPartition.kept`) is NOT fold-only: that text is what copy/fork
+ * act on.
  */
 export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
@@ -214,7 +233,9 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (isOwnTurnLive || possiblyLive) return false;
   const partition = partitionTurn(inputs.items);
   return (
-    hasFoldableShape(inputs.items, partition, inputs.continued) && partition.final.length === 0
+    hasFoldableShape(inputs.items, partition, inputs.continued) &&
+    partition.final.length === 0 &&
+    partition.kept === null
   );
 }
 
@@ -257,7 +278,7 @@ export function BlockRenderer({
   // dead-ends with no answer anywhere, renders expanded — there is
   // nothing to demarcate.
   const partition = partitionTurn(items);
-  const { process, exempt, final, finalStart } = partition;
+  const { process, exempt, kept, final, finalStart } = partition;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
   // firing) flips the session to running — Working shimmer included —
@@ -333,7 +354,13 @@ export function BlockRenderer({
         {exempt.map(({ item, index }) =>
           renderItem(item, index, false, false, false, false, onRetryError),
         )}
-        {renderSequence(final, { liveEdge: false, indexBase: finalStart, onRetryError })}
+        {kept && renderItem(kept.item, kept.index, false, false, false, false, onRetryError)}
+        {renderSequence(final, {
+          liveEdge: false,
+          indexBase: finalStart,
+          followsTextAtStart: kept !== null,
+          onRetryError,
+        })}
       </>
     );
   }
@@ -354,10 +381,16 @@ export function BlockRenderer({
  */
 function renderSequence(
   items: RenderItem[],
-  { liveEdge, suppressReasoningDuration = false, indexBase = 0, onRetryError }: TurnSequenceOptions,
+  {
+    liveEdge,
+    suppressReasoningDuration = false,
+    indexBase = 0,
+    followsTextAtStart = false,
+    onRetryError,
+  }: TurnSequenceOptions,
 ): ReactNode[] {
   const rendered: ReactNode[] = [];
-  let previousRenderedItemWasText = false;
+  let previousRenderedItemWasText = followsTextAtStart;
   const streamingRunStart = liveEdge ? findStreamingRunStart(items) : -1;
   // Reasoning is "currently streaming" iff the turn is live AND this
   // reasoning is the very last item in the bubble. Mirrors the
@@ -431,14 +464,41 @@ interface TurnSequenceOptions {
   liveEdge: boolean;
   suppressReasoningDuration?: boolean;
   indexBase?: number;
+  /** The sequence renders right after a text item (adjacent-text spacing). */
+  followsTextAtStart?: boolean;
   onRetryError?: BlockRendererProps["onRetryError"];
 }
 
 interface TurnPartition {
   process: RenderItem[];
   exempt: { item: RenderItem; index: number }[];
+  /**
+   * Narration lifted out of the trace to stay visible above a missing
+   * or short answer (see `KEPT_TEXT_MIN_CHARS`); null when the answer
+   * carries the turn or no earlier text is substantial.
+   */
+  kept: { item: RenderItem; index: number } | null;
   final: RenderItem[];
   finalStart: number;
+}
+
+function textLength(items: readonly RenderItem[]): number {
+  let n = 0;
+  for (const item of items) if (item.kind === "text") n += item.text.trim().length;
+  return n;
+}
+
+/**
+ * Whether a process-trace text item is worth keeping on screen when the
+ * turn's answer doesn't carry it: long enough to be a real write-up, or
+ * asking the user something. A `?` counts only before whitespace or the
+ * end, so URL query strings don't qualify; short narration ("Let me look
+ * at the code.", "Dispatching two sub-agents.") still folds.
+ */
+function isSubstantialText(item: RenderItem): boolean {
+  if (item.kind !== "text") return false;
+  const text = item.text.trim();
+  return text.length >= KEPT_TEXT_MIN_CHARS || /\?(\s|$)/.test(text);
 }
 
 // Bookkeeping tools some harnesses append AFTER the turn's final
@@ -477,6 +537,13 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * Errors, retries and policy denials DO fold — when the turn still
  * produced an answer they're recovered noise, and a turn that ended
  * on one has no trailing text so it never folds in the first place.
+ *
+ * `kept` lifts one text item out of the process when the answer is
+ * missing or short (< `KEPT_TEXT_MIN_CHARS`): the last substantial
+ * narration before the trailing work, which the fold would otherwise
+ * hide — typically the orchestrator's questions, followed by one more
+ * tool call or a yield to await sub-agents. A turn whose answer is
+ * already substantial partitions exactly as before.
  */
 function partitionTurn(items: RenderItem[]): TurnPartition {
   let end = items.length;
@@ -487,10 +554,23 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
   }
   let finalStart = end;
   while (finalStart > 0 && items[finalStart - 1]!.kind === "text") finalStart -= 1;
+  const final = items.slice(finalStart, end);
+  // A missing or short answer: keep the turn's LAST substantial text
+  // item visible instead of folding it (see `KEPT_TEXT_MIN_CHARS`).
+  let keptIndex = -1;
+  if (textLength(final) < KEPT_TEXT_MIN_CHARS) {
+    for (let i = finalStart - 1; i >= 0; i -= 1) {
+      if (isSubstantialText(items[i]!)) {
+        keptIndex = i;
+        break;
+      }
+    }
+  }
   const process: RenderItem[] = [];
   const exempt: { item: RenderItem; index: number }[] = [];
   for (let i = 0; i < finalStart; i += 1) {
     const item = items[i]!;
+    if (i === keptIndex) continue;
     if (isPendingElicitation(item) || isPersistentToolCard(item) || isInProgressTool(item)) {
       exempt.push({ item, index: i });
     } else {
@@ -498,7 +578,8 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
     }
   }
   process.push(...wrapup);
-  return { process, exempt, final: items.slice(finalStart, end), finalStart };
+  const kept = keptIndex >= 0 ? { item: items[keptIndex]!, index: keptIndex } : null;
+  return { process, exempt, kept, final, finalStart };
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
