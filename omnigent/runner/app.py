@@ -13627,7 +13627,7 @@ def create_runner_app(
                     panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
             return panes
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+        async def _native_pane_is_busy(pane: PaneRef) -> bool | None:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
@@ -13696,19 +13696,21 @@ def create_runner_app(
             # out-of-process forwarder that posts to the server only, so a quiet
             # codex pane may still be mid-turn even though the local map is not
             # "running". Before declaring it reapable, confirm against the
-            # AUTHORITATIVE server status. Fail-safe: a running/waiting status OR
-            # any error/non-200 => treat as busy, so a live turn is never reaped
-            # on doubt. (Runs only for a codex pane already quiet on every local
+            # AUTHORITATIVE server status. A running/waiting status is busy; any
+            # error/non-200 is UNKNOWN (``None``): the reaper neither reaps nor
+            # re-arms the idle clock on it, so a live turn is never reaped on
+            # doubt and one transient GET timeout does not cost a full idle
+            # window. (Runs only for a codex pane already quiet on every local
             # signal, so it is at most one GET per idle codex pane per scan.)
             if pane.terminal_name == "codex":
                 try:
                     resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=5.0)
                     if resp.status_code != 200:
-                        return True
+                        return None
                     if resp.json().get("status") in ("running", "waiting"):
                         return True
                 except Exception:  # noqa: BLE001 - never reap when liveness is unconfirmable
-                    return True
+                    return None
                 # AUTHORITATIVE idle wins, so codex returns here rather than
                 # falling through to the descendant-CPU heuristic below. The
                 # codex app-server is the one component that actually knows
