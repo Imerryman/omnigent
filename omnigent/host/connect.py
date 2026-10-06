@@ -744,6 +744,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         #     OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S   terminals/pane_reaper.py
         #       (resolved by a sibling change; allowlisted here so it is not
         #        inert on arrival)
+        #     OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S
+        #                                          harnesses/claude_native/forwarder.py
         #
         #   (2) Warn and fall back, but negative is MEANINGFUL. Non-numeric
         #   and non-finite (nan/inf) warn and default; ``<= 0`` deliberately
@@ -787,6 +789,7 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
         "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S",
+        "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S",
         "OMNIGENT_GH_TIMEOUT_SECONDS",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
         "HARNESS_TURN_TIMEOUT_S",

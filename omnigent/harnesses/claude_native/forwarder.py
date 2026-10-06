@@ -29,6 +29,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     HookReadResult,
     TranscriptReadResult,
+    advertised_tmux_socket_gone,
     compute_transcript_cumulative_cost,
     read_active_session_id,
     read_bridge_id,
@@ -178,6 +179,14 @@ _SUBAGENT_DROPPED_ITEM_REASON = "sub-agent transcript incomplete: an item could 
 _SUPERVISOR_INITIAL_BACKOFF_S = 1.0
 _SUPERVISOR_MAX_BACKOFF_S = 30.0
 _SUPERVISOR_HEALTHY_UPTIME_S = 60.0
+# Backstop for a forwarder that outlived its pane: once the advertised tmux
+# socket is gone AND the transcript has not changed for this long, the
+# supervisor returns instead of polling a dead bridge dir forever. The window
+# is the grace for records Claude flushes around its exit. ``0`` disables.
+_ORPHAN_TIMEOUT_ENV = "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S"
+_DEFAULT_ORPHAN_TIMEOUT_S = 300.0
+# Spacing between orphan checks (a few stats each), so the poll loop stays cheap.
+_ORPHAN_CHECK_INTERVAL_S = 15.0
 
 # Claude Code hook event names → Omnigent session-status values
 # published on the per-conversation SSE stream. Unmapped events emit
@@ -1162,6 +1171,7 @@ async def forward_claude_transcript_to_session(
     skip_user_messages: bool = False,
     start_at_offset: int | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
+    orphan_watch: _OrphanWatch | None = None,
 ) -> None:
     """
     Tail Claude's JSONL transcript and mirror semantic items into AP.
@@ -1196,7 +1206,10 @@ async def forward_claude_transcript_to_session(
         auth. Required for long-lived remote sessions — Databricks
         OAuth tokens expire after ~1 hour and a static header captured
         at startup would stop authenticating mid-session.
-    :returns: Never normally returns; cancel the task to stop it.
+    :param orphan_watch: Supervisor-owned pane-gone backstop. ``None``
+        (direct callers) never stops on its own.
+    :returns: Only when *orphan_watch* reports the pane gone; otherwise
+        runs until cancelled.
     """
     state = _read_forward_state(bridge_dir)
     hook_state: HookForwardState | None = None
@@ -1555,6 +1568,9 @@ async def forward_claude_transcript_to_session(
                     session_id,
                     extra={"session_id": session_id},
                 )
+            if orphan_watch is not None and orphan_watch.should_exit(time.monotonic()):
+                await _cancel_subagent_forward_task(subagent_task)
+                return
             try:
                 await asyncio.sleep(poll_interval_s)
             except asyncio.CancelledError:
@@ -2981,6 +2997,94 @@ async def _forward_session_cost(
         dedupe.posted_policy_cost = policy_cost
 
 
+def resolve_forwarder_orphan_timeout_s() -> float:
+    """
+    Resolve how long a pane-less forwarder waits on a quiet transcript.
+
+    Honors :envvar:`OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S` (``0``
+    disables the backstop); otherwise :data:`_DEFAULT_ORPHAN_TIMEOUT_S`. An
+    unparseable or negative value logs a warning and falls back to the default.
+
+    :returns: Seconds, e.g. ``300.0``.
+    """
+    raw = os.environ.get(_ORPHAN_TIMEOUT_ENV)
+    if not raw:
+        return _DEFAULT_ORPHAN_TIMEOUT_S
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1.0
+    if not value >= 0:  # also rejects nan
+        _logger.warning(
+            "%s=%r is not a non-negative number; using default %ss",
+            _ORPHAN_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_ORPHAN_TIMEOUT_S,
+        )
+        return _DEFAULT_ORPHAN_TIMEOUT_S
+    return value
+
+
+def _transcript_signature(bridge_dir: Path) -> tuple[str, int, int] | None:
+    """``(path, size, mtime_ns)`` of the hook-reported transcript, or ``None``."""
+    path = read_transcript_path(bridge_dir)
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return (str(path), -1, -1)
+    return (str(path), stat.st_size, stat.st_mtime_ns)
+
+
+@dataclass
+class _OrphanWatch:
+    """
+    Decide when a forwarder has outlived its pane.
+
+    Exits only when BOTH hold: the advertised tmux socket is gone, and the
+    transcript has not changed for ``timeout_s``. A live pane that is merely
+    quiet keeps its socket, and a freshly dead pane still gets the full window
+    to flush its final records, so neither condition alone stops forwarding.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param timeout_s: Quiet-transcript window, e.g. ``300.0``; ``<= 0``
+        disables the backstop.
+    :param last_change_at: Monotonic time the window counts from.
+    """
+
+    bridge_dir: Path
+    timeout_s: float
+    last_change_at: float
+    check_interval_s: float = _ORPHAN_CHECK_INTERVAL_S
+    next_check_at: float = 0.0
+    transcript_signature: tuple[str, int, int] | None = None
+    orphaned: bool = False
+
+    def should_exit(self, now: float) -> bool:
+        """
+        Re-evaluate (at most once per ``check_interval_s``) whether to stop.
+
+        :param now: Current monotonic time.
+        :returns: ``True`` once the forwarder should return; sets ``orphaned``.
+        """
+        if self.timeout_s <= 0 or now < self.next_check_at:
+            return False
+        self.next_check_at = now + self.check_interval_s
+        try:
+            signature = _transcript_signature(self.bridge_dir)
+            if signature != self.transcript_signature:
+                self.transcript_signature = signature
+                self.last_change_at = now
+                return False
+            if now - self.last_change_at < self.timeout_s:
+                return False
+            self.orphaned = advertised_tmux_socket_gone(self.bridge_dir)
+        except OSError:
+            return False
+        return self.orphaned
+
+
 async def _supervisor_sleep(seconds: float) -> None:
     """
     Sleep helper used between forwarder restarts.
@@ -3046,6 +3150,12 @@ async def supervise_forwarder(
     run left off — ``start_at_end`` is only consulted on a cold
     bridge with no persisted cursor.
 
+    Backstop: once the pane's advertised tmux socket is gone and the
+    transcript has been quiet for
+    :func:`resolve_forwarder_orphan_timeout_s`, the forwarder stops and
+    this returns normally (see :class:`_OrphanWatch`), so a forwarder
+    whose pane was torn down without cancelling it cannot poll forever.
+
     :param base_url: Omnigent server base URL, e.g.
         ``"http://localhost:6767"``.
     :param headers: Static HTTP headers for Omnigent requests. Authorization
@@ -3065,9 +3175,17 @@ async def supervise_forwarder(
     :param auth: Optional httpx Auth that mints a fresh bearer token
         per request, e.g. ``_server_auth(profile)``. Forwarded verbatim
         to :func:`forward_claude_transcript_to_session`.
-    :returns: Never normally returns; cancel the task to stop it.
+    :returns: Only once the pane is gone and the transcript is quiet;
+        otherwise runs until cancelled.
     """
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
+    # One watch across restarts, so a crash loop cannot keep resetting the window.
+    orphan_watch = _OrphanWatch(
+        bridge_dir=bridge_dir,
+        timeout_s=resolve_forwarder_orphan_timeout_s(),
+        last_change_at=time.monotonic(),
+        check_interval_s=_ORPHAN_CHECK_INTERVAL_S,
+    )
     while True:
         run_started_at = _supervisor_monotonic()
         crash_exc: Exception | None = None
@@ -3084,19 +3202,32 @@ async def supervise_forwarder(
                 skip_user_messages=skip_user_messages,
                 start_at_offset=start_at_offset,
                 event_dispatcher=event_dispatcher,
+                orphan_watch=orphan_watch,
             )
-            # The forwarder loop is ``while True`` and is not expected
-            # to return normally. Treat any normal return as a crash
-            # and restart.
-            _logger.warning(
-                "Claude transcript forwarder returned unexpectedly; restarting; session=%s",
-                session_id,
-                extra={"session_id": session_id},
-            )
+            # The forwarder loop is ``while True`` and returns normally only
+            # when its pane is gone. Treat any other return as a crash and
+            # restart.
+            if not orphan_watch.orphaned:
+                _logger.warning(
+                    "Claude transcript forwarder returned unexpectedly; restarting; session=%s",
+                    session_id,
+                    extra={"session_id": session_id},
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — supervisor restarts on any Exception
             crash_exc = exc
+        # Also consulted here so a forwarder that crashes before its poll loop
+        # checks cannot restart forever against a dead pane.
+        if orphan_watch.orphaned or orphan_watch.should_exit(time.monotonic()):
+            _logger.info(
+                "Claude transcript forwarder stopping: pane is gone and the "
+                "transcript has been quiet for %.0fs; session=%s",
+                orphan_watch.timeout_s,
+                session_id,
+                extra={"session_id": session_id},
+            )
+            return
         run_duration_s = _supervisor_monotonic() - run_started_at
         if run_duration_s >= _SUPERVISOR_HEALTHY_UPTIME_S:
             backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S

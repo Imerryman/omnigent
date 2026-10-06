@@ -4246,6 +4246,7 @@ def test_runner_env_allowlist_timeout_knob_set_is_pinned() -> None:
         "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
         "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S",
+        "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S",
         "OMNIGENT_GH_TIMEOUT_SECONDS",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
         "HARNESS_TURN_TIMEOUT_S",
@@ -4282,6 +4283,7 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
         "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S": "20",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S": "600",
         "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S": "180",
+        "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S": "900",
         "OMNIGENT_GH_TIMEOUT_SECONDS": "120",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS": "45",
         "HARNESS_TURN_TIMEOUT_S": "3600",
@@ -4304,6 +4306,7 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
     # Resolved by a sibling change to terminals/pane_reaper.py; allowlisted
     # here so the knob is not inert the moment that lands.
     assert env["OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S"] == "180"
+    assert env["OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S"] == "900"
     assert env["OMNIGENT_GH_TIMEOUT_SECONDS"] == "120"
     assert env["OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS"] == "45"
     assert env["HARNESS_TURN_TIMEOUT_S"] == "3600"
