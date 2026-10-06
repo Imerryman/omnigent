@@ -27,10 +27,11 @@ that shell out to tmux or read ``/proc``):
      tmux client (``client_activity``), or any event on the web attach bridge.
      An attached viewer that is merely *present* does NOT count, else a tab left
      open overnight pins the pane (and its MCP fleet) until the host OOMs, OR
-  6. the pane's tmux window emitted output recently, OR
-  7. codex only: the AUTHORITATIVE server status is ``running``/``waiting`` or
-     cannot be confirmed. A confirmed-idle codex verdict is final and skips the
-     next signal, OR
+  6. codex only: the AUTHORITATIVE server status is ``running``/``waiting``.
+     Any other confirmed status is a final idle verdict that skips signals 7 and
+     8 (an idle codex TUI can spin its terminal title forever, which tmux counts
+     as window activity). A failed status check is *unknown*, OR
+  7. the pane's tmux window emitted output recently, OR
   8. the pane's own process subtree has descendants averaging >= 5% of a core
      across two scans (:mod:`omnigent.terminals.pane_cpu`).
 
@@ -40,11 +41,16 @@ process (``mypy .``, a migration, a full test run) produces nothing to see and
 was being reaped while perfectly healthy. It measures the pane's process tree,
 never tmux clients, so an attached-but-idle viewer cannot satisfy it either.
 
-Recency windows: signals 4 and 6 use ``resolve_pane_output_busy_window_s``
+Recency windows: signals 4 and 7 use ``resolve_pane_output_busy_window_s``
 (``OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S``, default 120s); signal 5 always uses the
 fixed :data:`PANE_OUTPUT_BUSY_WINDOW_S`, so widening the knob cannot extend how
 long an idle viewer is honoured. Signals 4 and 8 fail safe to busy (logged) if
 their evidence-gathering raises.
+
+The predicate is tri-state: busy, idle, or unknown (``None``). An unknown scan
+leaves the pane's last-confirmed-busy time untouched and never reaps, so a
+transient status-check failure neither costs a full idle window nor tears down a
+pane whose liveness could not be confirmed.
 
 A pane idle on every signal for longer than the idle window (20 min by default)
 is reaped, with a **second busy re-check immediately before teardown** to close
@@ -213,12 +219,14 @@ class NativePaneReaper:
 
     :param list_native_panes: Returns the currently-live native panes (already
         role-confirmed by the caller) as :class:`PaneRef` values.
-    :param is_busy: ``async`` predicate — ``True`` if any liveness signal in the
-        module docstring's chain fires (in-flight turn, ``running`` status,
-        approval wait, stream progress, recent viewer *input*, tmux output,
-        codex server status, descendant CPU). An attached viewer without recent
-        input is not busy. Async so the blocking tmux and ``/proc`` probes run
-        off the event loop.
+    :param is_busy: ``async`` tri-state predicate — ``True`` if any liveness
+        signal in the module docstring's chain fires (in-flight turn,
+        ``running`` status, approval wait, stream progress, recent viewer
+        *input*, codex server status, tmux output, descendant CPU); ``False``
+        when idle; ``None`` when liveness cannot be confirmed (a failed codex
+        status check). An unknown scan neither re-arms the idle clock nor
+        reaps. An attached viewer without recent input is not busy. Async so
+        the blocking tmux and ``/proc`` probes run off the event loop.
     :param reap: ``async`` pane-scoped teardown — closes only this one native
         terminal, leaving the session resumable.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
@@ -230,7 +238,7 @@ class NativePaneReaper:
         self,
         *,
         list_native_panes: Callable[[], list[PaneRef]],
-        is_busy: Callable[[PaneRef], Awaitable[bool]],
+        is_busy: Callable[[PaneRef], Awaitable[bool | None]],
         reap: Callable[[PaneRef], Awaitable[None]],
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
@@ -269,14 +277,23 @@ class NativePaneReaper:
             self._task = None
         self._started = False
 
-    def _classify(self, now: float, panes: list[PaneRef], busy_convs: set[str]) -> list[PaneRef]:
+    def _classify(
+        self,
+        now: float,
+        panes: list[PaneRef],
+        busy_convs: set[str],
+        unknown_convs: frozenset[str] | set[str] = frozenset(),
+    ) -> list[PaneRef]:
         """Pure idle-clock decision: which panes are reapable right now.
 
-        Given the set of conversation ids observed busy this scan, maintain the
+        Given the conversation ids observed busy this scan, maintain the
         per-conversation idle clock and return the panes idle for at least
         ``idle_timeout_s``. A busy pane re-arms its clock; a newly-observed idle
-        pane gets one full window of grace before it is eligible. No I/O, so it is
-        unit-testable with an injected ``now`` and ``busy_convs``.
+        pane gets one full window of grace before it is eligible. A pane whose
+        liveness was unknown this scan (``unknown_convs``) keeps its clock as is
+        and is never reapable on that scan, so one failed probe neither costs a
+        full idle window nor triggers a teardown. No I/O, so it is unit-testable
+        with an injected ``now`` and ``busy_convs``.
         """
         live: set[str] = set()
         reapable: list[PaneRef] = []
@@ -285,6 +302,8 @@ class NativePaneReaper:
             live.add(conv)
             if conv in busy_convs:
                 self._last_busy_at[conv] = now
+                continue
+            if conv in unknown_convs:
                 continue
             last = self._last_busy_at.get(conv)
             if last is None:
@@ -314,12 +333,23 @@ class NativePaneReaper:
     async def _scan_once(self) -> None:
         panes = self._list_native_panes()
         now = time.monotonic()
-        busy_convs = {p.conversation_id for p in panes if await self._is_busy(p)}
-        for pane in self._classify(now, panes, busy_convs):
+        busy_convs: set[str] = set()
+        unknown_convs: set[str] = set()
+        for p in panes:
+            verdict = await self._is_busy(p)
+            if verdict is None:
+                unknown_convs.add(p.conversation_id)
+            elif verdict:
+                busy_convs.add(p.conversation_id)
+        for pane in self._classify(now, panes, busy_convs, unknown_convs):
             # Re-check immediately before teardown: selection happened above with
             # possibly-stale signals, and a turn / client / autonomous run may
-            # have started since (the select→reap race). Re-arm and skip if so.
-            if await self._is_busy(pane):
+            # have started since (the select→reap race). Re-arm and skip if so;
+            # skip without re-arming if liveness can no longer be confirmed.
+            recheck = await self._is_busy(pane)
+            if recheck is None:
+                continue
+            if recheck:
                 self._last_busy_at[pane.conversation_id] = time.monotonic()
                 continue
             _logger.info(

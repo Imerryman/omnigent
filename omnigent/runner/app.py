@@ -13627,7 +13627,7 @@ def create_runner_app(
                     panes.append(PaneRef(conv_id, terminal_id, name, socket_path))
             return panes
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+        async def _native_pane_is_busy(pane: PaneRef) -> bool | None:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
@@ -13639,10 +13639,8 @@ def create_runner_app(
             # codex pane's local status stays a stale "running" after it goes
             # idle and would pin it forever. Trust the in-runner status
             # short-circuit for harnesses whose forwarder runs in-process
-            # (claude/qwen); for codex, fall through to the viewer-input +
-            # tmux window-activity evidence below, which reflect a genuinely
-            # working pane (its TUI redraws every turn) and go quiet when idle,
-            # then to the authoritative server status.
+            # (claude/qwen); for codex, fall through to the viewer-input
+            # evidence below, then to the authoritative server status.
             if pane.terminal_name != "codex" and _native_pane_status.get(conv_id) == "running":
                 return True
             # A pane parked on a permission prompt emits nothing and reports no
@@ -13683,6 +13681,36 @@ def create_runner_app(
                 PANE_OUTPUT_BUSY_WINDOW_S
             ):
                 return True
+            # Codex: its _native_pane_status is fed by an out-of-process
+            # forwarder that posts to the server only, so ask the AUTHORITATIVE
+            # server status instead. It runs BEFORE the tmux output clock: an
+            # idle codex TUI can keep a stuck spinner in its terminal title,
+            # and tmux counts every title write as window activity, so the
+            # clock would read busy forever on an unchanged screen. A
+            # running/waiting status is busy; any error/non-200 is UNKNOWN
+            # (``None``): the reaper neither reaps nor re-arms the idle clock on
+            # it, so a live turn is never reaped on doubt and one transient GET
+            # timeout does not cost a full idle window. (At most one GET per
+            # codex pane per scan, after every cheaper signal above.)
+            if pane.terminal_name == "codex":
+                try:
+                    resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=5.0)
+                    if resp.status_code != 200:
+                        return None
+                    if resp.json().get("status") in ("running", "waiting"):
+                        return True
+                except Exception:  # noqa: BLE001 - never reap when liveness is unconfirmable
+                    return None
+                # AUTHORITATIVE idle wins, so codex returns here rather than
+                # falling through to the output clock and the descendant-CPU
+                # heuristic below. The codex app-server is the one component
+                # that actually knows whether this session has a turn in flight;
+                # output and CPU are proxies for that question. Letting a proxy
+                # override a confirmed-idle verdict would make a codex pane with
+                # a spinning title or a runaway descendant (a wedged MCP server,
+                # a polling sidecar) immortal -- the orphan pileup this reaper
+                # exists to prevent.
+                return False
             # Primary evidence: tmux stamps window_activity on every byte the
             # pane emits, so a producing terminal stays busy even when the
             # status pipeline above has silently stalled (a stalled forwarder
@@ -13692,36 +13720,6 @@ def create_runner_app(
             )
             if activity_at is not None and time.time() - activity_at < _pane_output_busy_window_s:
                 return True
-            # Belt-and-suspenders for codex: its _native_pane_status is fed by an
-            # out-of-process forwarder that posts to the server only, so a quiet
-            # codex pane may still be mid-turn even though the local map is not
-            # "running". Before declaring it reapable, confirm against the
-            # AUTHORITATIVE server status. Fail-safe: a running/waiting status OR
-            # any error/non-200 => treat as busy, so a live turn is never reaped
-            # on doubt. (Runs only for a codex pane already quiet on every local
-            # signal, so it is at most one GET per idle codex pane per scan.)
-            if pane.terminal_name == "codex":
-                try:
-                    resp = await server_client.get(f"/v1/sessions/{conv_id}", timeout=5.0)
-                    if resp.status_code != 200:
-                        return True
-                    if resp.json().get("status") in ("running", "waiting"):
-                        return True
-                except Exception:  # noqa: BLE001 - never reap when liveness is unconfirmable
-                    return True
-                # AUTHORITATIVE idle wins, so codex returns here rather than
-                # falling through to the descendant-CPU heuristic below. The
-                # codex app-server is the one component that actually knows
-                # whether this session has a turn in flight; CPU is a proxy for
-                # that question. Letting the proxy override a confirmed-idle
-                # verdict would make a codex pane with a runaway descendant (a
-                # wedged MCP server, a polling sidecar) immortal while it burns
-                # CPU -- the orphan pileup this reaper exists to prevent. Codex
-                # loses nothing by skipping the CPU signal: it is the only
-                # harness with an authoritative answer, which is strictly better
-                # evidence. This also keeps codex's verdict byte-identical to
-                # before the CPU signal was added.
-                return False
             # CHILD-PROCESS liveness. Every signal above is output-shaped: they
             # all answer "did something appear recently?". A worker blocked
             # inside ONE long silent child -- ``mypy .``, ``alembic upgrade
@@ -13784,7 +13782,13 @@ def create_runner_app(
                 # down in ``finally`` so an idle-reaped codex session can't orphan
                 # a ``codex app-server`` for the runner's lifetime even when the
                 # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                try:
+                    await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                finally:
+                    # Every other harness's forwarder outlives its pane too (the
+                    # claude one restarts forever, polling the dead bridge dir).
+                    # Idempotent, and a no-op once the codex teardown cancelled it.
+                    await _cancel_auto_forwarder_task(pane.conversation_id)
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,

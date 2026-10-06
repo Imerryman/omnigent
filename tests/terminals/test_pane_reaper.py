@@ -7,7 +7,9 @@ import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -42,12 +44,13 @@ class _Fakes:
         self.panes: list[PaneRef] = []
         self.busy: set[str] = set()
         self.reaped: list[str] = []
-        # Optional per-call override: (pane, call_index) -> bool. Lets a test make
-        # is_busy answer differently on the classify pass vs the re-check pass.
-        self.busy_override: Callable[[PaneRef, int], bool] | None = None
+        # Optional per-call override: (pane, call_index) -> bool | None (None is
+        # "unknown"). Lets a test make is_busy answer differently on the
+        # classify pass vs the re-check pass.
+        self.busy_override: Callable[[PaneRef, int], bool | None] | None = None
         self.busy_calls = 0
 
-    async def is_busy(self, pane: PaneRef) -> bool:
+    async def is_busy(self, pane: PaneRef) -> bool | None:
         self.busy_calls += 1
         if self.busy_override is not None:
             return self.busy_override(pane, self.busy_calls)
@@ -108,6 +111,30 @@ def test_classify_forgets_gone_panes() -> None:
     assert "conv_a" not in r._last_busy_at
 
 
+def test_classify_unknown_leaves_clock_untouched() -> None:
+    """An unknown scan neither re-arms the idle clock nor makes the pane reapable."""
+    f = _Fakes()
+    p = _pane("conv_a")
+    r = _make(f, timeout=10.0)
+    r._classify(0.0, [p], busy_convs={"conv_a"})
+    # Long past the window, but liveness could not be confirmed: no reap, no re-arm.
+    assert r._classify(1000.0, [p], busy_convs=set(), unknown_convs={"conv_a"}) == []
+    assert r._last_busy_at["conv_a"] == 0.0
+    # The next confirmed-idle scan judges against the last CONFIRMED busy time.
+    assert r._classify(1001.0, [p], busy_convs=set()) == [p]
+
+
+def test_classify_unknown_first_observation_seeds_nothing() -> None:
+    f = _Fakes()
+    p = _pane("conv_a")
+    r = _make(f, timeout=10.0)
+    assert r._classify(0.0, [p], busy_convs=set(), unknown_convs={"conv_a"}) == []
+    assert "conv_a" not in r._last_busy_at
+    r._classify(5.0, [p], busy_convs=set())  # first confirmed idle: grace starts here
+    assert r._classify(14.0, [p], busy_convs=set()) == []
+    assert r._classify(15.0, [p], busy_convs=set()) == [p]
+
+
 # ── Scan behaviour (_scan_once): reap, skip-busy, TOCTOU re-check ────────────
 
 
@@ -146,6 +173,35 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
     await r._scan_once()
     assert f.reaped == []  # spared by the re-check
     assert f.busy_calls == 2  # classify + re-check
+
+
+async def test_scan_unknown_neither_reaps_nor_rearms() -> None:
+    """A failed liveness probe on the selection pass spares the pane, clock intact."""
+    f = _Fakes()
+    p = _pane("conv_a")
+    f.panes = [p]
+    f.busy_override = lambda pane, n: None
+    r = _make(f, timeout=10.0)
+    stale = time.monotonic() - 1000
+    r._last_busy_at["conv_a"] = stale
+    await r._scan_once()
+    assert f.reaped == []
+    assert r._last_busy_at["conv_a"] == stale
+
+
+async def test_scan_recheck_unknown_skips_without_rearming() -> None:
+    """Idle at selection but unconfirmable at the pre-reap re-check: no teardown."""
+    f = _Fakes()
+    p = _pane("conv_a")
+    f.panes = [p]
+    f.busy_override = lambda pane, n: False if n == 1 else None
+    r = _make(f, timeout=10.0)
+    stale = time.monotonic() - 1000
+    r._last_busy_at["conv_a"] = stale
+    await r._scan_once()
+    assert f.reaped == []
+    assert f.busy_calls == 2
+    assert r._last_busy_at["conv_a"] == stale
 
 
 # ── Env resolver ────────────────────────────────────────────────────────────
@@ -328,6 +384,8 @@ def _silent_pane_app(
     tmp_path: Path,
     *,
     pane_pid: int | None = 4242,
+    server_client: NullServerClient | None = None,
+    window_activity_at: Callable[..., float | None] = lambda *_args: None,
 ) -> object:
     """A runner app whose panes are silent on every pre-existing busy signal.
 
@@ -335,7 +393,7 @@ def _silent_pane_app(
     no ``running`` status — so whatever the new signals say is the whole answer.
     """
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
-    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", window_activity_at)
     monkeypatch.setattr(native_cost_popup, "_tmux_pane_pid", lambda *_args: pane_pid)
     monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
     pane_progress.reset_stream_progress()
@@ -343,7 +401,7 @@ def _silent_pane_app(
     return create_runner_app(
         terminal_registry=registry,
         resource_registry=SessionResourceRegistry(terminal_registry=registry),
-        server_client=NullServerClient(),  # type: ignore[arg-type]
+        server_client=server_client or NullServerClient(),  # type: ignore[arg-type]
     )
 
 
@@ -802,3 +860,190 @@ async def test_output_busy_window_env_reaches_the_busy_predicate(
         input_at["at"] = five_min_ago_wall
         assert not await busy(pane), f"viewer input, window={window}"
         input_at["at"] = None
+
+
+async def test_reaped_claude_pane_leaves_no_forwarder_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaping a non-codex pane cancels its transcript forwarder.
+
+    The codex teardown helper is a no-op for every other harness, and the claude
+    forwarder restarts forever, so without an explicit cancel each reaped claude
+    pane left a task polling its dead bridge dir for the runner's lifetime.
+    """
+    from omnigent.runner.native import orchestration
+
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    reaper = app.state.native_pane_reaper
+    parked = asyncio.Event()
+
+    async def _forwarder() -> None:
+        parked.set()
+        await asyncio.Event().wait()
+
+    task: asyncio.Task[object] = asyncio.create_task(_forwarder())
+    orchestration._register_auto_forwarder_task("conv_reaped_claude", task)
+    try:
+        await parked.wait()
+        await reaper._reap(_pane("conv_reaped_claude", "claude"))
+
+        assert task.cancelled()
+        assert "conv_reaped_claude" not in orchestration._AUTO_FORWARDER_TASKS
+        # Idempotent: a second reap with nothing registered is a no-op.
+        await reaper._reap(_pane("conv_reaped_claude", "claude"))
+    finally:
+        task.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_reaped_claude", None)
+
+
+class _SessionStatusClient(NullServerClient):
+    """Server client whose session GET answers with a scripted outcome.
+
+    ``outcome`` is a status string (a 200 carrying that status), an int (that
+    HTTP status with an empty body), or an exception to raise.
+    """
+
+    def __init__(self) -> None:
+        self.outcome: str | int | Exception = "idle"
+
+    async def get(self, url: str, **kwargs: object) -> object:  # type: ignore[override]
+        del url, kwargs
+        outcome = self.outcome
+        if isinstance(outcome, Exception):
+            raise outcome
+        status_code = outcome if isinstance(outcome, int) else 200
+        body = {} if isinstance(outcome, int) else {"status": outcome}
+        return SimpleNamespace(status_code=status_code, json=lambda: body)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "verdict"),
+    [
+        ("idle", False),
+        ("running", True),
+        ("waiting", True),
+        (503, None),
+        (httpx.ReadError("connection reset"), None),
+        (httpx.ConnectTimeout("timed out"), None),
+    ],
+)
+async def test_codex_status_check_is_tri_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str | int | Exception,
+    verdict: bool | None,
+) -> None:
+    """A failed codex status check is unknown, never busy and never idle."""
+    client = _SessionStatusClient()
+    client.outcome = outcome
+    app = _silent_pane_app(monkeypatch, tmp_path, server_client=client)
+
+    assert await app.state.native_pane_reaper._is_busy(_pane("conv_codex", "codex")) is verdict
+
+
+async def test_status_check_failures_do_not_reset_the_idle_clock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Periodic GET failures neither re-arm the idle clock nor trigger a reap.
+
+    Treating a failed check as busy re-armed the clock, so a codex session idle
+    for well past the window survived ~1.6h on bursts of ReadError and
+    ConnectTimeout. The first scan that confirms idle must reap it.
+    """
+    client = _SessionStatusClient()
+    app = _silent_pane_app(monkeypatch, tmp_path, server_client=client)
+    pane = _pane("conv_flaky", "codex")
+    reaped: list[str] = []
+    reaper = NativePaneReaper(
+        list_native_panes=lambda: [pane],
+        is_busy=app.state.native_pane_reaper._is_busy,
+        reap=lambda p: _record_reaped(reaped, p),
+        idle_timeout_s=600.0,
+        reaper_interval_s=0.01,
+    )
+    stale = time.monotonic() - 3600.0
+    reaper._last_busy_at["conv_flaky"] = stale
+
+    for failure in (httpx.ReadError("reset"), httpx.ConnectTimeout("slow"), 502):
+        client.outcome = failure
+        await reaper._scan_once()
+        assert reaped == []
+        assert reaper._last_busy_at["conv_flaky"] == stale
+
+    client.outcome = "idle"
+    await reaper._scan_once()
+    assert reaped == ["conv_flaky"]
+
+
+def _spinning_title(*_args: object) -> float:
+    """tmux's window_activity for a pane whose title spinner writes ~20x a second."""
+    return time.time()
+
+
+async def test_idle_codex_pane_with_spinning_title_is_reapable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server's idle verdict beats tmux's activity clock for codex.
+
+    An idle codex TUI can keep a stuck braille spinner in its terminal title.
+    tmux counts each title write as window activity, so the pane looked busy
+    forever on a byte-identical screen while the server reported it idle.
+    """
+    client = _SessionStatusClient()
+    client.outcome = "idle"
+    app = _silent_pane_app(
+        monkeypatch, tmp_path, server_client=client, window_activity_at=_spinning_title
+    )
+    busy = app.state.native_pane_reaper._is_busy
+    pane = _pane("conv_spinner", "codex")
+
+    assert await busy(pane) is False
+    reaped: list[str] = []
+    reaper = NativePaneReaper(
+        list_native_panes=lambda: [pane],
+        is_busy=busy,
+        reap=lambda p: _record_reaped(reaped, p),
+        idle_timeout_s=0.0001,
+        reaper_interval_s=0.01,
+    )
+    await reaper._scan_once()  # arms the idle clock
+    await asyncio.sleep(0.01)
+    await reaper._scan_once()  # window elapsed -> reap
+    assert reaped == ["conv_spinner"]
+
+
+@pytest.mark.parametrize(
+    ("status", "verdict"),
+    [("running", True), ("waiting", True), (httpx.ReadError("reset"), None)],
+)
+async def test_codex_pane_server_reports_working_stays_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str | Exception,
+    verdict: bool | None,
+) -> None:
+    """With the same fresh output, codex follows its server, not the clock."""
+    client = _SessionStatusClient()
+    client.outcome = status
+    app = _silent_pane_app(
+        monkeypatch, tmp_path, server_client=client, window_activity_at=_spinning_title
+    )
+
+    assert await app.state.native_pane_reaper._is_busy(_pane("conv_working", "codex")) is verdict
+
+
+async def test_output_clock_still_spares_non_codex_panes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only codex defers to its server; other harnesses keep the output signal."""
+    client = _SessionStatusClient()
+    client.outcome = "idle"
+    app = _silent_pane_app(
+        monkeypatch, tmp_path, server_client=client, window_activity_at=_spinning_title
+    )
+
+    assert await app.state.native_pane_reaper._is_busy(_pane("conv_claude", "claude")) is True
