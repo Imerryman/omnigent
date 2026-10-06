@@ -7684,7 +7684,13 @@ def create_runner_app(
                 # down in ``finally`` so an idle-reaped codex session can't orphan
                 # a ``codex app-server`` for the runner's lifetime even when the
                 # pane close above partially fails (the very leak this guards).
-                await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                try:
+                    await _native_runtime.teardown_codex_native_app_server(pane.conversation_id)
+                finally:
+                    # Every other harness's forwarder outlives its pane too (the
+                    # claude one restarts forever, polling the dead bridge dir).
+                    # Idempotent, and a no-op once the codex teardown cancelled it.
+                    await _cancel_auto_forwarder_task(pane.conversation_id)
                 _publish_terminal_deleted_event(
                     conversation_id=pane.conversation_id,
                     terminal_name=pane.terminal_name,
