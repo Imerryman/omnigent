@@ -385,6 +385,7 @@ def _silent_pane_app(
     *,
     pane_pid: int | None = 4242,
     server_client: NullServerClient | None = None,
+    window_activity_at: Callable[..., float | None] = lambda *_args: None,
 ) -> object:
     """A runner app whose panes are silent on every pre-existing busy signal.
 
@@ -392,7 +393,7 @@ def _silent_pane_app(
     no ``running`` status — so whatever the new signals say is the whole answer.
     """
     monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
-    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", window_activity_at)
     monkeypatch.setattr(native_cost_popup, "_tmux_pane_pid", lambda *_args: pane_pid)
     monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
     pane_progress.reset_stream_progress()
@@ -974,3 +975,75 @@ async def test_status_check_failures_do_not_reset_the_idle_clock(
     client.outcome = "idle"
     await reaper._scan_once()
     assert reaped == ["conv_flaky"]
+
+
+def _spinning_title(*_args: object) -> float:
+    """tmux's window_activity for a pane whose title spinner writes ~20x a second."""
+    return time.time()
+
+
+async def test_idle_codex_pane_with_spinning_title_is_reapable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The server's idle verdict beats tmux's activity clock for codex.
+
+    An idle codex TUI can keep a stuck braille spinner in its terminal title.
+    tmux counts each title write as window activity, so the pane looked busy
+    forever on a byte-identical screen while the server reported it idle.
+    """
+    client = _SessionStatusClient()
+    client.outcome = "idle"
+    app = _silent_pane_app(
+        monkeypatch, tmp_path, server_client=client, window_activity_at=_spinning_title
+    )
+    busy = app.state.native_pane_reaper._is_busy
+    pane = _pane("conv_spinner", "codex")
+
+    assert await busy(pane) is False
+    reaped: list[str] = []
+    reaper = NativePaneReaper(
+        list_native_panes=lambda: [pane],
+        is_busy=busy,
+        reap=lambda p: _record_reaped(reaped, p),
+        idle_timeout_s=0.0001,
+        reaper_interval_s=0.01,
+    )
+    await reaper._scan_once()  # arms the idle clock
+    await asyncio.sleep(0.01)
+    await reaper._scan_once()  # window elapsed -> reap
+    assert reaped == ["conv_spinner"]
+
+
+@pytest.mark.parametrize(
+    ("status", "verdict"),
+    [("running", True), ("waiting", True), (httpx.ReadError("reset"), None)],
+)
+async def test_codex_pane_server_reports_working_stays_busy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str | Exception,
+    verdict: bool | None,
+) -> None:
+    """With the same fresh output, codex follows its server, not the clock."""
+    client = _SessionStatusClient()
+    client.outcome = status
+    app = _silent_pane_app(
+        monkeypatch, tmp_path, server_client=client, window_activity_at=_spinning_title
+    )
+
+    assert await app.state.native_pane_reaper._is_busy(_pane("conv_working", "codex")) is verdict
+
+
+async def test_output_clock_still_spares_non_codex_panes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only codex defers to its server; other harnesses keep the output signal."""
+    client = _SessionStatusClient()
+    client.outcome = "idle"
+    app = _silent_pane_app(
+        monkeypatch, tmp_path, server_client=client, window_activity_at=_spinning_title
+    )
+
+    assert await app.state.native_pane_reaper._is_busy(_pane("conv_claude", "claude")) is True
