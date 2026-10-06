@@ -27,10 +27,11 @@ that shell out to tmux or read ``/proc``):
      tmux client (``client_activity``), or any event on the web attach bridge.
      An attached viewer that is merely *present* does NOT count, else a tab left
      open overnight pins the pane (and its MCP fleet) until the host OOMs, OR
-  6. the pane's tmux window emitted output recently, OR
-  7. codex only: the AUTHORITATIVE server status is ``running``/``waiting``. A
-     failed status check is *unknown*; a confirmed-idle codex verdict is final
-     and skips the next signal, OR
+  6. codex only: the AUTHORITATIVE server status is ``running``/``waiting``.
+     Any other confirmed status is a final idle verdict that skips signals 7 and
+     8 (an idle codex TUI can spin its terminal title forever, which tmux counts
+     as window activity). A failed status check is *unknown*, OR
+  7. the pane's tmux window emitted output recently, OR
   8. the pane's own process subtree has descendants averaging >= 5% of a core
      across two scans (:mod:`omnigent.terminals.pane_cpu`).
 
@@ -40,7 +41,7 @@ process (``mypy .``, a migration, a full test run) produces nothing to see and
 was being reaped while perfectly healthy. It measures the pane's process tree,
 never tmux clients, so an attached-but-idle viewer cannot satisfy it either.
 
-Recency windows: signals 4 and 6 use ``resolve_pane_output_busy_window_s``
+Recency windows: signals 4 and 7 use ``resolve_pane_output_busy_window_s``
 (``OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S``, default 120s); signal 5 always uses the
 fixed :data:`PANE_OUTPUT_BUSY_WINDOW_S`, so widening the knob cannot extend how
 long an idle viewer is honoured. Signals 4 and 8 fail safe to busy (logged) if
