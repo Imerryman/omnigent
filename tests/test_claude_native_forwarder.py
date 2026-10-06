@@ -38,6 +38,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_active_session_id,
     record_hook_event,
     write_active_session_id,
+    write_tmux_target,
 )
 from omnigent.harnesses.claude_native.forwarder import (
     CompactionForwardState,
@@ -54,6 +55,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     forward_claude_transcript_to_session,
 )
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, EFFORT_CLEAR_VALUES
+from tests.budgets import budget
 
 
 @pytest.fixture(autouse=True)
@@ -11875,3 +11877,224 @@ async def test_timed_out_batch_is_split_not_dropped(
     updated = checkpoint.state.subagents["split"]
     assert updated.byte_offset == 30
     assert updated.seen_source_ids == tuple(item.source_id for item in items)
+
+
+# ---------------------------------------------------------------------------
+# Pane-gone backstop: a forwarder whose pane was torn down without cancelling
+# it must stop on its own, but never while the pane lives or right after it
+# dies (the window that lets Claude's final records still be mirrored).
+# ---------------------------------------------------------------------------
+
+
+def _orphan_bridge(tmp_path: Path, *, socket_alive: bool) -> tuple[Path, Path, Path]:
+    """
+    Build a bridge dir with a hook-reported transcript and an advertised pane.
+
+    :param tmp_path: Per-test temp directory.
+    :param socket_alive: Whether the advertised tmux socket exists.
+    :returns: ``(bridge_dir, transcript_path, socket_path)``.
+    """
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": "claude-session",
+            "transcript_path": str(transcript_path),
+        },
+    )
+    socket_path = tmp_path / "pane" / "tmux.sock"
+    if socket_alive:
+        socket_path.parent.mkdir()
+        socket_path.touch()
+    write_tmux_target(bridge_dir, socket_path=socket_path, tmux_target="claude:0.0")
+    return bridge_dir, transcript_path, socket_path
+
+
+def _watch(bridge_dir: Path, *, timeout_s: float = 300.0) -> forwarder._OrphanWatch:
+    return forwarder._OrphanWatch(
+        bridge_dir=bridge_dir, timeout_s=timeout_s, last_change_at=0.0, check_interval_s=15.0
+    )
+
+
+def test_orphan_watch_exits_once_pane_gone_and_transcript_quiet(tmp_path: Path) -> None:
+    bridge_dir, _transcript, _socket = _orphan_bridge(tmp_path, socket_alive=False)
+    watch = _watch(bridge_dir)
+
+    assert not watch.should_exit(0.0)  # first look records the transcript
+    assert not watch.should_exit(299.0)  # pane gone, but still inside the window
+    assert not watch.should_exit(305.0)  # throttled: next check is due at 314
+    assert watch.should_exit(315.0)
+    assert watch.orphaned
+
+
+def test_orphan_watch_never_stops_a_quiet_live_pane(tmp_path: Path) -> None:
+    bridge_dir, _transcript, _socket = _orphan_bridge(tmp_path, socket_alive=True)
+    watch = _watch(bridge_dir)
+
+    for now in (0.0, 600.0, 86_400.0):
+        assert not watch.should_exit(now)
+    assert not watch.orphaned
+
+
+def test_orphan_watch_keeps_tailing_a_transcript_written_after_pane_death(
+    tmp_path: Path,
+) -> None:
+    bridge_dir, transcript, _socket = _orphan_bridge(tmp_path, socket_alive=False)
+    watch = _watch(bridge_dir)
+
+    assert not watch.should_exit(0.0)
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write('{"type": "assistant"}\n')
+    assert not watch.should_exit(290.0)  # late record: the window restarts here
+    assert not watch.should_exit(580.0)  # 290s since the late record
+    assert watch.should_exit(600.0)
+
+
+def test_orphan_watch_needs_positive_evidence_the_pane_is_gone(tmp_path: Path) -> None:
+    """No advertised pane (e.g. a CLI-side forwarder) is not proof of death."""
+    bridge_dir, _transcript, _socket = _orphan_bridge(tmp_path, socket_alive=False)
+    (bridge_dir / "tmux.json").unlink()
+    watch = _watch(bridge_dir)
+
+    for now in (0.0, 600.0, 86_400.0):
+        assert not watch.should_exit(now)
+
+
+def test_orphan_watch_zero_timeout_disables_it(tmp_path: Path) -> None:
+    bridge_dir, _transcript, _socket = _orphan_bridge(tmp_path, socket_alive=False)
+    watch = _watch(bridge_dir, timeout_s=0.0)
+
+    for now in (0.0, 600.0, 86_400.0):
+        assert not watch.should_exit(now)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, forwarder._DEFAULT_ORPHAN_TIMEOUT_S),
+        ("60", 60.0),
+        ("0", 0.0),
+        ("abc", forwarder._DEFAULT_ORPHAN_TIMEOUT_S),
+        ("-5", forwarder._DEFAULT_ORPHAN_TIMEOUT_S),
+        ("nan", forwarder._DEFAULT_ORPHAN_TIMEOUT_S),
+    ],
+)
+def test_resolve_forwarder_orphan_timeout(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    if raw is None:
+        monkeypatch.delenv(forwarder._ORPHAN_TIMEOUT_ENV, raising=False)
+    else:
+        monkeypatch.setenv(forwarder._ORPHAN_TIMEOUT_ENV, raw)
+    assert forwarder.resolve_forwarder_orphan_timeout_s() == expected
+
+
+@pytest.mark.asyncio
+async def test_supervise_forwarder_returns_instead_of_restarting_when_orphaned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call_count = 0
+
+    async def fake_forwarder(*, orphan_watch: forwarder._OrphanWatch, **_: Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        orphan_watch.orphaned = True
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(forwarder, "forward_claude_transcript_to_session", fake_forwarder)
+    monkeypatch.setattr(forwarder, "_supervisor_sleep", fake_sleep)
+
+    await forwarder.supervise_forwarder(**_supervisor_kwargs(tmp_path))
+
+    assert call_count == 1
+    assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_supervise_forwarder_crash_loop_stops_for_a_dead_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forwarder that crashes before its poll loop still stops once orphaned."""
+    bridge_dir, _transcript, _socket = _orphan_bridge(tmp_path, socket_alive=False)
+    monkeypatch.setenv(forwarder._ORPHAN_TIMEOUT_ENV, "0.05")
+    monkeypatch.setattr(forwarder, "_ORPHAN_CHECK_INTERVAL_S", 0.0)
+    call_count = 0
+
+    async def crashing_forwarder(**_: Any) -> None:
+        nonlocal call_count
+        call_count += 1
+        raise RuntimeError("setup failed")
+
+    async def short_sleep(_seconds: float) -> None:
+        await asyncio.sleep(0.02)
+
+    monkeypatch.setattr(forwarder, "forward_claude_transcript_to_session", crashing_forwarder)
+    monkeypatch.setattr(forwarder, "_supervisor_sleep", short_sleep)
+
+    await asyncio.wait_for(
+        forwarder.supervise_forwarder(
+            **{**_supervisor_kwargs(tmp_path), "bridge_dir": bridge_dir}
+        ),
+        timeout=budget(10.0),
+    )
+    assert call_count >= 2  # restarted while inside the window, then stopped
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("socket_alive", [False, True])
+async def test_supervised_forwarder_stops_only_for_a_dead_pane(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    socket_alive: bool,
+) -> None:
+    """End to end through the real poll loop: a dead pane stops, a live one does not."""
+    bridge_dir, _transcript, _socket = _orphan_bridge(tmp_path, socket_alive=socket_alive)
+    monkeypatch.setenv(forwarder._ORPHAN_TIMEOUT_ENV, "0.05")
+    monkeypatch.setattr(forwarder, "_ORPHAN_CHECK_INTERVAL_S", 0.01)
+    owner_checks = 0
+    real_owner_check = forwarder.advertised_tmux_socket_gone
+
+    def counting_owner_check(path: Path) -> bool:
+        nonlocal owner_checks
+        owner_checks += 1
+        return real_owner_check(path)
+
+    monkeypatch.setattr(forwarder, "advertised_tmux_socket_gone", counting_owner_check)
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.supervise_forwarder(
+            base_url=base_url,
+            headers={},
+            session_id="conv_orphan",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=True,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        if not socket_alive:
+            await asyncio.wait_for(task, timeout=budget(10.0))
+            assert owner_checks >= 1
+        else:
+            # Past the window and asked about its pane several times, yet still running.
+            async with asyncio.timeout(budget(10.0)):
+                while owner_checks < 3:
+                    await asyncio.sleep(0.01)
+            assert not task.done()
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
