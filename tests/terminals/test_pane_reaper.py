@@ -802,3 +802,38 @@ async def test_output_busy_window_env_reaches_the_busy_predicate(
         input_at["at"] = five_min_ago_wall
         assert not await busy(pane), f"viewer input, window={window}"
         input_at["at"] = None
+
+
+async def test_reaped_claude_pane_leaves_no_forwarder_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reaping a non-codex pane cancels its transcript forwarder.
+
+    The codex teardown helper is a no-op for every other harness, and the claude
+    forwarder restarts forever, so without an explicit cancel each reaped claude
+    pane left a task polling its dead bridge dir for the runner's lifetime.
+    """
+    from omnigent.runner.native import orchestration
+
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    reaper = app.state.native_pane_reaper
+    parked = asyncio.Event()
+
+    async def _forwarder() -> None:
+        parked.set()
+        await asyncio.Event().wait()
+
+    task: asyncio.Task[object] = asyncio.create_task(_forwarder())
+    orchestration._register_auto_forwarder_task("conv_reaped_claude", task)
+    try:
+        await parked.wait()
+        await reaper._reap(_pane("conv_reaped_claude", "claude"))
+
+        assert task.cancelled()
+        assert "conv_reaped_claude" not in orchestration._AUTO_FORWARDER_TASKS
+        # Idempotent: a second reap with nothing registered is a no-op.
+        await reaper._reap(_pane("conv_reaped_claude", "claude"))
+    finally:
+        task.cancel()
+        orchestration._AUTO_FORWARDER_TASKS.pop("conv_reaped_claude", None)
