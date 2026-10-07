@@ -727,7 +727,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # wholesale (_build_harness_spawn_env, process_manager.py), so a var
         # stripped here is missing there too.
         #
-        # What is true of ALL of them: each consumer coerces its value
+        # What is true of ALL the Omnigent-read ones (the vendor-CLI knob at
+        # the end is the exception): each consumer coerces its value
         # through ``float()`` and uses it only as a number — none is
         # interpolated into a command, path or credential, so none can carry
         # a payload. What DIFFERS is what a MALFORMED value does, and it
@@ -760,6 +761,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         #   do not assume a warning will appear here:
         #     OMNIGENT_GH_TIMEOUT_SECONDS          runner/github_resource.py:94
         #     OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS  runtime/filesystem_registry.py:61
+        #     OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S  runner/subagent_work.py
+        #       (non-numeric or NEGATIVE silently yields 3.0s; ``0`` is honored
+        #        as "no grace")
         #
         #   (4) Fail-loud — a bare ``float()`` at import, so a malformed
         #   value raises and ABORTS the process rather than degrading. Now
@@ -772,6 +776,14 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         #     HARNESS_ACP_PROMPT_TIMEOUT_S         inner/acp_executor.py:162
         #       (this one validates explicitly: non-finite or non-positive
         #        raises a dedicated ValueError at ACP child startup)
+        #
+        # Not parsed by Omnigent at all — consumed by the vendor CLI running in
+        # the native pane, which inherits the runner's environment
+        # (inner/terminal.py, ``inherit_env``):
+        #     QWEN_STREAM_MAX_LIFETIME_MS          qwen CLI, per-model-stream
+        #       wall-clock cap in MILLISECONDS (``0`` disables; qwen's own
+        #       default is 900000). Without this entry a host drop-in setting
+        #       it never reaches the qwen pane.
         #
         # Harmonizing (1)-(4) onto one tolerant shape would mean editing
         # _runner.py, _scaffold.py and acp_executor.py; that is deliberately
@@ -792,6 +804,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S",
         "OMNIGENT_GH_TIMEOUT_SECONDS",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
+        "OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S",
+        "QWEN_STREAM_MAX_LIFETIME_MS",
         "HARNESS_TURN_TIMEOUT_S",
         "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
         "HARNESS_ACP_PROMPT_TIMEOUT_S",

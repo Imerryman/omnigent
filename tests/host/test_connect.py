@@ -4249,11 +4249,17 @@ def test_runner_env_allowlist_timeout_knob_set_is_pinned() -> None:
         "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S",
         "OMNIGENT_GH_TIMEOUT_SECONDS",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS",
+        "OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S",
+        "QWEN_STREAM_MAX_LIFETIME_MS",
         "HARNESS_TURN_TIMEOUT_S",
         "HARNESS_TURN_ABSOLUTE_TIMEOUT_S",
         "HARNESS_ACP_PROMPT_TIMEOUT_S",
     }
-    actual = {name for name in _RUNNER_ENV_ALLOWLIST if "TIMEOUT" in name or "BUSY_WINDOW" in name}
+    actual = {
+        name
+        for name in _RUNNER_ENV_ALLOWLIST
+        if any(marker in name for marker in ("TIMEOUT", "BUSY_WINDOW", "GRACE", "LIFETIME"))
+    }
     assert actual == expected, (
         "The timeout/reaper knobs in _RUNNER_ENV_ALLOWLIST changed. "
         f"Unexpectedly added: {sorted(actual - expected)}. "
@@ -4286,6 +4292,8 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
         "OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S": "900",
         "OMNIGENT_GH_TIMEOUT_SECONDS": "120",
         "OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS": "45",
+        "OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S": "5",
+        "QWEN_STREAM_MAX_LIFETIME_MS": "0",
         "HARNESS_TURN_TIMEOUT_S": "3600",
         "HARNESS_TURN_ABSOLUTE_TIMEOUT_S": "14400",
         "HARNESS_ACP_PROMPT_TIMEOUT_S": "900",
@@ -4309,6 +4317,9 @@ def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
     assert env["OMNIGENT_CLAUDE_FORWARDER_ORPHAN_TIMEOUT_S"] == "900"
     assert env["OMNIGENT_GH_TIMEOUT_SECONDS"] == "120"
     assert env["OMNIGENT_GIT_STATUS_TIMEOUT_SECONDS"] == "45"
+    assert env["OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S"] == "5"
+    # Read by the qwen CLI in the pane, not by Omnigent.
+    assert env["QWEN_STREAM_MAX_LIFETIME_MS"] == "0"
     assert env["HARNESS_TURN_TIMEOUT_S"] == "3600"
     assert env["HARNESS_TURN_ABSOLUTE_TIMEOUT_S"] == "14400"
     assert env["HARNESS_ACP_PROMPT_TIMEOUT_S"] == "900"
