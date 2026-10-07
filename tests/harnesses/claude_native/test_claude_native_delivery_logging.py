@@ -11,6 +11,17 @@ import pytest
 from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
 
+_RULE = "─" * 40
+
+
+def _composer(draft: str = "") -> str:
+    """Render Claude's framed composer holding *draft* (empty means idle)."""
+    return f"{_RULE}\n❯ {draft}\n{_RULE}"
+
+
+# A boxed tool-permission prompt drawn where the composer was.
+_PERMISSION_PANE = "╭────────────╮\n│ Do you want to make this edit? │\n╰────────────╯"
+
 
 @pytest.mark.parametrize(
     ("scenario", "verification", "outcome"),
@@ -18,11 +29,14 @@ from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
         ("normal", "draft_absent", "returned"),
         ("session_fallback", "draft_absent", "returned"),
         ("unknown_command", "draft_absent", "returned"),
-        ("blank_line", "unverified", "returned"),
+        ("blank_line", "draft_absent", "returned"),
+        ("unconfirmed_draft", "not_started", "error"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
-        ("empty_capture", "inconclusive_capture", "returned"),
-        ("missing_glyph", "inconclusive_capture", "returned"),
+        ("empty_capture", "inconclusive_capture", "error"),
+        ("missing_glyph", "inconclusive_capture", "error"),
+        ("prompt_hook", "prompt_hook_recorded", "returned"),
+        ("popped_surface", "popped_surface", "returned"),
         ("transport_error", "not_started", "error"),
         ("observation_error", "not_started", "returned"),
         ("startup_error", "not_started", "error"),
@@ -44,7 +58,7 @@ def test_delivery_diagnostics(
         secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
     elapsed = 0.0
-    pane = "❯ "
+    pane = _composer()
     enters = 0
     pending_checks = 0
 
@@ -76,12 +90,25 @@ def test_delivery_diagnostics(
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
-            pane = "❯ " + content
+            if scenario != "unconfirmed_draft":
+                pane = _composer(content)
         if args[-1] == "Enter":
             enters += 1
-            if scenario in {"blank_line", "timeout"} or (scenario == "retry" and enters == 1):
+            if scenario == "timeout" or (scenario == "retry" and enters == 1):
                 return
-            pane = {"empty_capture": "", "missing_glyph": "terminal output"}.get(scenario, "❯ ")
+            if scenario == "prompt_hook":
+                # Claude Code's own UserPromptSubmit record: the only acceptance
+                # signal for a pane whose composer cannot be read.
+                with (tmp_path / bridge._HOOKS_FILE).open("a", encoding="utf-8") as handle:
+                    handle.write(
+                        json.dumps({"payload": {"hook_event_name": "UserPromptSubmit"}}) + "\n"
+                    )
+            pane = {
+                "empty_capture": "",
+                "missing_glyph": "terminal output",
+                "prompt_hook": "",
+                "popped_surface": _PERMISSION_PANE,
+            }.get(scenario, _composer())
 
     monkeypatch.setattr(
         bridge,
@@ -138,7 +165,10 @@ def test_delivery_diagnostics(
     assert attrs["verification"] == verification
     assert attrs["outcome"] == outcome
     assert record.levelname == (
-        "INFO" if verification == "draft_absent" and outcome == "returned" else "WARNING"
+        "INFO"
+        if verification in {"draft_absent", "prompt_hook_recorded", "popped_surface"}
+        and outcome == "returned"
+        else "WARNING"
     )
     expected_session = "bridge-session" if scenario == "session_fallback" else "child-session"
     assert record.session_id == expected_session
@@ -151,7 +181,7 @@ def test_delivery_diagnostics(
 
     if scenario == "observation_error":
         assert enters == 1
-        assert pane == "❯ "
+        assert pane == _composer()
         assert attrs["submit_sent"] is True
     if scenario == "unknown_command":
         assert enters == 2
@@ -165,23 +195,34 @@ def test_delivery_diagnostics(
         assert attrs["draft_polls"] == 1
         assert attrs["draft_empty_captures"] == 0
         assert attrs["draft_wait_ms"] == 0
-        assert attrs["draft_pane_rows"] == 1
-        assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
+        assert attrs["draft_pane_rows"] == 3
+        assert attrs["draft_pane_max_columns"] == max(len(_RULE), len("❯ " + secret))
+        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 3)
+        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 40)
+        assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
+    if scenario == "normal":
         assert attrs["submit_polls"] == 1
         assert attrs["submit_wait_ms"] == 10
-        assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
-        assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
-        assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
         assert attrs["stage_verifying_submit_ms"] == 10
         assert attrs["elapsed_ms"] == 30
+    if scenario in {"empty_capture", "missing_glyph"}:
+        # An unreadable composer is never taken as acceptance, and never
+        # answered with a blind retry Enter.
+        assert enters == 1
 
     if scenario == "blank_line":
-        assert attrs["draft_seen"] is False
-        assert attrs["draft_needle_visible_below_prompt"] is True
+        # The framed composer's continuation rows locate a draft whose first
+        # line is blank, so it is verified rather than submitted blind.
+        assert attrs["draft_seen"] is True
         assert attrs["leading_blank_line"] is True
         assert attrs["submit_sent"] is True
         assert enters == 1
-        assert pane == "❯ \n" + secret
+    elif scenario == "unconfirmed_draft":
+        # A draft that never shows in the box fails BEFORE the Enter: an
+        # unverifiable submit would execute the message it then calls lost.
+        assert attrs["draft_seen"] is False
+        assert attrs["submit_sent"] is False
+        assert enters == 0
     elif scenario in {"normal", "retry", "timeout", "empty_capture", "missing_glyph"}:
         assert attrs["retries"] == enters - 1
         if scenario == "retry":
