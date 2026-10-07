@@ -282,10 +282,37 @@ def test_confirmation_retry_stops_when_a_prompt_replaces_the_dialog(
 def test_accepted_submit_can_immediately_raise_a_question(
     native_bridge: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A new question proves the submitted draft left the composer; no retry is needed."""
+    """A new question proves the submitted draft left the composer; no retry is needed.
+
+    FIXTURE EXTENDED vs upstream: the pane alone cannot say this, so the bridge
+    now also carries the ``UserPromptSubmit`` record Claude Code writes when a
+    prompt reaches it. Upstream's version asserted acceptance from the question
+    surface ALONE, which models an impossible world — a delivered message always
+    fires that hook — and the same shape is what a swallowed draft leaves on
+    screen when Claude was already parked on an earlier question. The record is
+    appended from the capture stub, i.e. after the pre-submit cursor, exactly as
+    the hook subprocess does in production.
+    """
     sent: list[tuple[str, ...]] = []
     _park_hook(native_bridge)
-    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _QUESTION)
+    hooks = native_bridge / "hooks.jsonl"
+
+    def capture(*_: str) -> str:
+        # APPEND, matching record_hook_event (bridge.py) — do not "simplify" this
+        # to write_text. The two are equivalent only while the file starts empty:
+        # the moment a test seeds a pre-existing record, write_text clobbers it
+        # and this test silently exercises a different scenario than its name
+        # claims, green and wrong. That is the failure mode this whole PR is about.
+        with hooks.open("a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {"recorded_at": 1.0, "payload": {"hook_event_name": "UserPromptSubmit"}}
+                )
+                + "\n"
+            )
+        return _QUESTION
+
+    monkeypatch.setattr(bridge, "_capture_pane", capture)
     monkeypatch.setattr(bridge, "_run_tmux", lambda *args: sent.append(args))
     monkeypatch.setattr(bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0)
     assert bridge._verify_submit_accepted(
@@ -294,8 +321,36 @@ def test_accepted_submit_can_immediately_raise_a_question(
         needle="Follow-up",
         what="submitted message",
         bridge_dir=native_bridge,
+        hooks_cursor=bridge.count_hook_events(native_bridge),
     )
     assert sent == []
+
+
+def test_a_question_already_on_screen_does_not_accept_a_swallowed_draft(
+    native_bridge: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: the parked-hook + surface pairing false-accepted a dropped message.
+
+    Claude is already parked on a question from a PREVIOUS prompt. Our draft is
+    sent into that surface and swallowed, so it was genuinely never delivered and
+    no new ``UserPromptSubmit`` record appears. An earlier revision accepted this
+    because a permission hook was parked and the pane showed a selection surface
+    — neither of which says THIS submit is why Claude is waiting. It must fail
+    and let the caller raise.
+    """
+    _park_hook(native_bridge)
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_: _QUESTION)
+    monkeypatch.setattr(bridge, "_run_tmux", lambda *_: None)
+    monkeypatch.setattr(bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0)
+    monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.2)
+    assert not bridge._verify_submit_accepted(
+        "/tmp/example.sock",
+        "main",
+        needle="Follow-up",
+        what="submitted message",
+        bridge_dir=native_bridge,
+        hooks_cursor=bridge.count_hook_events(native_bridge),
+    )
 
 
 def test_submit_retry_respects_a_hook_even_when_the_draft_is_still_visible(
