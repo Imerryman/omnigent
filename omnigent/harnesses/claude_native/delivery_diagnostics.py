@@ -19,6 +19,12 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 _Parameters = ParamSpec("_Parameters")
 
+# Verification outcomes that positively confirm delivery: the draft verifiably
+# left the composer, Claude Code's own ``UserPromptSubmit`` hook recorded the
+# prompt, or the submit popped a boxed dialog over the composer. Anything else
+# logs the delivery summary at WARNING.
+_CONFIRMED_VERIFICATIONS = frozenset({"draft_absent", "prompt_hook_recorded", "popped_surface"})
+
 
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
     @functools.wraps(function)
@@ -105,7 +111,8 @@ def trace_delivery(
                     last_attempt = trace.attempts[-1] if trace.attempts else {}
                     verification = last_attempt.get("verification", "not_started")
                     uncertain = any(
-                        attempt.get("verification") != "draft_absent" for attempt in trace.attempts
+                        attempt.get("verification") not in _CONFIRMED_VERIFICATIONS
+                        for attempt in trace.attempts
                     )
                     level = logging.WARNING if outcome != "returned" or uncertain else logging.INFO
                     if _logger.isEnabledFor(level):
