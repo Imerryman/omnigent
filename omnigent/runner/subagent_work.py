@@ -762,6 +762,26 @@ def _deliver_subagent_completion(entry: _SubagentWorkEntry) -> _SubagentDelivery
     )
 
 
+def _qwen_subagent_exit_grace_s() -> float:
+    """Grace before failing a qwen/antigravity sub-agent that exited with
+    undelivered work.
+
+    Must exceed a couple of forwarder poll intervals (~0.4s;
+    ``harnesses/qwen_native/forwarder.py``) plus POST latency so a SUCCESS whose
+    pane exited just before the forwarder's asynchronous ``idle`` -> ``completed``
+    edge landed is not falsely failed. Override with
+    ``OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S`` (tests set ``0``).
+    """
+    raw = os.environ.get("OMNIGENT_QWEN_SUBAGENT_EXIT_GRACE_S")
+    if raw is None:
+        return 3.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 3.0
+    return value if value >= 0.0 else 3.0
+
+
 def reap_stalled_subagent_launches(
     *,
     now: float | None = None,
