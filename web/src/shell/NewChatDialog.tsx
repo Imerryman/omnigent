@@ -3747,7 +3747,7 @@ export function NewChatLandingScreen() {
               ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
             : hasSdkModelPicker
               ? CLAUDE_NATIVE_EFFORTS
-            : [];
+              : [];
   const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
     const previous = pickerEdits;
     setPickerEdits({

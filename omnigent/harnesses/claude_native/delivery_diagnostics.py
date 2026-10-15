@@ -26,6 +26,26 @@ _Parameters = ParamSpec("_Parameters")
 _CONFIRMED_VERIFICATIONS = frozenset({"draft_absent", "prompt_hook_recorded", "popped_surface"})
 
 
+def _delivery_outcome(outcome: str | None, verification: str | None) -> str:
+    """
+    Summarise whether a returned delivery is known to have reached Claude.
+
+    :param outcome: How the attempt ended (``"returned"`` on success).
+    :param verification: How the submit was verified, if at all.
+    :returns: ``"draft_cleared"`` when the draft visibly left the input box,
+        ``"submit_confirmed"`` when Claude's own UserPromptSubmit hook or a
+        popped dialog proved the submit landed on an unreadable composer,
+        else ``"unknown"``.
+    """
+    if outcome != "returned":
+        return "unknown"
+    if verification == "draft_absent":
+        return "draft_cleared"
+    if verification in _CONFIRMED_VERIFICATIONS:
+        return "submit_confirmed"
+    return "unknown"
+
+
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
     @functools.wraps(function)
     def wrapped(*args: _Parameters.args, **kwargs: _Parameters.kwargs) -> None:
@@ -132,11 +152,7 @@ def trace_delivery(
                             and not normalized.split("\n", 1)[0].strip(),
                             "outcome": outcome,
                             "verification": verification,
-                            "delivery_outcome": (
-                                "draft_cleared"
-                                if outcome == "returned" and verification == "draft_absent"
-                                else "unknown"
-                            ),
+                            "delivery_outcome": _delivery_outcome(outcome, verification),
                             **last_attempt,
                             **{
                                 f"stage_{stage}_ms": round(seconds * 1000)

@@ -180,7 +180,13 @@ def test_delivery_diagnostics(
     assert attrs["input_enqueued_at_ms"] == 12345
     assert attrs["response_id"] == "resp_delivery"
     assert attrs["delivery_outcome"] == (
-        "draft_cleared" if outcome == "returned" and verification == "draft_absent" else "unknown"
+        "unknown"
+        if outcome != "returned"
+        else "draft_cleared"
+        if verification == "draft_absent"
+        else "submit_confirmed"
+        if verification in {"prompt_hook_recorded", "popped_surface"}
+        else "unknown"
     )
     assert record.levelname == (
         "INFO"
