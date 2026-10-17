@@ -366,6 +366,28 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# How many non-whitespace characters from the END of the message make the
+# second draft marker. Claude Code keeps the cursor (the end of the draft) in
+# view, so a 450-799 char draft that wraps past the ~7 composer rows of an 80x24
+# pane — too short to collapse into a ``[Pasted text …]`` placeholder — shows
+# its tail while its head is scrolled out of the box (omnigent-ai/omnigent#9026).
+_DRAFT_TAIL_NEEDLE_MAX_CHARS = 24
+# Clearing a leftover draft before a paste. In Claude Code 2.1.280 ``C-u``
+# deletes one rendered row backwards (joining the row above once the cursor's
+# row is empty), is a no-op on an empty box, and — unlike Escape or Ctrl+C —
+# never interrupts a running turn or opens the rewind dialog. Ctrl+A/Ctrl+K
+# emptied only the cursor's row, so a multi-row draft survived and the next
+# paste was appended to it. Presses go in bursts, re-reading the box between
+# them, up to a ceiling far above any draft Claude leaves uncollapsed.
+_COMPOSER_CLEAR_KEYS_PER_BURST = 16
+_COMPOSER_CLEAR_MAX_KEYS = 256
+# Spacing between bursts, so the TUI repaints before the box is judged again.
+_COMPOSER_CLEAR_SETTLE_S = 0.5
+# How long the box may stay non-empty (or unreadable) before the paste is
+# abandoned undelivered.
+_COMPOSER_CLEAR_TIMEOUT_S = 10.0
+# Bound on the composer capture logged at DEBUG when a draft is not confirmed.
+_DRAFT_FAILURE_LOG_TAIL_CHARS = 600
 # Mode footer Claude Code renders below its input box, keyed by
 # ``--permission-mode`` value. There is no non-interactive mode command, so
 # a live switch cycles with shift+tab and reads this footer to know where it
@@ -4289,6 +4311,7 @@ def inject_user_message(
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
     needle = _submit_needle(content)
+    tail_needle = _submit_tail_needle(content)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # A leading ``/name`` that is neither allowed nor known-dropped passes
@@ -4307,7 +4330,14 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=injected_text,
+        needle=needle,
+        tail_needle=tail_needle,
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -4332,6 +4362,7 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        tail_needle=tail_needle,
     )
 
 
@@ -4342,6 +4373,7 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
+    tail_needle: str = "",
 ) -> None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
@@ -4352,12 +4384,23 @@ def _paste_and_submit(
     visibly commit, submit, and verify the draft left the box — re-sending
     Enter while it verifiably hasn't.
 
+    Enter is pressed only once the CURRENT draft has been positively
+    identified in the live composer: the leftover-draft clear is verified
+    empty before the paste (see :func:`_clear_composer_draft`), so whatever
+    text then matches the head or tail needle is this paste. A draft that is
+    never confirmed, or that verifiably sits unaccepted after the submit, is
+    cleared again before raising, so a retry cannot be merged with it.
+
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param text: Exact text to paste (already escaped as needed).
-    :param needle: Draft marker from :func:`_submit_needle`; empty skips
-        draft-visibility verification (blind submit).
+    :param needle: Draft marker from :func:`_submit_needle`. With an empty
+        *tail_needle* too, the draft can only be confirmed as a collapsed
+        paste placeholder; otherwise delivery fails before Enter.
+    :param tail_needle: Draft marker from :func:`_submit_tail_needle`,
+        matched alongside *needle* so a draft whose head scrolled out of the
+        box still confirms. Empty disables it.
     :returns: None.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
@@ -4391,7 +4434,7 @@ def _paste_and_submit(
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
         empty_captures += not pane.strip()
-        if _draft_in_input_box(pane, needle) is True:
+        if _draft_in_input_box(pane, needle, tail_needle) is True:
             draft_seen = True
             break
         if _stacked_dialog_headline(pane) is not None:
@@ -4425,11 +4468,22 @@ def _paste_and_submit(
         polls=polls,
         empty_captures=empty_captures,
     )
+    delivery_diagnostics.record_details(tail_needle_available=bool(tail_needle))
     # Fail BEFORE the submit Enter, never after. The draft was never confirmed
     # in the box (e.g. an unidentifiable draft whose needle is empty), so its
     # delivery cannot be verified — and pressing Enter first would submit, and
     # so possibly execute, the very message this then reports as undelivered.
     if not draft_seen:
+        _log_unconfirmed_draft(
+            pane,
+            needle=needle,
+            tail_needle=tail_needle,
+            waited_s=time.monotonic() - paste_wait_started,
+            polls=polls,
+        )
+        # Whatever did land stays in the box otherwise, and the next paste is
+        # appended to it — a retry then submits both as one turn.
+        _clear_composer_draft(socket_path, tmux_target)
         raise RuntimeError(
             "Claude Code's pasted draft could not be confirmed in the input box. "
             "The message was not delivered."
@@ -4461,6 +4515,7 @@ def _paste_and_submit(
             socket_path,
             tmux_target,
             needle=needle,
+            tail_needle=tail_needle,
             what="submitted message",
             bridge_dir=bridge_dir,
             hooks_cursor=hooks_cursor,
@@ -4473,6 +4528,11 @@ def _paste_and_submit(
         ) from exc
     if accepted:
         return
+    # Clear only a draft that is verifiably still ours in the box: an
+    # unreadable composer may mean the submit landed after all, and no Enter
+    # (or anything else) goes out on a guess.
+    if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle, tail_needle) is True:
+        _clear_composer_draft(socket_path, tmux_target)
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(submission could not be confirmed). The message was not delivered."
@@ -4488,12 +4548,18 @@ def _paste_draft(bridge_dir: Path, socket_path: str, tmux_target: str, *, text: 
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param text: Exact text to paste (already escaped as needed).
     :returns: None.
-    :raises RuntimeError: If a ``tmux`` invocation fails.
+    :raises RuntimeError: If a ``tmux`` invocation fails, or if the input box
+        could not be verified empty first — nothing was pasted then.
     """
-    # Clear stale text first: raw controls can otherwise become pasted text.
-    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+    # A leftover draft (the person's, or one an earlier failed delivery left)
+    # would otherwise ride along: the paste is appended to it and the submit
+    # sends both as one turn. Pasting only onto a verifiably empty box is also
+    # what makes any needle match afterwards prove it is THIS paste.
+    if not _clear_composer_draft(socket_path, tmux_target):
+        raise RuntimeError(
+            "Claude Code's input box could not be cleared of an earlier draft before "
+            "pasting. The message was not delivered."
+        )
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4532,6 +4598,7 @@ def _verify_submit_accepted(
     what: str,
     bridge_dir: Path | None = None,
     hooks_cursor: int | None = None,
+    tail_needle: str = "",
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4560,6 +4627,9 @@ def _verify_submit_accepted(
         fast hook would land before the baseline and be missed, and a late hook
         from a previous prompt would be counted as this submit's. ``None``
         disables the signal rather than guessing.
+    :param tail_needle: Draft marker from :func:`_submit_tail_needle`. A draft
+        whose head is scrolled out of the box is still present while its tail
+        shows; reading the head alone would call it accepted.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4575,7 +4645,7 @@ def _verify_submit_accepted(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
-        draft_present = _draft_in_input_box(pane, needle)
+        draft_present = _draft_in_input_box(pane, needle, tail_needle)
         last_draft_present = draft_present
         if draft_present is None:
             # ``_draft_in_input_box`` returns None whenever it cannot read the
@@ -5610,12 +5680,37 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
         back whole.
     :returns: The pane's visible text, or ``""`` if capture failed.
     """
+    return _tmux_capture(socket_path, tmux_target, *(["-J"] if join_wrapped else []))
+
+
+def _capture_pane_styled(socket_path: str, tmux_target: str) -> str:
+    """
+    Capture the visible pane with its SGR styling (``capture-pane -e``).
+
+    Used only to tell a dim placeholder from real draft text (see
+    :func:`_composer_shows_only_placeholder`); never raises, like
+    :func:`_capture_pane`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: The pane's visible text with escapes, or ``""`` on failure.
+    """
+    return _tmux_capture(socket_path, tmux_target, "-e")
+
+
+def _tmux_capture(socket_path: str, tmux_target: str, *flags: str) -> str:
+    """
+    Run ``tmux capture-pane -p`` with extra *flags*; ``""`` on any failure.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param flags: Extra ``capture-pane`` flags, e.g. ``"-J"``.
+    :returns: The captured text, or ``""``.
+    """
     import subprocess
 
     _check_injection_cancelled()
-    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
-    if join_wrapped:
-        args.append("-J")
+    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p", *flags]
     try:
         proc = subprocess.run(
             args,
@@ -6295,10 +6390,75 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool | None:
-    """Locate the draft in the framed composer, including continuation rows.
+def _submit_tail_needle(content: str) -> str:
+    r"""
+        Derive a marker from the END of *content* to spot a scrolled draft.
 
-    Return None when the capture cannot establish whether the draft remains.
+        Claude Code keeps the end of a long draft in view and scrolls its head
+        out of the box (omnigent-ai/omnigent#9026), so the head needle from
+        :func:`_submit_needle` can be off-screen while this one shows. The marker
+        is whitespace-folded — line breaks and wrap points vanish, matching how
+        :func:`_draft_in_input_box` folds the composer — and keeps the last
+        :data:`_DRAFT_TAIL_NEEDLE_MAX_CHARS` characters. Control characters the
+        paste payload drops (:func:`_paste_payload_bytes`) are skipped; a tab or
+        DEL, which the TUI renders its own way, ends the marker.
+
+        :param content: Raw user text, e.g. ``"fix the bug
+    in foo.py"``.
+        :returns: The folded marker, e.g. ``"theauthflow"`` for
+            ``"…fix the auth flow"`` (whole content when shorter). Empty when no
+            visible character follows the last tab/DEL.
+    """
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    kept: list[str] = []
+    for ch in reversed(normalized):
+        if len(kept) >= _DRAFT_TAIL_NEEDLE_MAX_CHARS or ch in "\t\x7f":
+            break
+        if ch.isspace() or ord(ch) < 0x20:
+            continue
+        kept.append(ch)
+    return "".join(reversed(kept))
+
+
+def _composer_span(lines: list[str]) -> tuple[int, int] | None:
+    """
+    Locate the live composer within a pane's non-blank lines.
+
+    :param lines: The pane's non-blank lines, in order.
+    :returns: ``(start, end)`` — the index of the ``❯`` row under the opening
+        rule and the index of the closing rule (``len(lines)`` when it is
+        below the pane) — or ``None`` when no such row exists.
+    """
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    # The composer is always the last framed box at the bottom of the pane.
+    # Check the last rule first; fall back to the second-to-last rule when
+    # the last rule's row is the footer (e.g. a continuation-line composer
+    # where the row after the closing rule is the footer, not the composer).
+    candidates: list[int] = []
+    if rules:
+        candidates.append(rules[-1] + 1)
+    if len(rules) >= 2:
+        candidates.append(rules[-2] + 1)
+    for start in candidates:
+        if start >= len(lines) or not lines[start].strip().startswith(_CLAUDE_PROMPT_GLYPH):
+            continue
+        return start, next((i for i in rules if i > start), len(lines))
+    return None
+
+
+def _live_composer_body(pane: str) -> tuple[str, bool] | None:
+    """
+    Return the text inside the live chat composer and whether it is closed.
+
+    Only the framed box counts — never scrollback, transcript echoes or an
+    overlay — so a needle matched against this body proves the text is in
+    the box Enter would submit.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``(body, closed)``: the draft text after the ``❯`` glyph across
+        all of the box's rows, and whether the box's closing rule is on
+        screen (without it, more draft may be below the pane). ``None`` when
+        no chat composer is rendered.
     """
     # Only the absence of a rendered composer makes the draft's state
     # unknowable here. A confirm dialog / model picker / permission prompt that
@@ -6310,40 +6470,235 @@ def _draft_in_input_box(pane: str, needle: str) -> bool | None:
     # verifier then called the still-present, unsent draft delivered.
     if not _claude_prompt_rendered(pane):
         return None
-
     lines = [line for line in pane.splitlines() if line.strip()]
-    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
-    # The composer is always the last framed box at the bottom of the pane.
-    # Check the last rule first; fall back to the second-to-last rule when
-    # the last rule's row is the footer (e.g. a continuation-line composer
-    # where the row after the closing rule is the footer, not the composer).
-    candidates: list[int] = []
-    if rules:
-        candidates.append(rules[-1] + 1)
-    if len(rules) >= 2:
-        candidates.append(rules[-2] + 1)
-
-    for start in candidates:
-        if start >= len(lines):
-            continue
-        row = lines[start].strip()
-        if not row.startswith(_CLAUDE_PROMPT_GLYPH):
-            continue
-        end = next((i for i in rules if i > start), len(lines))
-        body = "\n".join([row.removeprefix(_CLAUDE_PROMPT_GLYPH), *lines[start + 1 : end]])
-        # Folding whitespace also handles terminal wrapping within the needle.
-        folded_body = "".join(body.split())
-        folded_needle = "".join(needle.split())
-        if _PASTED_PLACEHOLDER_PREFIX in body or (folded_needle and folded_needle in folded_body):
-            return True
-        # A closing rule immediately after the composer row means the box
-        # is definitively empty (not ambiguous).
-        if end < len(lines) and lines[end].strip():
-            return False
-        # Without a closing rule, the remaining draft may be below the pane.
+    span = _composer_span(lines)
+    if span is None:
         return None
+    start, end = span
+    row = lines[start].strip()
+    body = "\n".join([row.removeprefix(_CLAUDE_PROMPT_GLYPH), *lines[start + 1 : end]])
+    return body, end < len(lines)
 
-    return None
+
+def _draft_in_input_box(pane: str, needle: str, tail_needle: str = "") -> bool | None:
+    """Locate the draft in the framed composer, including continuation rows.
+
+    The draft counts as present when the box shows a collapsed-paste
+    placeholder, the head *needle*, or the *tail_needle* — the tail is what
+    remains visible once a long draft scrolls its head out of the box.
+
+    Return None when the capture cannot establish whether the draft remains.
+    """
+    composer = _live_composer_body(pane)
+    if composer is None:
+        return None
+    body, closed = composer
+    if _PASTED_PLACEHOLDER_PREFIX in body:
+        return True
+    # Folding whitespace also handles terminal wrapping within the needle.
+    folded_body = "".join(body.split())
+    for marker in (needle, tail_needle):
+        folded = "".join(marker.split())
+        if folded and folded in folded_body:
+            return True
+    # A closing rule after the composer rows means the draft is definitively
+    # absent (not ambiguous). Without one, the rest may be below the pane.
+    return False if closed else None
+
+
+def _composer_is_empty(pane: str) -> bool | None:
+    """
+    Report whether the live chat composer is structurally empty.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the framed box is fully on screen and holds no
+        text after the ``❯`` glyph, ``False`` when it holds any, ``None`` when
+        no chat composer is readable or its closing rule is off-screen.
+    """
+    composer = _live_composer_body(pane)
+    if composer is None or not composer[1]:
+        return None
+    return not composer[0].split()
+
+
+# One escape sequence in a ``capture-pane -e`` line: a CSI (SGR when it ends in
+# ``m``) or an OSC such as a hyperlink.
+_CAPTURE_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
+
+
+def _styled_cells(line: str) -> list[tuple[str, bool, bool]]:
+    """
+    Split one ``capture-pane -e`` line into ``(char, dim, inverse)`` cells.
+
+    :param line: A captured line with SGR escapes, e.g.
+        ``"❯ \x1b[7mT\x1b[27m\x1b[2mry…"``.
+    :returns: One tuple per printed character.
+    """
+    cells: list[tuple[str, bool, bool]] = []
+    dim = inverse = False
+    pos = 0
+    for match in _CAPTURE_ESCAPE_RE.finditer(line):
+        cells.extend((ch, dim, inverse) for ch in line[pos : match.start()])
+        pos = match.end()
+        seq = match.group()
+        if not (seq.startswith("\x1b[") and seq.endswith("m")):
+            continue
+        params = seq[2:-1].split(";")
+        idx = 0
+        while idx < len(params):
+            code = params[idx].split(":")[0]
+            if code in ("", "0"):
+                dim = inverse = False
+            elif code == "2":
+                dim = True
+            elif code == "22":
+                dim = False
+            elif code == "7":
+                inverse = True
+            elif code == "27":
+                inverse = False
+            elif code in ("38", "48", "58") and ":" not in params[idx]:
+                mode = params[idx + 1] if idx + 1 < len(params) else ""
+                idx += 2 if mode == "5" else 4 if mode == "2" else 0
+            idx += 1
+    cells.extend((ch, dim, inverse) for ch in line[pos:])
+    return cells
+
+
+def _composer_shows_only_placeholder(styled_pane: str) -> bool:
+    """
+    Report whether the composer's only text is Claude Code's dim placeholder.
+
+    An empty box can show a placeholder — e.g. a prompt suggestion after a
+    turn — which a plain capture cannot tell from a draft. Claude Code
+    renders it only while the draft is empty, as dim text whose first cell
+    carries the inverse-video cursor; typed or pasted text is never dim. So
+    the box reads as empty when every visible character in it is dim, save an
+    inverse first character directly followed by dim text.
+
+    :param styled_pane: Pane captured with SGR escapes
+        (:func:`_capture_pane_styled`).
+    :returns: ``True`` only for a fully on-screen chat composer whose text is
+        all placeholder; ``False`` otherwise, including an unreadable capture.
+    """
+    rows = [
+        cells
+        for cells in map(_styled_cells, styled_pane.splitlines())
+        if "".join(ch for ch, _, _ in cells).strip()
+    ]
+    plain = ["".join(ch for ch, _, _ in cells) for cells in rows]
+    if not _claude_prompt_rendered("\n".join(plain)):
+        return False
+    span = _composer_span(plain)
+    if span is None or span[1] >= len(plain):
+        return False
+    start, end = span
+    first = rows[start]
+    glyph_at = plain[start].index(_CLAUDE_PROMPT_GLYPH)
+    cells = [*first[glyph_at + 1 :], *(cell for row in rows[start + 1 : end] for cell in row)]
+    visible = [cell for cell in cells if not cell[0].isspace()]
+    if not any(dim for _, dim, _ in visible):
+        return False
+    for idx, (_, dim, inverse) in enumerate(visible):
+        if dim:
+            continue
+        if idx == 0 and inverse and len(visible) > 1 and visible[1][1]:
+            continue
+        return False
+    return True
+
+
+def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
+    """
+    Empty Claude Code's whole input box and verify it is empty.
+
+    ``C-u`` goes in bursts (see :data:`_COMPOSER_CLEAR_KEYS_PER_BURST`), and
+    only while the live chat composer verifiably holds text and no dialog
+    stacked above it owns the keyboard; the box is re-read between bursts
+    until it is structurally empty (a dim placeholder counts as empty, see
+    :func:`_composer_shows_only_placeholder`). An already-empty box gets no
+    keystroke at all.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``True`` once the box was seen empty; ``False`` when it could
+        not be shown empty within :data:`_COMPOSER_CLEAR_TIMEOUT_S` or
+        :data:`_COMPOSER_CLEAR_MAX_KEYS` presses. Callers must then not paste
+        or submit.
+    :raises RuntimeError: If a ``tmux send-keys`` invocation fails.
+    """
+    start = time.monotonic()
+    sent = 0
+    last_burst: float | None = None
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        empty = _composer_is_empty(pane)
+        if empty is False and _composer_shows_only_placeholder(
+            _capture_pane_styled(socket_path, tmux_target)
+        ):
+            empty = True
+        if empty:
+            return True
+        now = time.monotonic()
+        settled = last_burst is None or now - last_burst >= _COMPOSER_CLEAR_SETTLE_S
+        if now - start >= _COMPOSER_CLEAR_TIMEOUT_S or (
+            sent >= _COMPOSER_CLEAR_MAX_KEYS and settled
+        ):
+            _logger.warning(
+                "claude-native: input box not verified empty after %.1fs and %d C-u presses "
+                "(composer %s)",
+                now - start,
+                sent,
+                "unreadable" if empty is None else "still holds text",
+            )
+            return False
+        if (
+            empty is False
+            and settled
+            and sent < _COMPOSER_CLEAR_MAX_KEYS
+            and _stacked_dialog_headline(pane) is None
+        ):
+            _run_tmux(
+                socket_path,
+                "send-keys",
+                "-t",
+                tmux_target,
+                *(["C-u"] * _COMPOSER_CLEAR_KEYS_PER_BURST),
+            )
+            sent += _COMPOSER_CLEAR_KEYS_PER_BURST
+            last_burst = now
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _log_unconfirmed_draft(
+    pane: str, *, needle: str, tail_needle: str, waited_s: float, polls: int
+) -> None:
+    """
+    Log why a pasted draft was not confirmed, keeping message text out of WARNING.
+
+    :param pane: The last capture taken while waiting for the draft.
+    :param needle: Head marker tried, from :func:`_submit_needle`.
+    :param tail_needle: Tail marker tried, from :func:`_submit_tail_needle`.
+    :param waited_s: Seconds spent waiting.
+    :param polls: Captures taken.
+    :returns: None.
+    """
+    composer = _live_composer_body(pane)
+    _logger.warning(
+        "claude-native: pasted draft not confirmed in the input box after %.1fs "
+        "(%d polls; head needle %d chars, tail needle %d chars; composer %s)",
+        waited_s,
+        polls,
+        len(needle),
+        len(tail_needle),
+        "unreadable" if composer is None else "closed" if composer[1] else "open-ended",
+    )
+    _logger.debug(
+        "claude-native: unconfirmed draft needles head=%r tail=%r; capture tail:\n%s",
+        needle,
+        tail_needle,
+        pane.rstrip()[-_DRAFT_FAILURE_LOG_TAIL_CHARS:],
+    )
 
 
 def _format_terminal_failure_tail(pane: str) -> str:

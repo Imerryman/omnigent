@@ -4105,8 +4105,9 @@ def test_inject_user_message_pastes_content_then_submits(
     with interior newlines encoded as CR so Claude Code's TUI keeps
     multi-line input as a single editable block instead of submitting on
     each newline (anthropics/claude-code#52126). Fails if the harness
-    regresses to send-keys argv delivery, drops the trailing Enter, or
-    stops clearing the stale buffer.
+    regresses to send-keys argv delivery or drops the trailing Enter. The
+    composer here is already empty, so the verified pre-paste clear sends no
+    key at all (the multi-row clear itself is pinned by the #9026 tests).
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
@@ -4157,15 +4158,12 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(captured)}."
+    # load-buffer, paste-buffer, Enter — fewer than 3 means a delivery step was
+    # dropped; more means a key went to a box already verified empty.
+    assert len(captured) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
-    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
-    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    load, paste, submit = captured
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -4651,18 +4649,15 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     inject_user_message(bridge_dir, content="hello")
 
     # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter)
-    # fired.
+    # three delivery calls (load-buffer, paste-buffer, Enter) fired; the
+    # verified clear found the box already empty and sent nothing.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
-    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    load, paste, submit = send_keys
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -5766,11 +5761,16 @@ def test_submit_torn_capture_with_transcript_hint_does_not_accept(
     draft_pane = _composer_pane("keep me unsent")
     # Torn capture: composer missing, only a transcript echo of a dialog title.
     torn_pane = "  ⎿ earlier: Switch model? was discussed\n  more scrollback here\n"
-    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
+    state: dict[str, Any] = {"pasted": False, "submitted": False, "verify_captures": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
+        if "paste-buffer" in cmd:
+            state["pasted"] = True
         if "capture-pane" in cmd:
+            if not state["pasted"]:
+                # The box is empty until the paste lands (pre-paste clear check).
+                return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
             if not state["submitted"]:
                 # Paste-observation: the draft is visibly committed.
                 return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
@@ -11880,10 +11880,13 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "\x1b[97;5u", "\x1b[107;5u"], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    # Escape (dismiss the surface) must precede every delivery keystroke; the
+    # restored box is verifiably empty, so no clear key follows it.
+    assert tails[0] == "Escape", (
+        f"Expected the occupying surface to be Escaped before the paste; got {tails}."
     )
+    assert "load-buffer" in captured[1], f"Expected the paste right after the Escape; got {tails}."
+    assert not {"\x1b[97;5u", "\x1b[107;5u", "C-u"} & set(tails), tails
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"
 
@@ -13725,3 +13728,424 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+# ---------------------------------------------------------------------------
+# Hidden-head drafts and stale-draft clearing (omnigent-ai/omnigent#9026)
+# ---------------------------------------------------------------------------
+
+_SENTENCE_9026 = (
+    "the review found that the knight kit mesh still clips through the shoulder plate "
+    "when the arm rotates past ninety degrees so please re-export with the corrected "
+    "weights and rerun the multiview render check before you push again"
+)
+
+
+def _prose_9026(size: int, *, tag: str = "Rework request") -> str:
+    """
+    Build a single-line message of exactly *size* characters.
+
+    :param size: Target length, e.g. ``600``.
+    :param tag: Distinct lead-in, so two messages never share a head.
+    :returns: Message text with no newline.
+    """
+    vocabulary = _SENTENCE_9026.split()
+    words: list[str] = [f"{tag}:"]
+    idx = 0
+    while len(" ".join(words)) < size:
+        words.append(vocabulary[idx % len(vocabulary)])
+        idx += 1
+    return " ".join(words)[:size].rstrip()
+
+
+class _ScrollingComposerTui:
+    """
+    Fake Claude Code 2.1.280 composer in an 80x24 pane, driven by tmux argv.
+
+    Models what the live repro showed (omnigent-ai/omnigent#9026):
+
+    - the draft wraps at the pane width and the box shows at most
+      :attr:`visible_rows` rows, scrolled to the END of the draft, with the
+      ``❯`` glyph still leading the first visible row — so the head of a
+      450-799 char single-line draft is off-screen;
+    - pastes of 800+ chars or 2+ interior newlines collapse to a
+      ``[Pasted text #N +M lines]`` placeholder;
+    - CSI-u Ctrl+A then Ctrl+K empties only the cursor's (last) row;
+    - each ``C-u`` deletes one rendered row backwards (joining the previous
+      row when the cursor row is already empty), and is a no-op when empty;
+    - ``Enter`` submits whatever the draft holds as one user turn.
+    """
+
+    width = 76
+    visible_rows = 6
+
+    def __init__(self, *, transcript: str = "", draft: str = "") -> None:
+        self.transcript = transcript
+        self.draft = draft
+        self.placeholders: dict[str, str] = {}
+        self.pending = ""
+        self.submitted: list[str] = []
+        self.events: list[tuple[str, str]] = []
+        self.mangle_render = False
+        self.ignore_clear = False
+        self.swallow_enter = False
+        self.drop_paste = False
+        self.paste_visible_after_captures = 0
+        self._hidden_captures_left = 0
+
+    # -- rendering ---------------------------------------------------------
+    def _rows(self) -> list[str]:
+        rows: list[str] = []
+        for logical in self.draft.split("\n"):
+            if not logical:
+                rows.append("")
+                continue
+            rows.extend(logical[i : i + self.width] for i in range(0, len(logical), self.width))
+        return rows
+
+    def composer_text_visible(self) -> list[str]:
+        rows = self._rows()[-self.visible_rows :] if self.draft else [""]
+        if self._hidden_captures_left > 0:
+            rows = [""]
+        if self.mangle_render:
+            rows = [row.swapcase() for row in rows]
+        return rows
+
+    def render(self) -> str:
+        rows = self.composer_text_visible()
+        body = [f"❯ {rows[0]}", *(f"  {row}" for row in rows[1:])]
+        rule = "─" * 80
+        return "\n".join([self.transcript, rule, *body, "", rule, "", "  ⏵⏵ auto mode on", ""])
+
+    def logical_submission(self) -> str:
+        text = self.draft
+        for token, real in self.placeholders.items():
+            text = text.replace(token, real)
+        return text.rstrip("\n")
+
+    # -- key handling ------------------------------------------------------
+    def _delete_row_backwards(self) -> None:
+        if not self.draft:
+            return
+        if self.draft.endswith("\n"):
+            self.draft = self.draft[:-1]
+            return
+        rows = self._rows()
+        last = rows[-1]
+        self.draft = self.draft[: len(self.draft) - len(last)]
+
+    def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            pane = self.render()
+            if self._hidden_captures_left > 0:
+                self._hidden_captures_left -= 1
+            self.events.append(("capture", pane))
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "load-buffer" in cmd:
+            self.pending = Path(cmd[-1]).read_bytes().decode("utf-8").replace("\r", "\n")
+            self.events.append(("load-buffer", ""))
+        elif "paste-buffer" in cmd:
+            self.events.append(("paste-buffer", ""))
+            if not self.drop_paste:
+                text = self.pending
+                interior_newlines = text.rstrip("\n").count("\n")
+                if len(text.rstrip("\n")) >= 800 or interior_newlines >= 2:
+                    token = (
+                        f"[Pasted text #{len(self.placeholders) + 1} +{interior_newlines} lines]"
+                    )
+                    self.placeholders[token] = text.rstrip("\n")
+                    text = token + "\n"
+                self.draft += text
+                self._hidden_captures_left = self.paste_visible_after_captures
+        elif "send-keys" in cmd:
+            keys = [cmd[-1]] if "-l" in cmd else cmd[cmd.index("-t") + 2 :]
+            for key in keys:
+                self.events.append(("key", key))
+                if key == "Enter":
+                    if not self.swallow_enter and self.draft:
+                        self.submitted.append(self.logical_submission())
+                        self.draft = ""
+                elif key == "\x1b[107;5u" and not self.ignore_clear:
+                    # Ctrl+K after Ctrl+A: only the cursor's (last) row empties.
+                    rows = self._rows()
+                    self.draft = self.draft[: len(self.draft) - len(rows[-1])] if rows else ""
+                elif key == "C-u" and not self.ignore_clear:
+                    self._delete_row_backwards()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def key_presses(self) -> list[str]:
+        return [value for kind, value in self.events if kind == "key"]
+
+
+@pytest.fixture
+def _fast_delivery_9026(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Shrink the delivery timeouts so failure paths finish in well under a second.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.005)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_SLOW_ACCEPT_WARN_S", 10.0)
+    for name, value in (
+        ("_COMPOSER_CLEAR_TIMEOUT_S", 0.3),
+        ("_COMPOSER_CLEAR_SETTLE_S", 0.01),
+    ):
+        if hasattr(claude_native_bridge, name):
+            monkeypatch.setattr(claude_native_bridge, name, value)
+
+
+def _install_tui_9026(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tui: _ScrollingComposerTui
+) -> Path:
+    """
+    Point a bridge dir at a fake pane and route every tmux call to *tui*.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tui: The fake composer.
+    :returns: The bridge directory.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
+    )
+    monkeypatch.setattr("subprocess.run", tui.run)
+    return bridge_dir
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _prose_9026(450),
+        _prose_9026(600),
+        _prose_9026(799),
+        _prose_9026(250) + "\n" + _prose_9026(330, tag="Second paragraph"),
+    ],
+    ids=["single-450", "single-600", "single-799", "one-newline-581"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_hidden_head_draft_confirms_via_tail_and_submits_once(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A draft whose head scrolled off the 7-row composer still confirms.
+
+    Live failure (#9026): 450-799 B single-line drafts (or ~460+ B with one
+    newline) are neither collapsed to a placeholder nor fully visible in an
+    80x24 pane, so the head-only needle never matched and delivery raised
+    "could not be confirmed" before Enter. The tail of the message IS in the
+    live composer; it must confirm, and the accepted submit gets exactly one
+    Enter.
+    """
+    tui = _ScrollingComposerTui()
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    # Precondition: the head really is off-screen once pasted.
+    probe = _ScrollingComposerTui(draft=content + "\n")
+    head = claude_native_bridge._submit_needle(content)
+    assert "".join(head.split()) not in "".join("".join(probe.composer_text_visible()).split())
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content]
+    assert tui.key_presses().count("Enter") == 1, tui.key_presses()
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_no_enter_before_the_draft_is_observed_in_the_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enter only follows a capture that positively showed the current draft."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.paste_visible_after_captures = 5
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content=content)
+
+    enter_at = next(i for i, (kind, v) in enumerate(tui.events) if (kind, v) == ("key", "Enter"))
+    tail = "".join(content.split())[-20:]
+    seen_at = [
+        i
+        for i, (kind, pane) in enumerate(tui.events[:enter_at])
+        if kind == "capture" and tail in "".join(pane.split())
+    ]
+    assert seen_at, "Enter was sent before any capture showed the pasted draft"
+    paste_at = next(i for i, (kind, _) in enumerate(tui.events) if kind == "paste-buffer")
+    assert paste_at < seen_at[0] < enter_at
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_message_tail_outside_the_framed_composer_does_not_confirm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The tail needle is read from the live composer only, never scrollback.
+
+    Here the paste is swallowed while the transcript above the box already
+    shows the message's last words (an earlier echo). Matching pane-wide would
+    press Enter on an empty composer; delivery must fail before Enter instead.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui(transcript="> " + content[-200:])
+    tui.drop_paste = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+def test_draft_in_input_box_tail_needle_reads_only_the_composer() -> None:
+    """Unit-level: the tail matches inside the frame, not in the transcript."""
+    content = _prose_9026(600)
+    tail = claude_native_bridge._submit_tail_needle(content)
+    head = claude_native_bridge._submit_needle(content)
+    assert tail
+    assert "".join(tail.split()) == tail, "the tail needle is whitespace-folded"
+    assert "".join(content.split()).endswith(tail)
+
+    scrolled = _ScrollingComposerTui(draft=content + "\n").render()
+    assert claude_native_bridge._draft_in_input_box(scrolled, head) is False
+    assert claude_native_bridge._draft_in_input_box(scrolled, head, tail) is True
+
+    echoed = _ScrollingComposerTui(transcript=content, draft="").render()
+    assert claude_native_bridge._draft_in_input_box(echoed, head, tail) is False
+
+
+def test_submit_tail_needle_normalizes_like_the_paste_payload() -> None:
+    """Whitespace folds away, dropped controls vanish, and a tab bounds the tail."""
+    assert claude_native_bridge._submit_tail_needle("   \n\t ") == ""
+    assert claude_native_bridge._submit_tail_needle("short msg") == "shortmsg"
+    assert claude_native_bridge._submit_tail_needle("a\r\nb c\x07d") == "abcd"
+    assert claude_native_bridge._submit_tail_needle("head\twrap tail end") == "wraptailend"
+    long_tail = claude_native_bridge._submit_tail_needle("x" * 10 + " " + "y" * 100)
+    assert long_tail == "y" * claude_native_bridge._DRAFT_TAIL_NEEDLE_MAX_CHARS
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_failed_confirmation_clears_the_whole_draft_before_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A draft that never confirms is removed from the composer, then delivery raises.
+
+    Left behind (#9026 part B), the unconfirmed draft was merged into the next
+    retry and submitted as one turn with it.
+    """
+    tui = _ScrollingComposerTui()
+    tui.mangle_render = True  # lands, but neither needle can be read back
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.draft == "", f"stale draft left in the composer: {tui.draft!r}"
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_row_only_clear_concatenated_but_retry_now_carries_only_the_new_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A second injection after a failure submits only the second message.
+
+    The fake models Ctrl+A/Ctrl+K emptying just the cursor row, which is what
+    the old pre-paste clear did: the stale multi-row draft survived and the
+    next message was appended below it, so its Enter sent both as one turn.
+    """
+    stale = _prose_9026(600)
+    old_style = _ScrollingComposerTui(draft=stale + "\n")
+    old_style.run(["tmux", "send-keys", "-l", "-t", "t", "\x1b[97;5u"])
+    old_style.run(["tmux", "send-keys", "-l", "-t", "t", "\x1b[107;5u"])
+    assert old_style.draft.strip(), "row-only clear leaves the multi-row draft behind"
+
+    tui = _ScrollingComposerTui()
+    tui.mangle_render = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=stale)
+    tui.mangle_render = False
+
+    inject_user_message(bridge_dir, content="second message only")
+
+    assert tui.submitted == ["second message only"]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_stale_multi_row_draft_is_cleared_before_pasting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A draft the person left (or an earlier failure left) never rides along."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(700, tag="Stale draft") + "\n")
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+    first_paste = next(i for i, (kind, _) in enumerate(tui.events) if kind == "paste-buffer")
+    assert ("key", "C-u") in tui.events[:first_paste]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_unverifiable_clear_sends_no_paste_and_no_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the composer cannot be shown empty, nothing is pasted or submitted."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(300, tag="Stuck draft") + "\n")
+    tui.ignore_clear = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="must not be pasted")
+
+    kinds = [kind for kind, _ in tui.events]
+    assert "load-buffer" not in kinds
+    assert "paste-buffer" not in kinds
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_unaccepted_submit_clears_the_still_present_draft_before_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submit that verifiably never landed leaves no draft for the next retry."""
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.draft == ""
+    assert tui.key_presses()[-1] == "C-u", (
+        "cleanup must be the last keystroke, never another Enter"
+    )
+
+
+def test_composer_placeholder_ghost_text_counts_as_empty() -> None:
+    """
+    A dim placeholder (prompt suggestion) in an empty box is not a draft.
+
+    Claude Code renders the placeholder as an inverse first cell plus dim text,
+    and only while the draft is empty; real draft text is never dim.
+    """
+    rule = "─" * 80
+    ghost = f"{rule}\n\x1b[39m❯ \x1b[7mT\x1b[27m\x1b[2mry fixing the lint errors\x1b[22m\n{rule}\n"
+    real = f"{rule}\n\x1b[39m❯ fix the lint errors\x1b[7m \x1b[27m\n{rule}\n"
+    cursor_on_char = f"{rule}\n❯ \x1b[7mx\x1b[27m\n{rule}\n"
+    shows_only_placeholder = claude_native_bridge._composer_shows_only_placeholder
+    assert shows_only_placeholder(ghost) is True
+    assert shows_only_placeholder(real) is False
+    assert shows_only_placeholder(cursor_on_char) is False
+    assert shows_only_placeholder("") is False
