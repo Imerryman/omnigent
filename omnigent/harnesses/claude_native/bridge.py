@@ -391,6 +391,9 @@ _COMPOSER_CLEAR_TIMEOUT_S = 10.0
 # How long the confirmed draft may read as unreadable (a torn capture) right
 # before the submit Enter before delivery is abandoned undelivered.
 _PRE_SUBMIT_REVALIDATE_TIMEOUT_S = 2.0
+# How long an all-dim box may take to redraw after a focus-in event before it
+# is treated as unresolved (draft content / unknown, never empty).
+_FOCUS_IN_SETTLE_TIMEOUT_S = 1.0
 # How long a failed submit's cleanup waits through unreadable captures to
 # positively identify the stale draft before giving up (without a key).
 _FAILED_SUBMIT_CLEANUP_TIMEOUT_S = 5.0
@@ -4504,21 +4507,24 @@ def _paste_and_submit(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; message not sent."
         )
+    # Baseline for the delivery signal, captured STRICTLY BEFORE the keystroke:
+    # only a ``UserPromptSubmit`` record appended after this count can be this
+    # submit's. Reading it after the Enter races the hook both ways — a fast
+    # record lands before the baseline and is missed, and a late record from a
+    # previous prompt is counted as ours. It is taken BEFORE the re-validation
+    # below so that nothing — not even this file scan — sits between the last
+    # read of the box and the keystroke.
+    hooks_cursor = count_hook_events(bridge_dir)
     # Re-validate right before the keystroke: a dialog can open (they appear as
     # a turn ends) during the settle and the pending-prompt check above, which
     # only reads question/permission prompts and passes a stacked dialog
-    # because the composer is still drawn under it.
+    # because the composer is still drawn under it. This is the LAST read of
+    # the pane before Enter.
     delivery_diagnostics.set_stage("revalidating_draft")
     _revalidate_draft_before_enter(
         socket_path, tmux_target, needle=needle, tail_needle=tail_needle
     )
     delivery_diagnostics.set_stage("submitting")
-    # Baseline for the delivery signal, captured STRICTLY BEFORE the keystroke:
-    # only a ``UserPromptSubmit`` record appended after this count can be this
-    # submit's. Reading it after the Enter races the hook both ways — a fast
-    # record lands before the baseline and is missed, and a late record from a
-    # previous prompt is counted as ours.
-    hooks_cursor = count_hook_events(bridge_dir)
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     # Verify the submit took: a successful Enter clears the input box.
@@ -4750,8 +4756,18 @@ def _verify_submit_accepted(
             )
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
-            if _stacked_dialog_headline(pane) is not None:
-                # The dialog owns the keyboard; a retry would answer it.
+            # Decide the retry on a fresh frame, read AFTER the pending-prompt
+            # check: a dialog that opened since ``pane`` was captured owns the
+            # keyboard and a retry Enter would answer it.
+            fresh = _capture_pane(socket_path, tmux_target)
+            if _stacked_dialog_headline(fresh) is not None:
+                continue
+            still_there = (
+                _draft_confirmed(socket_path, tmux_target, fresh, needle, tail_needle)
+                if ghost_aware
+                else _draft_in_input_box(fresh, needle, tail_needle)
+            )
+            if still_there is not True:
                 continue
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
@@ -6650,9 +6666,16 @@ def _ghost_signature(composer: _StyledComposer) -> str | None:
     Claude Code 2.1.280 draws a placeholder — a prompt suggestion, the
     ``Try "…"`` hint — only while the draft is EMPTY, in one of exactly two
     ways (both captured live): ``"focused"``, an inverse-video first cell
-    (the cursor) followed by dim text; ``"unfocused"``, all-dim text with no
-    cursor cell. Typed and pasted text is never dim, focused or not, and a
-    collapsed ``[Pasted text …]`` badge is real draft content in any styling.
+    (the caret, at position 0 of an empty draft) followed by dim text;
+    ``"unfocused"``, all-dim text with no caret cell. Typed and pasted text is
+    never dim, focused or not, and a collapsed ``[Pasted text …]`` badge is
+    real draft content in any styling.
+
+    Only ``"focused"`` is evidence of an empty box. ``"unfocused"`` is a
+    candidate: all-dim text without a caret is also what a dimmed real draft
+    would look like (scrolled, it can even look unchanged after ``C-u``), so
+    callers resolve it with a focus-in event (:func:`_resolved_styled_capture`)
+    and fail closed while it stays unresolved.
 
     :param composer: The styled composer.
     :returns: ``"focused"`` or ``"unfocused"`` for a matching closed box,
@@ -6698,22 +6721,28 @@ def _draft_in_styled_input_box(
     """
     Locate the draft in a styled capture, ignoring ghost placeholder text.
 
-    Like :func:`_draft_in_input_box`, but a ghost placeholder (see
-    :func:`_ghost_signature`) reads as an empty box and dim cells never count
-    toward a needle match — Claude Code never dims draft text, so a dim
-    suggestion that repeats the message's words cannot confirm it.
+    Like :func:`_draft_in_input_box`, but dim cells never count toward a
+    needle match — Claude Code never dims draft text, so a dim suggestion
+    that repeats the message's words cannot confirm it. Only the focused ghost
+    rendering reads as an empty box; all-dim text the box cannot classify
+    (an unresolved ``"unfocused"`` candidate, or dim text beside a caret) is
+    unknowable, never "draft absent" — a verifier would otherwise call a
+    still-present draft accepted.
 
     :param styled_pane: Pane captured with SGR escapes.
     :param needle: Head marker from :func:`_submit_needle`.
     :param tail_needle: Tail marker from :func:`_submit_tail_needle`.
     :returns: ``True`` when real draft text matches (or a collapsed-paste
-        badge shows), ``False`` when the closed box holds no match, ``None``
-        when unreadable or open-ended.
+        badge shows), ``False`` when the closed box holds no match and no
+        unclassifiable dim text, ``None`` otherwise.
     """
     composer = _styled_composer(styled_pane)
     if composer is None:
         return None
-    if _ghost_signature(composer) is None:
+    signature = _ghost_signature(composer)
+    if signature == "unfocused":
+        return None
+    if signature is None:
         real = "".join(ch for ch, dim, _ in composer.cells if not dim)
         if _PASTED_PLACEHOLDER_PREFIX in real:
             return True
@@ -6722,7 +6751,58 @@ def _draft_in_styled_input_box(
             folded = "".join(marker.split())
             if folded and folded in folded_body:
                 return True
+        if any(dim and not ch.isspace() for ch, dim, _ in composer.cells):
+            return None
     return False if composer.closed else None
+
+
+def _send_focus_in(socket_path: str, tmux_target: str) -> None:
+    """
+    Tell Claude Code its terminal has focus (a focus-in event, ``ESC [ I``).
+
+    Measured on 2.1.280 with omnigent's tmux options (``focus-events on``):
+    a pane with no attached client is UNFOCUSED by default, so its ghost
+    placeholder renders all-dim. The focus-in event is not text — it inserts
+    nothing and leaves a draft untouched — and makes the box draw its caret:
+    a ghost then takes the verified focused rendering, while real text shows
+    the caret where the cursor is. Best effort: a tmux error leaves the box
+    unresolved, which every caller treats as unknown.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    """
+    try:
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[I")
+    except ClaudeInjectionCancelled:
+        raise
+    except RuntimeError as exc:
+        _logger.warning("claude-native: could not send a focus-in event: %s", exc)
+
+
+def _resolved_styled_capture(socket_path: str, tmux_target: str) -> str:
+    """
+    Take a styled capture, resolving an all-dim box with a focus-in event.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: A styled capture. When the first read is an ``"unfocused"``
+        candidate (and no dialog is up), a focus-in is sent and the box is
+        re-read for up to :data:`_FOCUS_IN_SETTLE_TIMEOUT_S` until it draws
+        something else; a box still all-dim after that is returned as is.
+    """
+    styled = _capture_pane_styled(socket_path, tmux_target)
+    if _composer_ghost_signature(styled) != "unfocused" or (
+        _stacked_dialog_headline(_strip_capture_escapes(styled)) is not None
+    ):
+        return styled
+    _send_focus_in(socket_path, tmux_target)
+    deadline = time.monotonic() + _FOCUS_IN_SETTLE_TIMEOUT_S
+    while True:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        styled = _capture_pane_styled(socket_path, tmux_target)
+        if _composer_ghost_signature(styled) != "unfocused" or time.monotonic() >= deadline:
+            return styled
 
 
 def _draft_confirmed(
@@ -6749,7 +6829,7 @@ def _draft_confirmed(
     plain = _draft_in_input_box(pane, needle, tail_needle)
     if plain is not True:
         return plain
-    styled = _capture_pane_styled(socket_path, tmux_target)
+    styled = _resolved_styled_capture(socket_path, tmux_target)
     if _stacked_dialog_headline(_strip_capture_escapes(styled)) is not None:
         return None
     return _draft_in_styled_input_box(styled, needle, tail_needle)
@@ -6852,11 +6932,12 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
     re-read between bursts until it is structurally empty. An already-empty
     box gets no keystroke at all.
 
-    A ghost placeholder (see :func:`_ghost_signature`) counts as empty. The
-    focused rendering is exact enough on its own; the unfocused one is all-dim
-    text, which a dimmed real draft would also be, so it counts only once a
-    ``C-u`` burst verifiably left it unchanged — ``C-u`` deletes real text row
-    by row and leaves a placeholder untouched (verified on 2.1.280).
+    A ghost placeholder counts as empty only in its focused rendering (see
+    :func:`_ghost_signature`); an all-dim box is first resolved with a
+    focus-in event (:func:`_resolved_styled_capture`), and one that stays
+    all-dim is treated as draft content — cleared like any other, and the
+    paste abandoned if it never goes. Every burst is re-decided on a frame
+    read immediately before it, so a dialog that opened meanwhile gets no key.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
@@ -6869,20 +6950,18 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
     start = time.monotonic()
     sent = 0
     last_burst: float | None = None
-    body_before_burst: str | None = None
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         empty = _composer_is_empty(pane)
         now = time.monotonic()
         settled = last_burst is None or now - last_burst >= _COMPOSER_CLEAR_SETTLE_S
-        composer = _live_composer_body(pane)
-        body = composer[0] if composer is not None else None
-        if empty is False and _stacked_dialog_headline(pane) is None:
-            signature = _composer_ghost_signature(_capture_pane_styled(socket_path, tmux_target))
-            if signature == "focused" or (
-                signature == "unfocused" and settled and body == body_before_burst
-            ):
-                empty = True
+        if (
+            empty is False
+            and _stacked_dialog_headline(pane) is None
+            and _composer_ghost_signature(_resolved_styled_capture(socket_path, tmux_target))
+            == "focused"
+        ):
+            empty = True
         if empty:
             return True
         if now - start >= _COMPOSER_CLEAR_TIMEOUT_S or (
@@ -6896,22 +6975,20 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
                 "unreadable" if empty is None else "still holds text",
             )
             return False
-        if (
-            empty is False
-            and settled
-            and sent < _COMPOSER_CLEAR_MAX_KEYS
-            and _stacked_dialog_headline(pane) is None
-        ):
-            _run_tmux(
-                socket_path,
-                "send-keys",
-                "-t",
-                tmux_target,
-                *(["C-u"] * _COMPOSER_CLEAR_KEYS_PER_BURST),
-            )
-            sent += _COMPOSER_CLEAR_KEYS_PER_BURST
-            last_burst = now
-            body_before_burst = body
+        if empty is False and settled and sent < _COMPOSER_CLEAR_MAX_KEYS:
+            # Re-read right before the burst: the keys must land on the frame
+            # they were decided on, not on a dialog that opened since.
+            fresh = _capture_pane(socket_path, tmux_target)
+            if _composer_is_empty(fresh) is False and _stacked_dialog_headline(fresh) is None:
+                _run_tmux(
+                    socket_path,
+                    "send-keys",
+                    "-t",
+                    tmux_target,
+                    *(["C-u"] * _COMPOSER_CLEAR_KEYS_PER_BURST),
+                )
+                sent += _COMPOSER_CLEAR_KEYS_PER_BURST
+                last_burst = now
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
