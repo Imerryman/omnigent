@@ -13774,6 +13774,12 @@ class _ScrollingComposerTui:
     - each ``C-u`` deletes one rendered row backwards (joining the previous
       row when the cursor row is already empty), and is a no-op when empty;
     - ``Enter`` submits whatever the draft holds as one user turn.
+
+    Captured with ``-e`` it adds the styling 2.1.280 really emits: an empty
+    box can show a ghost placeholder/prompt suggestion — inverse first cell
+    plus dim text while focused, all dim while unfocused — which ``C-u``
+    leaves untouched. A stacked dialog can sit above the box (it owns the
+    keyboard: ``Enter`` answers it, ``Escape`` dismisses it unless sticky).
     """
 
     width = 76
@@ -13793,6 +13799,15 @@ class _ScrollingComposerTui:
         self.fail_clear_keys = False
         self.paste_visible_after_captures = 0
         self._hidden_captures_left = 0
+        self.ghost: str | None = None
+        self.ghost_focused = True
+        self.ghost_after_submit: str | None = None
+        self.dim_draft = False
+        self.dialog = False
+        self.dialog_sticky = False
+        self.dialog_on_paste = False
+        self.enter_into_dialog = 0
+        self.torn_captures = 0
 
     # -- rendering ---------------------------------------------------------
     def _rows(self) -> list[str]:
@@ -13812,11 +13827,34 @@ class _ScrollingComposerTui:
             rows = [row.swapcase() for row in rows]
         return rows
 
-    def render(self) -> str:
+    def render(self, *, styled: bool = False) -> str:
         rows = self.composer_text_visible()
-        body = [f"❯ {rows[0]}", *(f"  {row}" for row in rows[1:])]
+        if self.dim_draft and styled:
+            rows = [f"\x1b[2m{row}\x1b[0m" if row else row for row in rows]
+        first = f"❯\u00a0{rows[0]}"
+        if not self.draft and self.ghost and self._hidden_captures_left <= 0:
+            if not styled:
+                first = f"❯\u00a0{self.ghost}"
+            elif self.ghost_focused:
+                first = f"❯\u00a0\x1b[7m{self.ghost[0]}\x1b[0;2m{self.ghost[1:]}\x1b[0m"
+            else:
+                first = f"❯\u00a0\x1b[2m{self.ghost}\x1b[0m"
+        body = [first, *(f"  {row}" for row in rows[1:])]
         rule = "─" * 80
-        return "\n".join([self.transcript, rule, *body, "", rule, "", "  ⏵⏵ auto mode on", ""])
+        dialog = (
+            [
+                rule,
+                "  Teach auto mode about your environment?",
+                "  ❯ 1. Yes",
+                "    2. Not now",
+                "  Enter to confirm · Esc to cancel",
+            ]
+            if self.dialog
+            else []
+        )
+        return "\n".join(
+            [self.transcript, *dialog, rule, *body, "", rule, "", "  ⏵⏵ auto mode on", ""]
+        )
 
     def logical_submission(self) -> str:
         text = self.draft
@@ -13838,7 +13876,11 @@ class _ScrollingComposerTui:
     def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
         if "capture-pane" in cmd:
-            pane = self.render()
+            if self.torn_captures > 0:
+                self.torn_captures -= 1
+                self.events.append(("capture", "torn"))
+                return SimpleNamespace(returncode=0, stdout="  ⎿ torn frame\n", stderr="")
+            pane = self.render(styled="-e" in cmd)
             if self._hidden_captures_left > 0:
                 self._hidden_captures_left -= 1
             self.events.append(("capture", pane))
@@ -13859,16 +13901,29 @@ class _ScrollingComposerTui:
                     text = token + "\n"
                 self.draft += text
                 self._hidden_captures_left = self.paste_visible_after_captures
+            if self.dialog_on_paste:
+                self.dialog = True
+            # Pasted text is never dim; only a stale draft from before is.
+            self.dim_draft = False
         elif "send-keys" in cmd:
             keys = [cmd[-1]] if "-l" in cmd else cmd[cmd.index("-t") + 2 :]
             if self.fail_clear_keys and "C-u" in keys:
                 return SimpleNamespace(returncode=1, stdout="", stderr="no server running")
             for key in keys:
                 self.events.append(("key", key))
+                if self.dialog:
+                    # The dialog owns the keyboard.
+                    if key == "Enter":
+                        self.enter_into_dialog += 1
+                    elif key == "Escape" and not self.dialog_sticky:
+                        self.dialog = False
+                    continue
                 if key == "Enter":
                     if not self.swallow_enter and self.draft:
                         self.submitted.append(self.logical_submission())
                         self.draft = ""
+                        if self.ghost_after_submit is not None:
+                            self.ghost = self.ghost_after_submit
                 elif key == "\x1b[107;5u" and not self.ignore_clear:
                     # Ctrl+K after Ctrl+A: only the cursor's (last) row empties.
                     rows = self._rows()
@@ -13895,9 +13950,13 @@ def _fast_delivery_9026(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
     monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.05)
     monkeypatch.setattr(claude_native_bridge, "_SUBMIT_SLOW_ACCEPT_WARN_S", 10.0)
+    monkeypatch.setattr(claude_native_bridge, "_OCCUPIED_INPUT_DISMISS_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(claude_native_bridge, "_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S", 0.01)
     for name, value in (
         ("_COMPOSER_CLEAR_TIMEOUT_S", 0.3),
         ("_COMPOSER_CLEAR_SETTLE_S", 0.01),
+        ("_PRE_SUBMIT_REVALIDATE_TIMEOUT_S", 0.3),
+        ("_FAILED_SUBMIT_CLEANUP_TIMEOUT_S", 0.3),
     ):
         if hasattr(claude_native_bridge, name):
             monkeypatch.setattr(claude_native_bridge, name, value)
@@ -14163,8 +14222,302 @@ def test_composer_placeholder_ghost_text_counts_as_empty() -> None:
     ghost = f"{rule}\n\x1b[39m❯ \x1b[7mT\x1b[27m\x1b[2mry fixing the lint errors\x1b[22m\n{rule}\n"
     real = f"{rule}\n\x1b[39m❯ fix the lint errors\x1b[7m \x1b[27m\n{rule}\n"
     cursor_on_char = f"{rule}\n❯ \x1b[7mx\x1b[27m\n{rule}\n"
-    shows_only_placeholder = claude_native_bridge._composer_shows_only_placeholder
-    assert shows_only_placeholder(ghost) is True
-    assert shows_only_placeholder(real) is False
-    assert shows_only_placeholder(cursor_on_char) is False
-    assert shows_only_placeholder("") is False
+    signature = claude_native_bridge._composer_ghost_signature
+    assert signature(ghost) == "focused"
+    assert signature(real) is None
+    assert signature(cursor_on_char) is None
+    assert signature("") is None
+
+
+# -- Rework of #19 (cross-vendor review): ghost text, dialogs, torn cleanup --
+
+_RULE_9026 = "─" * 80
+
+
+def _styled_composer_9026(first_row: str, *more_rows: str) -> str:
+    """
+    Build a ``capture-pane -e`` style pane around one composer.
+
+    :param first_row: The ``❯`` row's text after the glyph, escapes included.
+    :param more_rows: Continuation rows.
+    :returns: Pane text with SGR escapes.
+    """
+    body = [f"\x1b[39m❯ {first_row}", *(f"  {row}" for row in more_rows)]
+    return "\n".join([_RULE_9026, *body, _RULE_9026, "", "  ⏵⏵ auto mode on", ""])
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_swallowed_paste_never_confirms_on_a_matching_ghost_suggestion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dim prompt suggestion equal to the message is not the draft.
+
+    The paste is swallowed while the empty box shows Claude's ghost suggestion
+    with the same words. Matching plain text confirmed it and pressed Enter
+    on an empty composer; only real (non-ghost) composer text may confirm.
+    """
+    content = 'Try "fix typecheck errors"'
+    tui = _ScrollingComposerTui()
+    tui.ghost = content
+    tui.drop_paste = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    head = claude_native_bridge._submit_needle(content)
+    tail = claude_native_bridge._submit_tail_needle(content)
+    assert claude_native_bridge._draft_in_input_box(tui.render(), head, tail) is True
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.parametrize("focused", [True, False], ids=["focused-ghost", "unfocused-ghost"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_accepted_submit_is_not_re_entered_when_a_matching_suggestion_appears(
+    focused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    After a successful submit the box may show a suggestion with the same words.
+
+    Read as plain text that ghost looked like the draft still sitting there,
+    so verification sent retry Enters — into a box whose Enter would act on
+    the suggestion. The accepted submit must get exactly one Enter.
+    """
+    content = "run the full test suite again and report the failures"
+    tui = _ScrollingComposerTui()
+    tui.ghost_after_submit = content
+    tui.ghost_focused = focused
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content]
+    assert tui.key_presses().count("Enter") == 1, tui.key_presses()
+
+
+def test_ghost_signature_is_exact_and_never_a_collapsed_paste_badge() -> None:
+    """
+    Only the two verified ghost renderings count; a badge never does.
+
+    2.1.280 draws a placeholder as an inverse first cell plus dim text while
+    focused and as all-dim text while unfocused (captured live). Anything
+    else — a collapsed ``[Pasted text …]`` badge in any styling, a real draft
+    with the cursor block on its first character (vim normal mode / Home) —
+    is draft content.
+    """
+    signature = claude_native_bridge._composer_ghost_signature
+    focused = _styled_composer_9026('\x1b[7mT\x1b[0;2m\x1b[39m\x1b[49mry "fix typecheck errors"')
+    unfocused = _styled_composer_9026('\x1b[2mTry "fix typecheck errors"')
+    assert signature(focused) == "focused"
+    assert signature(unfocused) == "unfocused"
+    assert signature(_styled_composer_9026("\x1b[7m[\x1b[0;2mPasted text #1 +3 lines]")) is None
+    assert signature(_styled_composer_9026("\x1b[2m[Pasted text #1 +3 lines]\x1b[0m")) is None
+    assert signature(_styled_composer_9026("[Pasted text #1 +3 lines]\x1b[7m \x1b[0m")) is None
+    assert signature(_styled_composer_9026("\x1b[7mf\x1b[0mix the bug")) is None
+    assert signature(_styled_composer_9026("\x1b[7mf\x1b[0mix \x1b[2mthe bug")) is None
+    assert signature(_styled_composer_9026("fix the bug\x1b[7m \x1b[0m")) is None
+    assert signature(_styled_composer_9026("\x1b[7m \x1b[0m")) is None
+    assert signature(_styled_composer_9026("\x1b[7mx\x1b[0m")) is None
+    assert signature("") is None
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_all_dim_real_draft_is_cleared_not_mistaken_for_a_ghost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An all-dim draft that ``C-u`` deletes was real text and is cleared first.
+
+    All-dim is also how an unfocused ghost looks, so it is only treated as
+    empty once a ``C-u`` burst verifiably leaves it unchanged — a real draft
+    shrinks, a ghost does not.
+    """
+    tui = _ScrollingComposerTui(draft="stale dim draft text\n")
+    tui.dim_draft = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+@pytest.mark.parametrize("focused", [True, False], ids=["focused-ghost", "unfocused-ghost"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_ghost_in_the_empty_box_does_not_block_delivery(
+    focused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both verified ghost renderings read as an empty box; the message delivers."""
+    tui = _ScrollingComposerTui()
+    tui.ghost = 'Try "fix typecheck errors"'
+    tui.ghost_focused = focused
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_dim_collapsed_paste_badge_is_cleared_before_pasting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale ``[Pasted text …]`` badge is never read as an empty box."""
+    tui = _ScrollingComposerTui()
+    tui.run(["tmux", "load-buffer", str(_write_9026(tmp_path, "a\nb\nc\nd\n"))])
+    tui.run(["tmux", "paste-buffer", "-t", "t"])
+    tui.dim_draft = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+def _write_9026(tmp_path: Path, text: str) -> Path:
+    """
+    Write *text* as a paste-buffer source file for the fake.
+
+    :param tmp_path: Per-test temp directory.
+    :param text: Buffer contents.
+    :returns: The file path.
+    """
+    path = tmp_path / "stale-paste.bin"
+    path.write_bytes(text.replace("\n", "\r").encode("utf-8"))
+    return path
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_tail_visible_draft_with_a_stacked_dialog_gets_no_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dialog that pops with the paste is never answered by the submit Enter.
+
+    The draft's tail is plainly in the box under the dialog, so a needle-first
+    check confirmed it and the Enter went to the dialog's selected option.
+    Dialogs are checked before any needle match; one that will not go away
+    fails the delivery with no Enter at all.
+    """
+    tui = _ScrollingComposerTui()
+    tui.dialog_on_paste = True
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.enter_into_dialog == 0
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dialog_that_opens_right_before_the_enter_is_not_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The box is re-validated immediately before Enter.
+
+    Here the dialog opens after the draft was confirmed — during the settle
+    and pending-prompt check, which ignores stacked dialogs because the
+    composer is still drawn.
+    """
+    tui = _ScrollingComposerTui()
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_pending = claude_native_bridge.has_pending_user_prompt
+    calls = {"n": 0}
+
+    def _pending_then_dialog(bridge: Path) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 2:  # the pre-Enter check, after the draft confirmed
+            tui.dialog = True
+        return real_pending(bridge)
+
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", _pending_then_dialog)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert calls["n"] >= 2
+    assert "Enter" not in tui.key_presses()
+    assert tui.enter_into_dialog == 0
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_unaccepted_submit_cleanup_waits_through_a_torn_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A torn first cleanup capture does not skip the post-submit cleanup.
+
+    The one-shot check saw no composer, left the stale draft in the box, and
+    the next delivery's text was merged with it.
+    """
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    def _verify_fails_then_tear(*_args: object, **_kwargs: object) -> bool:
+        tui.torn_captures = 2
+        return False
+
+    monkeypatch.setattr(claude_native_bridge, "_verify_submit_accepted", _verify_fails_then_tear)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.draft == "", f"stale draft left after a torn cleanup capture: {tui.draft!r}"
+    assert tui.key_presses().count("Enter") == 1
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_clear_stops_pressing_once_a_dialog_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clear keys go out in small bursts and stop the moment a dialog owns the keys."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(700, tag="Stale draft") + "\n")
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_run = tui.run
+
+    def _dialog_after_first_burst(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = real_run(cmd, **kwargs)
+        if "send-keys" in cmd and "C-u" in cmd:
+            tui.dialog = True
+        return result
+
+    monkeypatch.setattr("subprocess.run", _dialog_after_first_burst)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    bursts = [e for e in tui.events if e == ("key", "C-u")]
+    assert 0 < len(bursts) <= claude_native_bridge._COMPOSER_CLEAR_KEYS_PER_BURST
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "Enter" not in tui.key_presses()
+
+
+def test_tail_needle_ignores_trailing_whitespace_and_keeps_wide_characters() -> None:
+    """Trailing blanks never enter the marker; CJK characters are kept verbatim."""
+    tail = claude_native_bridge._submit_tail_needle
+    assert tail("please review   \n\n\t \n") == tail("please review")
+    assert tail("日本語のテキストを確認してください。") == "日本語のテキストを確認してください。"
+    long_cjk = "確認" * 40
+    assert tail(long_cjk) == long_cjk[-claude_native_bridge._DRAFT_TAIL_NEEDLE_MAX_CHARS :]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_wide_character_draft_with_hidden_head_confirms_via_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long CJK single-line draft (head scrolled away) still delivers once."""
+    content = "レビュー結果：" + "肩のプレートを貫通するメッシュを修正してください。" * 25
+    tui = _ScrollingComposerTui()
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content=content[:700])
+
+    assert tui.submitted == [content[:700]]
+    assert tui.key_presses().count("Enter") == 1

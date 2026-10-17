@@ -126,6 +126,9 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    # The fake draws no styling, so its ``capture-pane -e`` read is the same
+    # text; a match must hold in the styled re-read before it confirms.
+    monkeypatch.setattr(bridge, "_capture_pane_styled", lambda *_a, **_k: pane)
     if scenario == "observation_error":
         monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
     if scenario.startswith("pending_"):
