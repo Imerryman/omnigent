@@ -5340,32 +5340,39 @@ def test_delivery_signal_requires_a_record_after_the_pre_submit_cursor(
 
     # Pane text cannot produce the signal, and neither can writing a convincing
     # envelope into a file that is not the hook log.
+    _pin_session_9026(bridge_dir)
     (bridge_dir / "pane.txt").write_text(_FORGED_SURFACE_PANE)
     (bridge_dir / "not-hooks.jsonl").write_text(
         json.dumps({"payload": {"hook_event_name": "UserPromptSubmit"}}) + "\n"
     )
-    assert _submit_reached_claude(bridge_dir, 0) is False
-    assert _submit_reached_claude(None, 0) is False, "no bridge dir => no channel"
+    ours = {"expected_prompt": "Follow-up", "submitted_after": time.time()}
+    assert _submit_reached_claude(bridge_dir, 0, **ours) is False
+    assert _submit_reached_claude(None, 0, **ours) is False, "no bridge dir => no channel"
 
     # A previous prompt's record, already on file when the cursor was taken.
-    _hook_record(bridge_dir, "UserPromptSubmit")
+    _prompt_hook_9026(bridge_dir, "Follow-up")
     cursor = claude_native_bridge.count_hook_events(bridge_dir)
-    assert _submit_reached_claude(bridge_dir, cursor) is False, "pre-submit record is not ours"
+    ours = {"expected_prompt": "Follow-up", "submitted_after": time.time()}
+    assert _submit_reached_claude(bridge_dir, cursor, **ours) is False, "pre-submit record"
     # Without a baseline the signal is unsound, so it is off rather than guessed.
-    assert _submit_reached_claude(bridge_dir, None) is False
+    assert _submit_reached_claude(bridge_dir, None, **ours) is False
 
-    # Our own record, appended after the cursor.
-    _hook_record(bridge_dir, "UserPromptSubmit")
-    assert _submit_reached_claude(bridge_dir, cursor) is True
+    # Our own record, appended after the cursor (and after the Enter).
+    _prompt_hook_9026(bridge_dir, "Follow-up")
+    assert _submit_reached_claude(bridge_dir, cursor, **ours) is True
+    # ...but only when the caller can say which prompt and which Enter it is.
+    assert _submit_reached_claude(bridge_dir, cursor) is False
 
     # A subagent's record never answers for the parent turn, and another event
     # is not a delivery.
     sub = tmp_path / "sub"
-    _hook_record(sub, "UserPromptSubmit", transcript_path="/p/subagents/a.jsonl")
-    assert _submit_reached_claude(sub, 0) is False
+    _pin_session_9026(sub)
+    _prompt_hook_9026(sub, "Follow-up", transcript_path="/p/subagents/a.jsonl")
+    assert _submit_reached_claude(sub, 0, **ours) is False
     stopped = tmp_path / "stopped"
+    _pin_session_9026(stopped)
     _hook_record(stopped, "Stop")
-    assert _submit_reached_claude(stopped, 0) is False
+    assert _submit_reached_claude(stopped, 0, **ours) is False
 
 
 def test_submit_accepted_when_claude_records_the_prompt(
@@ -5382,7 +5389,9 @@ def test_submit_accepted_when_claude_records_the_prompt(
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    _pin_session_9026(bridge_dir)
     cursor = claude_native_bridge.count_hook_events(bridge_dir)
+    submitted_after = time.time()
     captures = 0
 
     def capture(*_: str) -> str:
@@ -5390,7 +5399,7 @@ def test_submit_accepted_when_claude_records_the_prompt(
         captures += 1
         assert captures <= 3, "a recorded prompt must be accepted promptly, not polled out"
         if captures == 2:
-            _hook_record(bridge_dir, "UserPromptSubmit")
+            _prompt_hook_9026(bridge_dir, "Follow-up on the review")
         return "  ⎿  \x00 torn frame\n"
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
@@ -5405,6 +5414,8 @@ def test_submit_accepted_when_claude_records_the_prompt(
         what="submitted message",
         bridge_dir=bridge_dir,
         hooks_cursor=cursor,
+        expected_prompt="Follow-up on the review",
+        submitted_after=submitted_after,
     )
     assert time.monotonic() - started < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4
 
@@ -5433,7 +5444,8 @@ def test_submit_baseline_is_captured_before_the_enter_keystroke(
     )
     # A previous turn's record is already on file, so a correct baseline excludes
     # it and only the record written by this Enter can accept.
-    _hook_record(bridge_dir, "UserPromptSubmit")
+    _pin_session_9026(bridge_dir)
+    _prompt_hook_9026(bridge_dir, "ask me something")
     tui: dict[str, Any] = {"pane": _composer_pane()}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -5445,7 +5457,7 @@ def test_submit_baseline_is_captured_before_the_enter_keystroke(
         if cmd[-1] == "Enter":
             # The hook wins the race against the first capture, and the pane is
             # left showing only the question — no composer, no boxed chrome.
-            _hook_record(bridge_dir, "UserPromptSubmit")
+            _prompt_hook_9026(bridge_dir, "ask me something")
             tui["pane"] = _QUESTION_SURFACE_PANE
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -13813,6 +13825,10 @@ class _ScrollingComposerTui:
         # styled captures; a focus-in event turns it on, as on the real TUI.
         self.draft_cursor = False
         self.dim_on_enter = False
+        # Called on every Enter (e.g. to append the hook record Claude writes).
+        self.on_enter: Any = None
+        # Captures that come back torn right after an Enter.
+        self.torn_after_enter = 0
 
     # -- rendering ---------------------------------------------------------
     def _rows(self) -> list[str]:
@@ -13933,6 +13949,9 @@ class _ScrollingComposerTui:
                         self.dialog = False
                     continue
                 if key == "Enter":
+                    if self.on_enter is not None:
+                        self.on_enter()
+                    self.torn_captures += self.torn_after_enter
                     if self.dim_on_enter:
                         self.dim_draft = True
                     if not self.swallow_enter and self.draft:
@@ -14344,11 +14363,12 @@ def test_all_dim_real_draft_is_cleared_not_mistaken_for_a_ghost(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    An all-dim draft that ``C-u`` deletes was real text and is cleared first.
+    An all-dim draft is cleared first, never pasted over.
 
-    All-dim is also how an unfocused ghost looks, so it is only treated as
-    empty once a ``C-u`` burst verifiably leaves it unchanged — a real draft
-    shrinks, a ghost does not.
+    All-dim is also how an unfocused ghost looks, so it is never empty on its
+    own: a focus-in event makes a ghost take the verified focused rendering
+    while real text shows its caret, and the caret-bearing box is cleared
+    like any other draft.
     """
     tui = _ScrollingComposerTui(draft="stale dim draft text\n")
     tui.dim_draft = True
@@ -14715,3 +14735,190 @@ def test_real_styled_pasted_text_badge_still_confirms() -> None:
     )
     assert claude_native_bridge._composer_ghost_signature(styled) is None
     assert claude_native_bridge._draft_in_styled_input_box(styled, "line 0", "line4") is True
+
+
+# -- Rework round 4: the UserPromptSubmit record must be THIS prompt's --
+
+_SESSION_9026 = "8a1d72fb-2a76-4158-baf0-52fe663236bd"
+
+
+def _pin_session_9026(bridge_dir: Path) -> None:
+    """
+    Pin the active Claude session the way its SessionStart hook does.
+
+    :param bridge_dir: Bridge directory.
+    :returns: None.
+    """
+    claude_native_bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": _SESSION_9026,
+            "transcript_path": f"/p/{_SESSION_9026}.jsonl",
+        },
+    )
+
+
+def _prompt_hook_9026(bridge_dir: Path, prompt: str | None, **extra: object) -> None:
+    """
+    Append a parent-process UserPromptSubmit record shaped like 2.1.280's.
+
+    The live payload (captured with a blocking hook) carries ``cwd``,
+    ``hook_event_name``, ``permission_mode``, ``prompt``, ``prompt_id``,
+    ``session_id`` and ``transcript_path``.
+
+    :param bridge_dir: Bridge directory.
+    :param prompt: The ``prompt`` field, or ``None`` to omit it.
+    :param extra: Field overrides, e.g. ``session_id="other"``.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "cwd": "/w",
+        "permission_mode": "default",
+        "prompt_id": "p-1",
+        "session_id": _SESSION_9026,
+        "transcript_path": f"/p/{_SESSION_9026}.jsonl",
+        **extra,
+    }
+    if prompt is not None:
+        payload["prompt"] = prompt
+    _hook_record(bridge_dir, "UserPromptSubmit", **payload)
+
+
+def _hook_during_revalidation_9026(
+    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, prompt: str
+) -> None:
+    """
+    Append a prompt record while the pre-Enter re-validation runs.
+
+    That is after the hook-cursor baseline and before this delivery's Enter —
+    a previous prompt's late record landing in the gap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param bridge_dir: Bridge directory.
+    :param prompt: The late record's prompt.
+    :returns: None.
+    """
+    real = claude_native_bridge._revalidate_draft_before_enter
+
+    def _revalidate_then_late_hook(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        _prompt_hook_9026(bridge_dir, prompt)
+
+    monkeypatch.setattr(
+        claude_native_bridge, "_revalidate_draft_before_enter", _revalidate_then_late_hook
+    )
+
+
+@pytest.mark.parametrize(
+    "late_prompt",
+    ["the previous prompt, delivered a moment ago", "SAME"],
+    ids=["unrelated-prompt", "identical-prompt"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_late_hook_from_a_previous_prompt_never_confirms_this_submit(
+    late_prompt: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A record appended after the baseline but before this Enter is not this prompt's.
+
+    The baseline is taken before re-validation, so a previous prompt's late
+    record can land in between. Here this Enter is swallowed and the next
+    frames are torn, so only the hook could answer — and accepting by line
+    position alone credited the old record, returned success, and skipped the
+    cleanup with the draft still in the box. Even an identical prompt (the
+    same message sent twice) recorded before this Enter is not this submit.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    _hook_during_revalidation_9026(
+        monkeypatch, bridge_dir, content if late_prompt == "SAME" else late_prompt
+    )
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert tui.draft == "", "the cleanup must still run"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"prompt": None},
+        {"session_id": None},
+        {"session_id": "another-session"},
+        {"prompt": "a different prompt"},
+    ],
+    ids=["no-prompt", "no-session", "other-session", "other-prompt"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_an_uncorrelated_hook_after_the_enter_never_confirms(
+    fields: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record that lacks, or contradicts, this prompt and session is not evidence."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    prompt = fields.get("prompt", content)
+    extra = {k: v for k, v in fields.items() if k != "prompt" and v is not None}
+    if fields.get("session_id", "") is None:
+        extra["session_id"] = ""
+
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, prompt, **extra)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert tui.draft == ""
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        lambda c: c,
+        lambda c: c + "\n",
+        lambda c: c.replace("\t", "    ").replace("\r\n", "\n") + "\n",
+    ],
+    ids=["exact", "trailing-newline", "tabs-crlf-normalized"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_the_correlated_prompt_hook_still_confirms_an_unreadable_frame(
+    recorded: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    This prompt's own record, written after this Enter, still confirms delivery.
+
+    The submit lands but every frame after it is torn, so the record is the
+    only evidence. Claude records the prompt with CRLF folded to LF, tabs as
+    four spaces and a trailing newline on multi-line drafts (all captured
+    live), so the match is on whitespace-folded content.
+    """
+    content = "Rework request:\r\n\tre-export the knight kit mesh " + _prose_9026(200)
+    tui = _ScrollingComposerTui()
+    tui.torn_after_enter = 10_000
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, recorded(content))
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert len(tui.submitted) == 1
+    assert tui.key_presses().count("Enter") == 1
+
+
+def test_prompt_correlation_normalizes_like_claude_records_it() -> None:
+    """Whitespace folds away (CRLF, tabs→spaces, trailing newline); the U+FEFF escape too."""
+    same = claude_native_bridge._same_prompt
+    assert same("a b\r\n\tc", "a b\n    c\n")
+    assert same("﻿/help me", "/help me")
+    assert same("line 0\nline 1", "line 0\nline 1\n")
+    assert not same("a b c", "a b c d")
+    assert not same("", "")
+    assert not same("abc", None)

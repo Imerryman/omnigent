@@ -392,7 +392,8 @@ _COMPOSER_CLEAR_TIMEOUT_S = 10.0
 # before the submit Enter before delivery is abandoned undelivered.
 _PRE_SUBMIT_REVALIDATE_TIMEOUT_S = 2.0
 # How long an all-dim box may take to redraw after a focus-in event before it
-# is treated as unresolved (draft content / unknown, never empty).
+# is treated as unresolved (draft content / unknown, never empty). This bounds
+# the redraw WAIT only; each capture inside it has tmux's own subprocess timeout.
 _FOCUS_IN_SETTLE_TIMEOUT_S = 1.0
 # How long a failed submit's cleanup waits through unreadable captures to
 # positively identify the stale draft before giving up (without a key).
@@ -3765,9 +3766,46 @@ def read_hook_events_from_offset(
     )
 
 
-def _user_prompt_reached_claude_since(bridge_dir: Path, start_event_count: int) -> bool:
+def _same_prompt(sent: str, recorded: object) -> bool:
     """
-    Return whether Claude Code recorded a new user prompt after a hook cursor.
+    Report whether a ``UserPromptSubmit`` ``prompt`` field is the text we sent.
+
+    Claude Code 2.1.280 records the submitted draft, not the keystrokes
+    (captured live with a blocking hook): a collapsed ``[Pasted text …]``
+    paste arrives expanded in full (36.8 KB untruncated), CRLF folds to LF,
+    tabs become four spaces, and a multi-line draft gains a trailing newline.
+    So the comparison is on whitespace-folded content, with the U+FEFF
+    slash-command escape and the control characters the paste payload drops
+    removed too. Equality, not containment: a longer or shorter prompt is a
+    different prompt.
+
+    :param sent: The text pasted into the composer.
+    :param recorded: The record's ``prompt`` field (anything; non-strings never
+        match).
+    :returns: ``True`` when both fold to the same non-empty content.
+    """
+
+    def fold(text: str) -> str:
+        return "".join(
+            ch for ch in text if not ch.isspace() and ch != "﻿" and ord(ch) >= 0x20 and ch != "\x7f"
+        )
+
+    if not isinstance(recorded, str):
+        return False
+    folded = fold(sent)
+    return bool(folded) and folded == fold(recorded)
+
+
+def _user_prompt_reached_claude_since(
+    bridge_dir: Path,
+    start_event_count: int,
+    *,
+    expected_prompt: str,
+    submitted_after: float,
+    session_id: str,
+) -> bool:
+    """
+    Return whether Claude Code recorded THIS prompt after a hook cursor.
 
     ``UserPromptSubmit`` is registered in :func:`_claude_hook_settings` as the
     symmetric counterpart to ``Stop``: Claude Code runs it "when a new user
@@ -3786,10 +3824,22 @@ def _user_prompt_reached_claude_since(bridge_dir: Path, start_event_count: int) 
     :func:`stop_hook_seen_since` skips them, so a background Task agent's edge
     never answers for the parent turn.
 
+    Position after the cursor is not enough: the cursor is taken before the
+    pre-Enter re-validation, so a previous prompt's late record can land in
+    that gap. A record only counts when it is correlated with this submit —
+    its ``prompt`` is the text we pasted (:func:`_same_prompt`), its
+    ``session_id`` is the active session, and the hook wrote it
+    (``recorded_at``) no earlier than this Enter. A record missing any of
+    those fields never counts; the caller then falls back to the pane.
+
     :param bridge_dir: Bridge directory path.
     :param start_event_count: Hook record count captured before the submit.
-    :returns: ``True`` once a parent-process ``UserPromptSubmit`` hook has been
-        recorded after the cursor.
+    :param expected_prompt: The text this submit pasted.
+    :param submitted_after: ``time.time()`` taken immediately before this
+        submit's Enter.
+    :param session_id: The active Claude session id.
+    :returns: ``True`` once a correlated parent-process ``UserPromptSubmit``
+        record has been recorded after the cursor.
     """
     path = bridge_dir / _HOOKS_FILE
     try:
@@ -3810,6 +3860,14 @@ def _user_prompt_reached_claude_since(bridge_dir: Path, start_event_count: int) 
                 if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
                     continue
                 if payload.get("agent_id"):
+                    continue
+                recorded_at = envelope.get("recorded_at")
+                if (
+                    not isinstance(recorded_at, int | float)
+                    or recorded_at < submitted_after
+                    or payload.get("session_id") != session_id
+                    or not _same_prompt(expected_prompt, payload.get("prompt"))
+                ):
                     continue
                 return True
     except FileNotFoundError:
@@ -4525,6 +4583,9 @@ def _paste_and_submit(
         socket_path, tmux_target, needle=needle, tail_needle=tail_needle
     )
     delivery_diagnostics.set_stage("submitting")
+    # Wall clock, like the hook's own ``recorded_at``: this prompt's record is
+    # written after this instant, a previous prompt's late record before it.
+    submitted_after = time.time()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     # Verify the submit took: a successful Enter clears the input box.
@@ -4544,6 +4605,8 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             hooks_cursor=hooks_cursor,
             ghost_aware=True,
+            expected_prompt=text,
+            submitted_after=submitted_after,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4621,6 +4684,8 @@ def _verify_submit_accepted(
     hooks_cursor: int | None = None,
     tail_needle: str = "",
     ghost_aware: bool = False,
+    expected_prompt: str | None = None,
+    submitted_after: float | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4656,6 +4721,11 @@ def _verify_submit_accepted(
         (:func:`_draft_confirmed`), so a dim suggestion that repeats the
         message after a successful submit counts as the draft gone, not as
         the draft still there to re-Enter.
+    :param expected_prompt: The text the submit pasted, which a
+        ``UserPromptSubmit`` record must carry to count (see
+        :func:`_submit_reached_claude`); ``None`` disables that signal.
+    :param submitted_after: ``time.time()`` taken immediately before the
+        submit's (first) Enter; ``None`` disables that signal.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4706,7 +4776,12 @@ def _verify_submit_accepted(
             #    ``UserPromptSubmit`` hook, which fires when a prompt reaches it
             #    and therefore before any question that prompt raises.
             popped = _submit_popped_surface(pane)
-            if popped or _submit_reached_claude(bridge_dir, hooks_cursor):
+            if popped or _submit_reached_claude(
+                bridge_dir,
+                hooks_cursor,
+                expected_prompt=expected_prompt,
+                submitted_after=submitted_after,
+            ):
                 delivery_diagnostics.record_verification(
                     draft_still_present=False,
                     pane=pane,
@@ -5027,6 +5102,7 @@ def inject_slash_command(
     # Captured before the keystroke, for the same reason as in
     # :func:`inject_user_message`.
     hooks_cursor = count_hook_events(bridge_dir)
+    submitted_after = time.time()
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -5038,6 +5114,8 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
             hooks_cursor=hooks_cursor,
+            expected_prompt=command,
+            submitted_after=submitted_after,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -6208,7 +6286,13 @@ def _composer_row(pane: str) -> str | None:
     return None
 
 
-def _submit_reached_claude(bridge_dir: Path | None, hooks_cursor: int | None) -> bool:
+def _submit_reached_claude(
+    bridge_dir: Path | None,
+    hooks_cursor: int | None,
+    *,
+    expected_prompt: str | None = None,
+    submitted_after: float | None = None,
+) -> bool:
     """
     Report whether Claude Code itself recorded the prompt this submit sent.
 
@@ -6237,12 +6321,28 @@ def _submit_reached_claude(bridge_dir: Path | None, hooks_cursor: int | None) ->
         both directions (a previous prompt's record would count as ours, and a
         fast record would be missed), so ``None`` is ``False`` rather than a
         guess.
-    :returns: ``True`` when a parent-process ``UserPromptSubmit`` record has
-        landed after *hooks_cursor*.
+    :param expected_prompt: The text this submit pasted; ``None`` disables the
+        signal (an uncorrelatable record is never evidence).
+    :param submitted_after: ``time.time()`` taken immediately before the Enter;
+        ``None`` disables the signal.
+    :returns: ``True`` when a parent-process ``UserPromptSubmit`` record for
+        this prompt, in the active session, landed after *hooks_cursor* and
+        after the Enter (see :func:`_user_prompt_reached_claude_since`).
     """
     if bridge_dir is None or hooks_cursor is None:
         return False
-    return _user_prompt_reached_claude_since(bridge_dir, hooks_cursor)
+    if expected_prompt is None or submitted_after is None:
+        return False
+    session_id = read_claude_session_id(bridge_dir)
+    if session_id is None:
+        return False
+    return _user_prompt_reached_claude_since(
+        bridge_dir,
+        hooks_cursor,
+        expected_prompt=expected_prompt,
+        submitted_after=submitted_after,
+        session_id=session_id,
+    )
 
 
 def _submit_popped_surface(pane: str) -> bool:
@@ -6768,6 +6868,10 @@ def _send_focus_in(socket_path: str, tmux_target: str) -> None:
     the caret where the cursor is. Best effort: a tmux error leaves the box
     unresolved, which every caller treats as unknown.
 
+    Side effect on an attached human: Claude Code then believes its terminal
+    is focused until that client's next real focus change, which only affects
+    how the caret and the placeholder are drawn — no input is consumed.
+
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :returns: None.
@@ -6788,13 +6892,20 @@ def _resolved_styled_capture(socket_path: str, tmux_target: str) -> str:
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :returns: A styled capture. When the first read is an ``"unfocused"``
         candidate (and no dialog is up), a focus-in is sent and the box is
-        re-read for up to :data:`_FOCUS_IN_SETTLE_TIMEOUT_S` until it draws
-        something else; a box still all-dim after that is returned as is.
+        re-read until it draws something else, for at most
+        :data:`_FOCUS_IN_SETTLE_TIMEOUT_S` of redraw wait — plus the time of
+        the captures themselves, each bounded by tmux's own subprocess
+        timeout (:data:`_TMUX_SEND_TIMEOUT_S`). A box still all-dim after that
+        is returned as is.
     """
     styled = _capture_pane_styled(socket_path, tmux_target)
     if _composer_ghost_signature(styled) != "unfocused" or (
         _stacked_dialog_headline(_strip_capture_escapes(styled)) is not None
     ):
+        return styled
+    # Re-check on a fresh frame immediately before sending: the event goes to
+    # whatever owns the keyboard, and a dialog may have opened since.
+    if _stacked_dialog_headline(_capture_pane(socket_path, tmux_target)) is not None:
         return styled
     _send_focus_in(socket_path, tmux_target)
     deadline = time.monotonic() + _FOCUS_IN_SETTLE_TIMEOUT_S
