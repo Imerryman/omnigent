@@ -106,7 +106,9 @@ def test_delivery_diagnostics(
                     handle.write(
                         json.dumps(
                             {
-                                "recorded_at": elapsed,
+                                # Written after the Enter (the fake clock does
+                                # not advance inside the keystroke).
+                                "recorded_at": elapsed + 0.001,
                                 "payload": {
                                     "hook_event_name": "UserPromptSubmit",
                                     "session_id": "claude-session",

@@ -398,6 +398,14 @@ _FOCUS_IN_SETTLE_TIMEOUT_S = 1.0
 # How long a failed submit's cleanup waits through unreadable captures to
 # positively identify the stale draft before giving up (without a key).
 _FAILED_SUBMIT_CLEANUP_TIMEOUT_S = 5.0
+# The submit ledger (see :func:`_user_prompt_reached_claude_since`): every
+# submit Enter the bridge pressed, so a delayed UserPromptSubmit record of an
+# earlier identical prompt pays off that prompt's claim instead of confirming
+# a later one. Claims older than the window are taken as settled; the file is
+# compacted past the line cap.
+_SUBMIT_LEDGER_FILE = "submit_ledger.jsonl"
+_SUBMIT_LEDGER_WINDOW_S = 120.0
+_SUBMIT_LEDGER_MAX_LINES = 512
 # Bound on the composer capture logged at DEBUG when a draft is not confirmed.
 _DRAFT_FAILURE_LOG_TAIL_CHARS = 600
 # Mode footer Claude Code renders below its input box, keyed by
@@ -3766,86 +3774,239 @@ def read_hook_events_from_offset(
     )
 
 
+# U+FEFF that :func:`_escape_slash_command_text` puts before a leading slash.
+_SLASH_ESCAPE_RE = re.compile("^(\\s*)\ufeff(?=/)")
+
+
+def _canonical_prompt(text: str) -> str:
+    r"""
+    Canonicalize a prompt for correlation, undoing only measured transport changes.
+
+    Measured on Claude Code 2.1.280 with a blocking ``UserPromptSubmit`` hook
+    (pasted text vs. the recorded ``prompt``): CR and CRLF arrive as LF; a tab
+    as four spaces (fixed — ``"ab\tc"`` -> ``"ab    c"``, not to a tab stop);
+    ESC/BEL and the other control characters the paste payload drops never
+    arrive (:func:`_paste_payload_bytes`); trailing whitespace is not
+    transported reliably — an uncollapsed draft is trimmed (``"hello world
+    "`` -> ``"hello world"``, the bridge's appended newline included) while a
+    collapsed ``[Pasted text …]`` paste keeps it (``"a\nb\nc\n"`` ->
+    ``"a\nb\nc\n\n"``); and the U+FEFF slash-command escape may be consumed.
+    Exactly those are undone: line endings, tabs, dropped controls, trailing
+    whitespace, and U+FEFF only at the slash-escape position. Leading and
+    interior whitespace is kept verbatim — it arrives verbatim — so prompts
+    that differ only in where a space or newline falls stay different.
+
+    :param text: Sent text or a recorded ``prompt``.
+    :returns: The canonical form, e.g. ``"ab    c"`` for ``"ab\tc\n"``.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+    text = "".join(ch for ch in text if ch == "\n" or ord(ch) >= 0x20)
+    return _SLASH_ESCAPE_RE.sub(r"\1", text, count=1).rstrip()
+
+
 def _same_prompt(sent: str, recorded: object) -> bool:
     """
     Report whether a ``UserPromptSubmit`` ``prompt`` field is the text we sent.
 
-    Claude Code 2.1.280 records the submitted draft, not the keystrokes
-    (captured live with a blocking hook): a collapsed ``[Pasted text …]``
-    paste arrives expanded in full (36.8 KB untruncated), CRLF folds to LF,
-    tabs become four spaces, and a multi-line draft gains a trailing newline.
-    So the comparison is on whitespace-folded content, with the U+FEFF
-    slash-command escape and the control characters the paste payload drops
-    removed too. Equality, not containment: a longer or shorter prompt is a
-    different prompt.
-
     :param sent: The text pasted into the composer.
     :param recorded: The record's ``prompt`` field (anything; non-strings never
         match).
-    :returns: ``True`` when both fold to the same non-empty content.
+    :returns: ``True`` when both have the same non-empty canonical form
+        (:func:`_canonical_prompt`).
     """
-
-    def fold(text: str) -> str:
-        return "".join(
-            ch for ch in text if not ch.isspace() and ch != "﻿" and ord(ch) >= 0x20 and ch != "\x7f"
-        )
-
     if not isinstance(recorded, str):
         return False
-    folded = fold(sent)
-    return bool(folded) and folded == fold(recorded)
+    canonical = _canonical_prompt(sent)
+    return bool(canonical) and canonical == _canonical_prompt(recorded)
 
 
-def _user_prompt_reached_claude_since(
-    bridge_dir: Path,
-    start_event_count: int,
-    *,
-    expected_prompt: str,
-    submitted_after: float,
-    session_id: str,
-) -> bool:
+def _prompt_key(text: str) -> str:
     """
-    Return whether Claude Code recorded THIS prompt after a hook cursor.
+    Digest a prompt's canonical form, so the ledger never stores message text.
+
+    :param text: Sent text or a recorded ``prompt``.
+    :returns: Hex SHA-256 of :func:`_canonical_prompt`.
+    """
+    return hashlib.sha256(_canonical_prompt(text).encode("utf-8")).hexdigest()
+
+
+class _SubmitClaim(NamedTuple):
+    """One submit Enter the bridge pressed, owed at most one ``UserPromptSubmit`` record."""
+
+    claim_id: str
+    # Active Claude session, snapshotted before the Enter.
+    session_id: str
+    # :func:`_prompt_key` of the submitted text.
+    prompt_key: str
+    # ``hooks.jsonl`` record count taken before the Enter.
+    hooks_cursor: int
+    # ``time.time()`` taken before the Enter.
+    submitted_after: float
+
+
+def _append_submit_ledger(bridge_dir: Path, entry: _JsonObject) -> None:
+    """
+    Append one entry to the submit ledger; best effort, compacted when long.
+
+    Callers hold the bridge's injection lock, so appends never interleave.
+
+    :param bridge_dir: Bridge directory path.
+    :param entry: ``{"claim": {...}}`` or ``{"void": "<claim_id>"}``.
+    :returns: None. An I/O error is logged; the ledger then simply knows less.
+    """
+    path = bridge_dir / _SUBMIT_LEDGER_FILE
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > _SUBMIT_LEDGER_MAX_LINES:
+            keep = lines[-(_SUBMIT_LEDGER_MAX_LINES // 2) :]
+            path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    except OSError:
+        _logger.warning("claude-native: could not update the submit ledger", exc_info=True)
+
+
+def _new_submit_claim(
+    bridge_dir: Path, *, prompt: str, hooks_cursor: int, submitted_after: float
+) -> _SubmitClaim | None:
+    """
+    Record that a submit Enter is about to be pressed for *prompt*.
+
+    :param bridge_dir: Bridge directory path.
+    :param prompt: The text in the composer.
+    :param hooks_cursor: ``hooks.jsonl`` record count taken before the Enter.
+    :param submitted_after: ``time.time()`` taken before the Enter.
+    :returns: The claim, or ``None`` when no session is pinned yet or the
+        prompt is empty — the hook signal is then off for this submit.
+    """
+    session_id = read_claude_session_id(bridge_dir)
+    if session_id is None or not _canonical_prompt(prompt):
+        return None
+    claim = _SubmitClaim(
+        claim_id=secrets.token_hex(8),
+        session_id=session_id,
+        prompt_key=_prompt_key(prompt),
+        hooks_cursor=hooks_cursor,
+        submitted_after=submitted_after,
+    )
+    _append_submit_ledger(bridge_dir, {"claim": claim._asdict()})
+    return claim
+
+
+def _void_submit_claim(bridge_dir: Path, claim: _SubmitClaim | None) -> None:
+    """
+    Mark a claim as owed no record: its submit verifiably never happened.
+
+    Used when the draft was positively found and cleared after the submit
+    window, or when Claude Code rejected the message as an unknown command
+    (which fires no ``UserPromptSubmit``). Otherwise the claim would absorb
+    the record of the caller's retry of the same message.
+
+    :param bridge_dir: Bridge directory path.
+    :param claim: The claim, or ``None`` (nothing to do).
+    :returns: None.
+    """
+    if claim is not None:
+        _append_submit_ledger(bridge_dir, {"void": claim.claim_id})
+
+
+def _read_submit_claims(bridge_dir: Path) -> list[_SubmitClaim]:
+    """
+    Read the ledger's claims, oldest first, without the voided ones.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: Claims in the order their Enters were pressed; empty when the
+        ledger is missing or unreadable.
+    """
+    try:
+        lines = (bridge_dir / _SUBMIT_LEDGER_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    claims: list[_SubmitClaim] = []
+    voided: set[str] = set()
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("void"), str):
+            voided.add(entry["void"])
+            continue
+        raw = entry.get("claim")
+        if not isinstance(raw, dict):
+            continue
+        try:
+            claims.append(
+                _SubmitClaim(
+                    claim_id=str(raw["claim_id"]),
+                    session_id=str(raw["session_id"]),
+                    prompt_key=str(raw["prompt_key"]),
+                    hooks_cursor=int(raw["hooks_cursor"]),
+                    submitted_after=float(raw["submitted_after"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return [claim for claim in claims if claim.claim_id not in voided]
+
+
+def _user_prompt_reached_claude_since(bridge_dir: Path, claim: _SubmitClaim) -> bool:
+    """
+    Return whether Claude Code recorded the prompt THIS claim's Enter submitted.
 
     ``UserPromptSubmit`` is registered in :func:`_claude_hook_settings` as the
     symmetric counterpart to ``Stop``: Claude Code runs it "when a new user
     prompt reaches Claude (web-UI message via tmux send-keys, or direct
-    keystrokes into the embedded terminal)". A record appended after the
-    cursor captured before a submit is therefore Claude Code's own statement
-    that the message landed — the authoritative answer to the question
-    :func:`_verify_submit_accepted` otherwise has to infer from a screenshot.
+    keystrokes into the embedded terminal)". It is written by a hook
+    subprocess appending to ``hooks.jsonl``, not by anything drawn in the pane,
+    so no amount of assistant output can fabricate it.
 
-    It is written by a hook subprocess appending to ``hooks.jsonl``, not by
-    anything drawn in the pane, so no amount of assistant output can fabricate
-    it. That is the whole point: pane text is forgeable, this is not.
+    A record is evidence only once correlated with this submit: a
+    parent-process record (no ``agent_id``, no ``subagents/`` transcript) of the
+    claim's session whose ``prompt`` is the submitted text
+    (:func:`_canonical_prompt`), appended after the claim's cursor and written
+    (``recorded_at``) strictly after its Enter. A record missing any of those
+    never counts.
 
-    Subagent records (carrying an ``agent_id``, or whose ``transcript_path``
-    contains a ``subagents/`` component) are skipped the same way
-    :func:`stop_hook_seen_since` skips them, so a background Task agent's edge
-    never answers for the parent turn.
-
-    Position after the cursor is not enough: the cursor is taken before the
-    pre-Enter re-validation, so a previous prompt's late record can land in
-    that gap. A record only counts when it is correlated with this submit —
-    its ``prompt`` is the text we pasted (:func:`_same_prompt`), its
-    ``session_id`` is the active session, and the hook wrote it
-    (``recorded_at``) no earlier than this Enter. A record missing any of
-    those fields never counts; the caller then falls back to the pane.
+    Time and position still cannot tell this prompt's record from an EARLIER
+    identical prompt's delayed one (its hook may write during this Enter), so
+    records are accounted for, not merely matched: every Enter the bridge
+    pressed is a claim in the submit ledger, owed at most one record. Reading
+    the hook log in order, each correlated record (deduplicated by
+    ``prompt_id``) pays off the OLDEST outstanding claim for that session and
+    prompt it could belong to; this claim is confirmed only by a record that
+    pays IT. An earlier identical delivery confirmed by the pane before its
+    hook arrived therefore absorbs its own late record. Claims older than
+    :data:`_SUBMIT_LEDGER_WINDOW_S` are taken as settled (a hook never lags
+    that long), and a claim whose submit verifiably never happened is voided
+    (:func:`_void_submit_claim`). Without a ledger (missing, unwritable, or
+    lost with the bridge directory) only this claim is owed, which is the
+    time/position/prompt/session check alone.
 
     :param bridge_dir: Bridge directory path.
-    :param start_event_count: Hook record count captured before the submit.
-    :param expected_prompt: The text this submit pasted.
-    :param submitted_after: ``time.time()`` taken immediately before this
-        submit's Enter.
-    :param session_id: The active Claude session id.
-    :returns: ``True`` once a correlated parent-process ``UserPromptSubmit``
-        record has been recorded after the cursor.
+    :param claim: The claim recorded for this submit's Enter.
+    :returns: ``True`` once a correlated record has paid off this claim.
     """
+    owed = [
+        earlier
+        for earlier in _read_submit_claims(bridge_dir)
+        if earlier.claim_id != claim.claim_id
+        and earlier.session_id == claim.session_id
+        and earlier.prompt_key == claim.prompt_key
+        and earlier.submitted_after < claim.submitted_after
+        and claim.submitted_after - earlier.submitted_after <= _SUBMIT_LEDGER_WINDOW_S
+    ]
+    owed.append(claim)
+    start = min(entry.hooks_cursor for entry in owed)
+    paid: set[str] = set()
+    seen_prompt_ids: set[str] = set()
     path = bridge_dir / _HOOKS_FILE
     try:
         with path.open("r", encoding="utf-8") as handle:
             for index, line in enumerate(handle, start=1):
-                if index <= start_event_count:
+                if index <= start:
                     continue
                 try:
                     envelope = json.loads(line)
@@ -3862,14 +4023,30 @@ def _user_prompt_reached_claude_since(
                 if payload.get("agent_id"):
                     continue
                 recorded_at = envelope.get("recorded_at")
+                prompt = payload.get("prompt")
                 if (
                     not isinstance(recorded_at, int | float)
-                    or recorded_at < submitted_after
-                    or payload.get("session_id") != session_id
-                    or not _same_prompt(expected_prompt, payload.get("prompt"))
+                    or payload.get("session_id") != claim.session_id
+                    or not isinstance(prompt, str)
+                    or _prompt_key(prompt) != claim.prompt_key
+                    or not _canonical_prompt(prompt)
                 ):
                     continue
-                return True
+                prompt_id = payload.get("prompt_id")
+                if isinstance(prompt_id, str) and prompt_id:
+                    if prompt_id in seen_prompt_ids:
+                        continue
+                    seen_prompt_ids.add(prompt_id)
+                for entry in owed:
+                    if (
+                        entry.claim_id not in paid
+                        and index > entry.hooks_cursor
+                        and recorded_at > entry.submitted_after
+                    ):
+                        paid.add(entry.claim_id)
+                        break
+                if claim.claim_id in paid:
+                    return True
     except FileNotFoundError:
         return False
     except OSError:
@@ -4399,7 +4576,7 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(
+    claim = _paste_and_submit(
         bridge_dir,
         socket_path,
         tmux_target,
@@ -4418,8 +4595,10 @@ def inject_user_message(
         # No rejection: Claude Code accepted the command (a real skill or
         # custom command) and the turn is underway.
         return
-    # Claude Code dropped the message. Re-deliver it escaped so the text
-    # reaches the model as a regular user message instead of vanishing.
+    # Claude Code dropped the message — no UserPromptSubmit fires for it, so its
+    # claim owes nothing. Re-deliver it escaped so the text reaches the model
+    # as a regular user message instead of vanishing.
+    _void_submit_claim(bridge_dir, claim)
     _logger.info(
         "claude-native: Claude Code rejected unknown command /%s; "
         "re-delivering the message escaped as plain text",
@@ -4443,7 +4622,7 @@ def _paste_and_submit(
     text: str,
     needle: str,
     tail_needle: str = "",
-) -> None:
+) -> _SubmitClaim | None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
@@ -4470,7 +4649,9 @@ def _paste_and_submit(
     :param tail_needle: Draft marker from :func:`_submit_tail_needle`,
         matched alongside *needle* so a draft whose head scrolled out of the
         box still confirms. Empty disables it.
-    :returns: None.
+    :returns: The submit ledger claim of the accepted Enter (``None`` when no
+        session was pinned), so a caller that learns the submit was dropped
+        can void it.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
@@ -4573,19 +4754,31 @@ def _paste_and_submit(
     # below so that nothing — not even this file scan — sits between the last
     # read of the box and the keystroke.
     hooks_cursor = count_hook_events(bridge_dir)
+    # The ledger claim for this Enter, also written before the re-validation
+    # (file I/O stays out of the gap before the keystroke). Its session is
+    # snapshotted now, not read back during verification.
+    claim = _new_submit_claim(
+        bridge_dir, prompt=text, hooks_cursor=hooks_cursor, submitted_after=time.time()
+    )
     # Re-validate right before the keystroke: a dialog can open (they appear as
     # a turn ends) during the settle and the pending-prompt check above, which
     # only reads question/permission prompts and passes a stacked dialog
     # because the composer is still drawn under it. This is the LAST read of
     # the pane before Enter.
     delivery_diagnostics.set_stage("revalidating_draft")
-    _revalidate_draft_before_enter(
-        socket_path, tmux_target, needle=needle, tail_needle=tail_needle
-    )
+    try:
+        _revalidate_draft_before_enter(
+            socket_path, tmux_target, needle=needle, tail_needle=tail_needle
+        )
+    except BaseException:
+        _void_submit_claim(bridge_dir, claim)  # no Enter was pressed
+        raise
     delivery_diagnostics.set_stage("submitting")
     # Wall clock, like the hook's own ``recorded_at``: this prompt's record is
-    # written after this instant, a previous prompt's late record before it.
-    submitted_after = time.time()
+    # written after this instant. Kept before the keystroke — nothing proves a
+    # genuine hook cannot write before ``send-keys`` returns.
+    if claim is not None:
+        claim = claim._replace(submitted_after=time.time())
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     delivery_diagnostics.record_details(submit_sent=True)
     # Verify the submit took: a successful Enter clears the input box.
@@ -4605,8 +4798,7 @@ def _paste_and_submit(
             bridge_dir=bridge_dir,
             hooks_cursor=hooks_cursor,
             ghost_aware=True,
-            expected_prompt=text,
-            submitted_after=submitted_after,
+            submit_claim=claim,
         )
     except ClaudeUserPromptPending as exc:
         # The Enter already went out, so the prompt may belong to this message's own turn.
@@ -4615,8 +4807,11 @@ def _paste_and_submit(
             "it may already have been delivered."
         ) from exc
     if accepted:
-        return
-    _discard_unaccepted_draft(socket_path, tmux_target, needle=needle, tail_needle=tail_needle)
+        return claim
+    if _discard_unaccepted_draft(socket_path, tmux_target, needle=needle, tail_needle=tail_needle):
+        # The draft was positively found and cleared: this Enter submitted
+        # nothing, so its claim must not absorb a retry's record.
+        _void_submit_claim(bridge_dir, claim)
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(submission could not be confirmed). The message was not delivered."
@@ -4684,8 +4879,7 @@ def _verify_submit_accepted(
     hooks_cursor: int | None = None,
     tail_needle: str = "",
     ghost_aware: bool = False,
-    expected_prompt: str | None = None,
-    submitted_after: float | None = None,
+    submit_claim: _SubmitClaim | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4721,11 +4915,9 @@ def _verify_submit_accepted(
         (:func:`_draft_confirmed`), so a dim suggestion that repeats the
         message after a successful submit counts as the draft gone, not as
         the draft still there to re-Enter.
-    :param expected_prompt: The text the submit pasted, which a
-        ``UserPromptSubmit`` record must carry to count (see
+    :param submit_claim: The submit ledger claim recorded for the (first)
+        Enter, which a ``UserPromptSubmit`` record must pay off to count (see
         :func:`_submit_reached_claude`); ``None`` disables that signal.
-    :param submitted_after: ``time.time()`` taken immediately before the
-        submit's (first) Enter; ``None`` disables that signal.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4776,12 +4968,7 @@ def _verify_submit_accepted(
             #    ``UserPromptSubmit`` hook, which fires when a prompt reaches it
             #    and therefore before any question that prompt raises.
             popped = _submit_popped_surface(pane)
-            if popped or _submit_reached_claude(
-                bridge_dir,
-                hooks_cursor,
-                expected_prompt=expected_prompt,
-                submitted_after=submitted_after,
-            ):
+            if popped or _submit_reached_claude(bridge_dir, hooks_cursor, claim=submit_claim):
                 delivery_diagnostics.record_verification(
                     draft_still_present=False,
                     pane=pane,
@@ -5102,7 +5289,9 @@ def inject_slash_command(
     # Captured before the keystroke, for the same reason as in
     # :func:`inject_user_message`.
     hooks_cursor = count_hook_events(bridge_dir)
-    submitted_after = time.time()
+    claim = _new_submit_claim(
+        bridge_dir, prompt=command, hooks_cursor=hooks_cursor, submitted_after=time.time()
+    )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -5114,8 +5303,7 @@ def inject_slash_command(
             what="slash command",
             bridge_dir=bridge_dir,
             hooks_cursor=hooks_cursor,
-            expected_prompt=command,
-            submitted_after=submitted_after,
+            submit_claim=claim,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -6290,8 +6478,7 @@ def _submit_reached_claude(
     bridge_dir: Path | None,
     hooks_cursor: int | None,
     *,
-    expected_prompt: str | None = None,
-    submitted_after: float | None = None,
+    claim: _SubmitClaim | None = None,
 ) -> bool:
     """
     Report whether Claude Code itself recorded the prompt this submit sent.
@@ -6321,28 +6508,16 @@ def _submit_reached_claude(
         both directions (a previous prompt's record would count as ours, and a
         fast record would be missed), so ``None`` is ``False`` rather than a
         guess.
-    :param expected_prompt: The text this submit pasted; ``None`` disables the
-        signal (an uncorrelatable record is never evidence).
-    :param submitted_after: ``time.time()`` taken immediately before the Enter;
-        ``None`` disables the signal.
-    :returns: ``True`` when a parent-process ``UserPromptSubmit`` record for
-        this prompt, in the active session, landed after *hooks_cursor* and
-        after the Enter (see :func:`_user_prompt_reached_claude_since`).
+    :param claim: The submit ledger claim recorded for this Enter (its prompt,
+        pre-Enter session snapshot, cursor and time); ``None`` disables the
+        signal — an uncorrelatable record is never evidence.
+    :returns: ``True`` when a correlated parent-process ``UserPromptSubmit``
+        record paid off this claim (see
+        :func:`_user_prompt_reached_claude_since`).
     """
-    if bridge_dir is None or hooks_cursor is None:
+    if bridge_dir is None or hooks_cursor is None or claim is None:
         return False
-    if expected_prompt is None or submitted_after is None:
-        return False
-    session_id = read_claude_session_id(bridge_dir)
-    if session_id is None:
-        return False
-    return _user_prompt_reached_claude_since(
-        bridge_dir,
-        hooks_cursor,
-        expected_prompt=expected_prompt,
-        submitted_after=submitted_after,
-        session_id=session_id,
-    )
+    return _user_prompt_reached_claude_since(bridge_dir, claim)
 
 
 def _submit_popped_surface(pane: str) -> bool:
@@ -6997,7 +7172,7 @@ def _revalidate_draft_before_enter(
 
 def _discard_unaccepted_draft(
     socket_path: str, tmux_target: str, *, needle: str, tail_needle: str
-) -> None:
+) -> bool:
     """
     After a failed submit verification, clear the draft once it is identified.
 
@@ -7011,7 +7186,9 @@ def _discard_unaccepted_draft(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Head marker from :func:`_submit_needle`.
     :param tail_needle: Tail marker from :func:`_submit_tail_needle`.
-    :returns: None. Never raises a tmux error (see :func:`_discard_failed_draft`).
+    :returns: ``True`` only when the draft was positively identified and the
+        box then verified empty — proof the submit never happened. Never
+        raises a tmux error (see :func:`_discard_failed_draft`).
     """
     deadline = time.monotonic() + _FAILED_SUBMIT_CLEANUP_TIMEOUT_S
     while True:
@@ -7019,17 +7196,16 @@ def _discard_unaccepted_draft(
         if _stacked_dialog_headline(pane) is None:
             present = _draft_confirmed(socket_path, tmux_target, pane, needle, tail_needle)
             if present is True:
-                _discard_failed_draft(socket_path, tmux_target)
-                return
+                return _discard_failed_draft(socket_path, tmux_target)
             if present is False:
-                return
+                return False
         if time.monotonic() >= deadline:
             _logger.warning(
                 "claude-native: the unaccepted draft could not be identified for cleanup "
                 "within %.0fs; it may still be in the input box",
                 _FAILED_SUBMIT_CLEANUP_TIMEOUT_S,
             )
-            return
+            return False
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
@@ -7103,14 +7279,15 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
-def _discard_failed_draft(socket_path: str, tmux_target: str) -> None:
+def _discard_failed_draft(socket_path: str, tmux_target: str) -> bool:
     """
     Clear an undelivered draft on a failure path, without masking that failure.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
-    :returns: None. A tmux error is logged, not raised, so the caller's own
-        "not delivered" error still surfaces; cancellation still propagates.
+    :returns: Whether the box was verified empty afterwards. A tmux error is
+        logged, not raised, so the caller's own "not delivered" error still
+        surfaces; cancellation still propagates.
     """
     try:
         cleared = _clear_composer_draft(socket_path, tmux_target)
@@ -7118,9 +7295,10 @@ def _discard_failed_draft(socket_path: str, tmux_target: str) -> None:
         raise
     except RuntimeError as exc:
         _logger.warning("claude-native: could not clear the undelivered draft: %s", exc)
-        return
+        return False
     if not cleared:
         _logger.warning("claude-native: the undelivered draft may still be in the input box")
+    return cleared
 
 
 def _log_unconfirmed_draft(

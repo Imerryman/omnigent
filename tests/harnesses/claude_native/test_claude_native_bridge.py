@@ -5345,21 +5345,29 @@ def test_delivery_signal_requires_a_record_after_the_pre_submit_cursor(
     (bridge_dir / "not-hooks.jsonl").write_text(
         json.dumps({"payload": {"hook_event_name": "UserPromptSubmit"}}) + "\n"
     )
-    ours = {"expected_prompt": "Follow-up", "submitted_after": time.time()}
-    assert _submit_reached_claude(bridge_dir, 0, **ours) is False
-    assert _submit_reached_claude(None, 0, **ours) is False, "no bridge dir => no channel"
+
+    def _claim(bridge: Path) -> Any:
+        return claude_native_bridge._new_submit_claim(
+            bridge,
+            prompt="Follow-up",
+            hooks_cursor=claude_native_bridge.count_hook_events(bridge),
+            submitted_after=time.time(),
+        )
 
     # A previous prompt's record, already on file when the cursor was taken.
     _prompt_hook_9026(bridge_dir, "Follow-up")
     cursor = claude_native_bridge.count_hook_events(bridge_dir)
-    ours = {"expected_prompt": "Follow-up", "submitted_after": time.time()}
-    assert _submit_reached_claude(bridge_dir, cursor, **ours) is False, "pre-submit record"
+    claim = _claim(bridge_dir)
+    assert _submit_reached_claude(bridge_dir, cursor, claim=claim) is False, "pre-submit record"
+    assert _submit_reached_claude(None, cursor, claim=claim) is False, (
+        "no bridge dir => no channel"
+    )
     # Without a baseline the signal is unsound, so it is off rather than guessed.
-    assert _submit_reached_claude(bridge_dir, None, **ours) is False
+    assert _submit_reached_claude(bridge_dir, None, claim=claim) is False
 
     # Our own record, appended after the cursor (and after the Enter).
     _prompt_hook_9026(bridge_dir, "Follow-up")
-    assert _submit_reached_claude(bridge_dir, cursor, **ours) is True
+    assert _submit_reached_claude(bridge_dir, cursor, claim=claim) is True
     # ...but only when the caller can say which prompt and which Enter it is.
     assert _submit_reached_claude(bridge_dir, cursor) is False
 
@@ -5367,12 +5375,16 @@ def test_delivery_signal_requires_a_record_after_the_pre_submit_cursor(
     # is not a delivery.
     sub = tmp_path / "sub"
     _pin_session_9026(sub)
+    sub_claim = _claim(sub)
     _prompt_hook_9026(sub, "Follow-up", transcript_path="/p/subagents/a.jsonl")
-    assert _submit_reached_claude(sub, 0, **ours) is False
+    assert _submit_reached_claude(sub, sub_claim.hooks_cursor, claim=sub_claim) is False
     stopped = tmp_path / "stopped"
     _pin_session_9026(stopped)
+    stopped_claim = _claim(stopped)
     _hook_record(stopped, "Stop")
-    assert _submit_reached_claude(stopped, 0, **ours) is False
+    assert (
+        _submit_reached_claude(stopped, stopped_claim.hooks_cursor, claim=stopped_claim) is False
+    )
 
 
 def test_submit_accepted_when_claude_records_the_prompt(
@@ -5391,7 +5403,12 @@ def test_submit_accepted_when_claude_records_the_prompt(
     bridge_dir.mkdir()
     _pin_session_9026(bridge_dir)
     cursor = claude_native_bridge.count_hook_events(bridge_dir)
-    submitted_after = time.time()
+    claim = claude_native_bridge._new_submit_claim(
+        bridge_dir,
+        prompt="Follow-up on the review",
+        hooks_cursor=cursor,
+        submitted_after=time.time(),
+    )
     captures = 0
 
     def capture(*_: str) -> str:
@@ -5414,8 +5431,7 @@ def test_submit_accepted_when_claude_records_the_prompt(
         what="submitted message",
         bridge_dir=bridge_dir,
         hooks_cursor=cursor,
-        expected_prompt="Follow-up on the review",
-        submitted_after=submitted_after,
+        submit_claim=claim,
     )
     assert time.monotonic() - started < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4
 
@@ -14922,3 +14938,164 @@ def test_prompt_correlation_normalizes_like_claude_records_it() -> None:
     assert not same("a b c", "a b c d")
     assert not same("", "")
     assert not same("abc", None)
+
+
+# -- Rework round 5: exact prompt canonicalization; hook accounting across deliveries --
+
+
+def test_prompt_correlation_canonicalizes_only_the_measured_transforms() -> None:
+    """
+    Only what 2.1.280 was measured to do to a prompt is forgiven; the rest is exact.
+
+    Measured with a blocking UserPromptSubmit hook: CR and CRLF arrive as LF,
+    a tab as four spaces (fixed, not to a tab stop: ``ab\\tc`` -> ``ab    c``),
+    ESC/BEL vanish (the paste payload drops them), and trailing whitespace is
+    not transported reliably — an uncollapsed draft is trimmed (``"hello
+    world   "`` -> ``"hello world"``) while a collapsed paste keeps the
+    bridge's synthetic trailing newline. Leading and interior whitespace is
+    kept verbatim, so it must match verbatim.
+    """
+    same = claude_native_bridge._same_prompt
+    # measured transforms still correlate
+    assert same("a1\r\nb2", "a1\nb2\n")
+    assert same("x1\ry2\rz3", "x1\ny2\nz3\n")
+    assert same("ab\tc", "ab    c")
+    assert same("\tindented", "    indented")
+    assert same("be\x1bfore\x07after", "beforeafter")
+    assert same("hello world   ", "hello world")
+    assert same("hello world\n", "hello world")
+    assert same("a1\nb2\nc3\n", "a1\nb2\nc3\n\n")
+    assert same("﻿/help me", "/help me")
+    assert same("  ﻿/help me", "  /help me")
+    assert same("   indented start", "   indented start")
+    # whitespace placement is content
+    assert not same("review ab c", "review a bc")
+    assert not same("a\nb c", "a b\nc")
+    assert not same("a  b", "a b")
+    assert not same("   indented start", "indented start")
+    assert not same("ab\tc", "ab  c")
+    # U+FEFF is only forgiven at the slash-escape position
+    assert not same("mid﻿text", "midtext")
+    assert not same("﻿plain", "plain")
+    assert not same("", "")
+    assert not same("abc", None)
+
+
+def _deliver_confirmed_by_pane_9026(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tui: _ScrollingComposerTui, content: str
+) -> Path:
+    """
+    Deliver *content* once, confirmed by the pane, with no hook record written.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tui: The fake composer.
+    :param content: Message text.
+    :returns: The bridge directory.
+    """
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    inject_user_message(bridge_dir, content=content)
+    assert tui.submitted == [content]
+    return bridge_dir
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_an_earlier_identical_deliverys_late_hook_never_confirms_this_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Codex's sequence: the earlier delivery's hook is written during this Enter.
+
+    The same message was delivered before and confirmed by the pane before its
+    hook arrived. That hook is then written while this delivery's ``send-keys
+    Enter`` is still in flight — after the baseline and after
+    ``submitted_after``, so position, time, prompt and session all match. This
+    Enter is swallowed and the frames are torn. The record pays off the
+    earlier delivery's outstanding claim, so it cannot confirm this one.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    bridge_dir = _deliver_confirmed_by_pane_9026(tmp_path, monkeypatch, tui, content)
+
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert tui.draft == "", "the cleanup must still run"
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_one_record_written_twice_never_pays_two_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicated record (same ``prompt_id``) is counted once."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    bridge_dir = _deliver_confirmed_by_pane_9026(tmp_path, monkeypatch, tui, content)
+
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+
+    def _same_record_twice() -> None:
+        _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+        _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+
+    tui.on_enter = _same_record_twice
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_when_both_the_earlier_and_the_current_hook_arrive_the_current_confirms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The earlier record pays the earlier claim; this prompt's own record confirms this one."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    bridge_dir = _deliver_confirmed_by_pane_9026(tmp_path, monkeypatch, tui, content)
+
+    tui.torn_after_enter = 10_000
+
+    def _earlier_then_current() -> None:
+        _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+        _prompt_hook_9026(bridge_dir, content + "\n", prompt_id="current")
+
+    tui.on_enter = _earlier_then_current
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content, content]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_verifiably_undelivered_attempt_does_not_absorb_the_retrys_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A claim whose draft was positively cleared (never submitted) owes no record.
+
+    Otherwise the caller's retry of the same message — delivered, its pane
+    unreadable — would have its genuine record paid to the failed attempt and
+    be reported undelivered, prompting a duplicate send.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+    assert tui.draft == ""
+
+    tui.swallow_enter = False
+    tui.torn_after_enter = 10_000
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, content, prompt_id="retry")
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content]

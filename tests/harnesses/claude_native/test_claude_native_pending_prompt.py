@@ -301,7 +301,12 @@ def test_accepted_submit_can_immediately_raise_a_question(
     hooks = native_bridge / "hooks.jsonl"
     # The session the SessionStart hook pinned.
     (native_bridge / bridge._STATE_FILE).write_text(json.dumps({"claude_session_id": "claude-s"}))
-    submitted_after = time.time()
+    claim = bridge._new_submit_claim(
+        native_bridge,
+        prompt="Follow-up question please",
+        hooks_cursor=bridge.count_hook_events(native_bridge),
+        submitted_after=time.time(),
+    )
 
     def capture(*_: str) -> str:
         # APPEND, matching record_hook_event (bridge.py) — do not "simplify" this
@@ -335,8 +340,7 @@ def test_accepted_submit_can_immediately_raise_a_question(
         what="submitted message",
         bridge_dir=native_bridge,
         hooks_cursor=bridge.count_hook_events(native_bridge),
-        expected_prompt="Follow-up question please",
-        submitted_after=submitted_after,
+        submit_claim=claim,
     )
     assert sent == []
 
