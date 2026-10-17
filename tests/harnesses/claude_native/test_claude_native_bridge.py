@@ -13790,6 +13790,7 @@ class _ScrollingComposerTui:
         self.ignore_clear = False
         self.swallow_enter = False
         self.drop_paste = False
+        self.fail_clear_keys = False
         self.paste_visible_after_captures = 0
         self._hidden_captures_left = 0
 
@@ -13860,6 +13861,8 @@ class _ScrollingComposerTui:
                 self._hidden_captures_left = self.paste_visible_after_captures
         elif "send-keys" in cmd:
             keys = [cmd[-1]] if "-l" in cmd else cmd[cmd.index("-t") + 2 :]
+            if self.fail_clear_keys and "C-u" in keys:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no server running")
             for key in keys:
                 self.events.append(("key", key))
                 if key == "Enter":
@@ -14050,6 +14053,22 @@ def test_failed_confirmation_clears_the_whole_draft_before_raising(
     assert tui.draft == "", f"stale draft left in the composer: {tui.draft!r}"
     assert "Enter" not in tui.key_presses()
     assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_failing_cleanup_does_not_mask_the_undelivered_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux error while discarding the draft still reports "not confirmed"."""
+    tui = _ScrollingComposerTui()
+    tui.mangle_render = True
+    tui.fail_clear_keys = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert "Enter" not in tui.key_presses()
 
 
 @pytest.mark.usefixtures("_fast_delivery_9026")

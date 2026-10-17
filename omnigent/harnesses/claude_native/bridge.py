@@ -4483,7 +4483,7 @@ def _paste_and_submit(
         )
         # Whatever did land stays in the box otherwise, and the next paste is
         # appended to it — a retry then submits both as one turn.
-        _clear_composer_draft(socket_path, tmux_target)
+        _discard_failed_draft(socket_path, tmux_target)
         raise RuntimeError(
             "Claude Code's pasted draft could not be confirmed in the input box. "
             "The message was not delivered."
@@ -4532,7 +4532,7 @@ def _paste_and_submit(
     # unreadable composer may mean the submit landed after all, and no Enter
     # (or anything else) goes out on a guess.
     if _draft_in_input_box(_capture_pane(socket_path, tmux_target), needle, tail_needle) is True:
-        _clear_composer_draft(socket_path, tmux_target)
+        _discard_failed_draft(socket_path, tmux_target)
     raise RuntimeError(
         f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
         "(submission could not be confirmed). The message was not delivered."
@@ -6668,6 +6668,26 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
             sent += _COMPOSER_CLEAR_KEYS_PER_BURST
             last_burst = now
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _discard_failed_draft(socket_path: str, tmux_target: str) -> None:
+    """
+    Clear an undelivered draft on a failure path, without masking that failure.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None. A tmux error is logged, not raised, so the caller's own
+        "not delivered" error still surfaces; cancellation still propagates.
+    """
+    try:
+        cleared = _clear_composer_draft(socket_path, tmux_target)
+    except ClaudeInjectionCancelled:
+        raise
+    except RuntimeError as exc:
+        _logger.warning("claude-native: could not clear the undelivered draft: %s", exc)
+        return
+    if not cleared:
+        _logger.warning("claude-native: the undelivered draft may still be in the input box")
 
 
 def _log_unconfirmed_draft(
