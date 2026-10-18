@@ -395,6 +395,24 @@ _PRE_SUBMIT_REVALIDATE_TIMEOUT_S = 2.0
 # is treated as unresolved (draft content / unknown, never empty). This bounds
 # the redraw WAIT only; each capture inside it has tmux's own subprocess timeout.
 _FOCUS_IN_SETTLE_TIMEOUT_S = 1.0
+# Dispelling an all-dim box before a paste (see :func:`_probe_ghost_candidate`).
+# Measured on 2.1.280 with ``tengu_native_cursor`` on (as for logged-in
+# accounts; ``CLAUDE_CODE_NATIVE_CURSOR=1`` reproduces it): the box draws no
+# caret cell at all, so a prompt suggestion stays all-dim through focus-in,
+# ``C-u`` and redraws. Typing one character replaces the suggestion with that
+# character as real text; ``BSpace`` then empties the draft (the suggestion is
+# redrawn). A letter is inert in an empty composer — unlike ``/``, ``!``, ``#``,
+# ``?`` or ``@``, which open modes or menus there.
+_GHOST_PROBE_CHAR = "x"
+# How long the probe character (and then its deletion) may take to render.
+_GHOST_PROBE_SETTLE_TIMEOUT_S = 1.0
+# Probes per clear; a box the probe cannot settle falls back to ``C-u``.
+_GHOST_PROBE_MAX_ATTEMPTS = 2
+# Size cap per styled frame logged when the box could not be cleared.
+_CLEAR_FAILURE_LOG_FRAME_CHARS = 1500
+# Pane rows logged per frame: the composer box, its footer and a stacked
+# dialog's rows above it.
+_CLEAR_FAILURE_LOG_FRAME_LINES = 16
 # How long a failed submit's cleanup waits through unreadable captures to
 # positively identify the stale draft before giving up (without a key).
 _FAILED_SUBMIT_CLEANUP_TIMEOUT_S = 5.0
@@ -6949,8 +6967,11 @@ def _ghost_signature(composer: _StyledComposer) -> str | None:
     Only ``"focused"`` is evidence of an empty box. ``"unfocused"`` is a
     candidate: all-dim text without a caret is also what a dimmed real draft
     would look like (scrolled, it can even look unchanged after ``C-u``), so
-    callers resolve it with a focus-in event (:func:`_resolved_styled_capture`)
-    and fail closed while it stays unresolved.
+    callers resolve it — with a focus-in event (:func:`_resolved_styled_capture`)
+    or, before a paste, a typed probe (:func:`_probe_ghost_candidate`) — and
+    fail closed while it stays unresolved. With Claude Code's native cursor
+    (``tengu_native_cursor``) no caret cell is ever drawn, so a placeholder
+    is ``"unfocused"`` whatever the focus.
 
     :param composer: The styled composer.
     :returns: ``"focused"`` or ``"unfocused"`` for a matching closed box,
@@ -7209,6 +7230,162 @@ def _discard_unaccepted_draft(
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
 
 
+def _composer_holds_only(styled_pane: str, char: str) -> bool:
+    """
+    Report whether the live composer's whole draft is the single *char*.
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :param char: The one character expected, e.g. ``"x"``.
+    :returns: ``True`` only when the box is fully on screen, its sole visible
+        cell is *char* drawn as real (non-dim) text, and the ``❯`` row is its
+        only row. A one-row box is a one-row draft: the box grows with the
+        draft before it scrolls, so no draft row can hide above or below.
+    """
+    composer = _styled_composer(styled_pane)
+    if composer is None or not composer.closed:
+        return False
+    visible = [(ch, dim) for ch, dim, _ in composer.cells if not ch.isspace()]
+    if visible != [(char, False)]:
+        return False
+    # Blank rows are skipped when the box is located, so a probe typed above
+    # empty draft lines would otherwise read as the probe alone.
+    lines = _strip_capture_escapes(styled_pane).splitlines()
+    rows = [
+        idx
+        for idx in range(1, len(lines))
+        if _is_box_rule(lines[idx - 1]) and lines[idx].strip().startswith(_CLAUDE_PROMPT_GLYPH)
+    ]
+    return bool(rows) and rows[-1] + 1 < len(lines) and _is_box_rule(lines[rows[-1] + 1])
+
+
+def _await_styled_frame(
+    socket_path: str, tmux_target: str, accept: Callable[[str], bool]
+) -> tuple[bool, str]:
+    """
+    Re-read the pane until *accept* holds, for :data:`_GHOST_PROBE_SETTLE_TIMEOUT_S`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param accept: Predicate over a styled capture.
+    :returns: Whether a frame was accepted, and the last styled frame read.
+    """
+    deadline = time.monotonic() + _GHOST_PROBE_SETTLE_TIMEOUT_S
+    while True:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        styled = _capture_pane_styled(socket_path, tmux_target)
+        if accept(styled):
+            return True, styled
+        if time.monotonic() >= deadline:
+            return False, styled
+
+
+def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> tuple[bool | None, str]:
+    """
+    Prove that an all-dim box holds no draft, by typing over its placeholder.
+
+    Typed text replaces a prompt suggestion, but is appended to a real draft.
+    So after one :data:`_GHOST_PROBE_CHAR`, a box whose whole draft is that
+    character (:func:`_composer_holds_only`) held nothing else; ``BSpace``
+    removes it and the box is empty again — Claude Code then redraws its
+    suggestion, which the paste replaces. Nothing about the dim text itself
+    is judged, so a dim real draft can never pass: it keeps its text and the
+    probe joins it, and the caller clears both.
+
+    Each key is decided on a fresh frame with no stacked dialog (keys typed
+    into one would answer it).
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``(outcome, frame)``. *outcome* is ``True`` when the box was
+        proven to hold no draft and is empty again; ``False`` when the probe
+        landed beside other text (a real draft, now holding the probe too);
+        ``None`` when unresolved — no key sent, the probe never rendered, a
+        dialog opened before ``BSpace``, or the deletion never rendered.
+        *frame* is the last styled frame read after the probe (``""`` when no
+        key was sent).
+    :raises RuntimeError: If a ``tmux send-keys`` invocation fails.
+    """
+    fresh = _capture_pane(socket_path, tmux_target)
+    before = _live_composer_body(fresh)
+    if _composer_is_empty(fresh) is not False or _stacked_dialog_headline(fresh) is not None:
+        return None, ""
+    folded_before = "".join(before[0].split()) if before is not None else ""
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _GHOST_PROBE_CHAR)
+
+    def _probe_landed(styled: str) -> bool:
+        if _composer_holds_only(styled, _GHOST_PROBE_CHAR):
+            return True
+        # Beside other text, the probe shows as real text in a changed box. A
+        # box that is all dim, bare, or merely redrawn has not shown it yet.
+        composer = _styled_composer(styled)
+        if composer is None or not any(
+            not dim and not ch.isspace() for ch, dim, _ in composer.cells
+        ):
+            return False
+        folded = "".join("".join(ch for ch, _, _ in composer.cells).split())
+        return folded != folded_before
+
+    landed, frame = _await_styled_frame(socket_path, tmux_target, _probe_landed)
+    if not landed:
+        return None, frame
+    if not _composer_holds_only(frame, _GHOST_PROBE_CHAR):
+        return False, frame
+    if _stacked_dialog_headline(_capture_pane(socket_path, tmux_target)) is not None:
+        return None, frame
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BSpace")
+
+    def _probe_gone(styled: str) -> bool:
+        # The draft was exactly the probe, so once it no longer renders as
+        # real text the draft is empty — whether the box is bare or shows the
+        # suggestion again (any styling: neither signature admits the probe).
+        if _composer_is_empty(_strip_capture_escapes(styled)) is True:
+            return True
+        return _composer_ghost_signature(styled) is not None
+
+    gone, after = _await_styled_frame(socket_path, tmux_target, _probe_gone)
+    return (True if gone else None), after
+
+
+def _log_uncleared_composer(
+    socket_path: str, tmux_target: str, frames: list[tuple[str, str]]
+) -> None:
+    """
+    Log the styled frames of a box that could not be cleared, size-capped.
+
+    The final frame is read here; when it is an all-dim box with no dialog,
+    a focus-in event is sent and the redrawn frame logged too, so the log
+    shows whether the TUI draws a caret at all. Frames go to INFO, not
+    WARNING: they can hold the person's draft text.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param frames: ``(label, styled capture)`` pairs read during the clear.
+    :returns: None.
+    """
+    last = _capture_pane_styled(socket_path, tmux_target)
+    frames = [*frames, ("last", last)]
+    if _composer_ghost_signature(last) == "unfocused" and (
+        _stacked_dialog_headline(_capture_pane(socket_path, tmux_target)) is None
+    ):
+        _send_focus_in(socket_path, tmux_target)
+        _, after = _await_styled_frame(
+            socket_path,
+            tmux_target,
+            lambda styled: _composer_ghost_signature(styled) != "unfocused",
+        )
+        frames.append(("after focus-in", after))
+    for label, styled in frames:
+        region = "\n".join(styled.rstrip("\n").splitlines()[-_CLEAR_FAILURE_LOG_FRAME_LINES:])
+        if len(region) > _CLEAR_FAILURE_LOG_FRAME_CHARS:
+            region = "…" + region[-_CLEAR_FAILURE_LOG_FRAME_CHARS:]
+        _logger.info(
+            "claude-native: uncleared input box, %s frame (ghost signature %s): %r",
+            label,
+            _composer_ghost_signature(styled),
+            region,
+        )
+
+
 def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
     """
     Empty Claude Code's whole input box and verify it is empty.
@@ -7219,48 +7396,67 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
     re-read between bursts until it is structurally empty. An already-empty
     box gets no keystroke at all.
 
-    A ghost placeholder counts as empty only in its focused rendering (see
-    :func:`_ghost_signature`); an all-dim box is first resolved with a
-    focus-in event (:func:`_resolved_styled_capture`), and one that stays
-    all-dim is treated as draft content — cleared like any other, and the
-    paste abandoned if it never goes. Every burst is re-decided on a frame
-    read immediately before it, so a dialog that opened meanwhile gets no key.
+    A ghost placeholder counts as empty in its focused rendering (see
+    :func:`_ghost_signature`). An all-dim box — an unfocused placeholder, the
+    only rendering a native-cursor TUI ever draws, or a dimmed real draft —
+    is never judged by its looks: it is probed (:func:`_probe_ghost_candidate`)
+    and counts as empty only once the probe proves no draft was there.
+    Anything else is cleared like any draft, and the paste abandoned if it
+    never goes. Every key is decided on a frame read immediately before it,
+    so a dialog that opened meanwhile gets none.
 
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :returns: ``True`` once the box was seen empty; ``False`` when it could
         not be shown empty within :data:`_COMPOSER_CLEAR_TIMEOUT_S` or
-        :data:`_COMPOSER_CLEAR_MAX_KEYS` presses. Callers must then not paste
-        or submit.
+        :data:`_COMPOSER_CLEAR_MAX_KEYS` presses (the frames read are then
+        logged, see :func:`_log_uncleared_composer`). Callers must then not
+        paste or submit.
     :raises RuntimeError: If a ``tmux send-keys`` invocation fails.
     """
     start = time.monotonic()
     sent = 0
+    probes = 0
     last_burst: float | None = None
+    frames: list[tuple[str, str]] = []
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         empty = _composer_is_empty(pane)
         now = time.monotonic()
         settled = last_burst is None or now - last_burst >= _COMPOSER_CLEAR_SETTLE_S
-        if (
-            empty is False
-            and _stacked_dialog_headline(pane) is None
-            and _composer_ghost_signature(_resolved_styled_capture(socket_path, tmux_target))
-            == "focused"
-        ):
-            empty = True
+        if empty is False and _stacked_dialog_headline(pane) is None:
+            styled = _capture_pane_styled(socket_path, tmux_target)
+            if not frames:
+                frames.append(("first", styled))
+            signature = _composer_ghost_signature(styled)
+            if signature == "focused":
+                empty = True
+            elif signature == "unfocused" and settled and probes < _GHOST_PROBE_MAX_ATTEMPTS:
+                probes += 1
+                outcome, frame = _probe_ghost_candidate(socket_path, tmux_target)
+                if frame:
+                    frames.append((f"probe {probes}", frame))
+                if outcome is True:
+                    return True
+                if outcome is False:
+                    # A real draft (the probe joined it): clear it, never re-probe.
+                    probes = _GHOST_PROBE_MAX_ATTEMPTS
+                # Whatever the probe left is draft text now; re-read the box.
+                continue
         if empty:
             return True
         if now - start >= _COMPOSER_CLEAR_TIMEOUT_S or (
             sent >= _COMPOSER_CLEAR_MAX_KEYS and settled
         ):
             _logger.warning(
-                "claude-native: input box not verified empty after %.1fs and %d C-u presses "
-                "(composer %s)",
+                "claude-native: input box not verified empty after %.1fs, %d C-u presses "
+                "and %d probes (composer %s)",
                 now - start,
                 sent,
+                probes,
                 "unreadable" if empty is None else "still holds text",
             )
+            _log_uncleared_composer(socket_path, tmux_target, frames)
             return False
         if empty is False and settled and sent < _COMPOSER_CLEAR_MAX_KEYS:
             # Re-read right before the burst: the keys must land on the frame
