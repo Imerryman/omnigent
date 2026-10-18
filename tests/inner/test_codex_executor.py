@@ -567,6 +567,137 @@ class TestCodexExecutor(unittest.TestCase):
             ],
         )
 
+    def test_build_initial_prompt_no_trailing_user_run_is_all_history(self):
+        # "Current" is the TRAILING run of user inputs after the last
+        # non-user item. Here the lone user message is followed by an
+        # assistant turn and a tool result, so nothing trails: its image
+        # must become a placeholder like any other historical attachment,
+        # and the assistant/tool turns after it must still be replayed.
+        history_uri = "data:image/png;base64,SGlzdG9yeQ=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": history_uri, "filename": "old.png"}
+                ],
+            },
+            {"role": "assistant", "content": "Looking it up."},
+            {"role": "tool", "content": "tool result: 42"},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        self.assertEqual([item for item in wire if item["type"] == "image"], [])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(history_uri, text)
+        self.assertIn("[image previously shared: old.png]", text)
+        self.assertIn("tool result: 42", text)
+
+    def test_build_initial_prompt_keeps_all_trailing_buffered_user_images_native(self):
+        # Several buffered user inputs coalesced into one continuation turn
+        # (no assistant/tool turn between them and the end of history) are
+        # ALL "current" -- every one of their images must stay native, not
+        # just the last.
+        uri_a = "data:image/png;base64,QQ=="
+        uri_b = "data:image/png;base64,Qg=="
+        messages = [
+            {"role": "assistant", "content": "Go ahead."},
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": uri_a, "filename": "a.png"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": uri_b, "filename": "b.png"}],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(
+            images, [{"type": "image", "url": uri_a}, {"type": "image", "url": uri_b}]
+        )
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn("previously shared", text)
+
+    def test_build_initial_prompt_unresolved_historical_attachment_keeps_could_not_be_loaded(
+        self,
+    ):
+        # An attachment whose image_url never got resolved must keep the
+        # same visible "[Attachment <name> could not be loaded]" marker used
+        # elsewhere (native_attachments.unresolved_attachment_marker), not
+        # the generic "[Unavailable history content: ...]" catch-all.
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "missing", "filename": "photo.png"}
+                ],
+            },
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "Summarize."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertIn("[Attachment photo.png could not be loaded]", text)
+        self.assertNotIn("Unavailable history content", text)
+
+    def test_build_initial_prompt_historical_attachment_placeholder_falls_back_to_file_id(self):
+        # A resolved historical attachment with no filename, only a
+        # file_id, must name the attachment by that file_id in its
+        # placeholder rather than falling back to the bare marker.
+        history_uri = "data:image/png;base64,SGlzdG9yeQ=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": history_uri, "file_id": "file_abc123"}
+                ],
+            },
+            {"role": "assistant", "content": "Saw it."},
+            {"role": "user", "content": "Summarize."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertIn("[image previously shared: file_abc123]", text)
+
+    def test_build_initial_prompt_drops_historical_binary_input_file_before_wire_conversion(
+        self,
+    ):
+        # Assert directly on the intermediate prompt (not just the final
+        # wire-format items): _to_codex_input_items silently drops binary
+        # input_file blocks, so a wire-level assertion alone could not
+        # catch a regression where a historical input_file block is left as
+        # a real (non-placeholder) block instead of a text placeholder.
+        history_file_data = "data:application/pdf;base64,SGlzdG9yeVBkZg=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": history_file_data,
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "Read it."},
+            {"role": "user", "content": "Summarize."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        historical_input_file_blocks = [
+            block
+            for block in prompt
+            if isinstance(block, dict) and block.get("type") == "input_file"
+        ]
+        self.assertEqual(historical_input_file_blocks, [])
+
     def test_goal_objective_requires_a_standalone_command(self):
         self.assertEqual(
             _goal_objective_from_content("  /goal Finish the implementation  "),

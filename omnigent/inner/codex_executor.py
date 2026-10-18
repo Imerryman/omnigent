@@ -114,6 +114,7 @@ from .model_signer import (
     SignerStartError,
     SubprocessModelSigner,
 )
+from .native_attachments import unresolved_attachment_marker
 
 logger = logging.getLogger(__name__)
 
@@ -2391,18 +2392,24 @@ def _build_initial_prompt(
     """
     Build the initial prompt for a fresh Codex thread.
 
-    Replays prior turns with role labels. Only the latest user message's own
-    attachments stay native content blocks; earlier turns' resolved
-    image/file attachments become text placeholders (see
+    Replays prior turns with role labels. "Current" input is the trailing
+    run of consecutive user messages at the very end of history (normally
+    just one message, but the runner may coalesce several buffered steered
+    messages into one continuation turn); only those messages' own
+    attachments stay native content blocks. If the last message is not from
+    the user, there is no current attachment at all. Every other, earlier
+    turn's resolved image/file attachment becomes a text placeholder (see
     ``_history_attachment_placeholder``) so a cold-started thread cannot
-    mistake replayed history for something just attached. Text-only history
-    retains its plain-string format.
+    mistake replayed history for something just attached. An attachment
+    that never resolved (no inline ``image_url``/``file_data``) keeps the
+    same visible "could not be loaded" marker used elsewhere
+    (:func:`unresolved_attachment_marker`), whether it is current or
+    historical. Text-only history retains its plain-string format.
 
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
     """
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if len(messages) <= 1 or len(user_messages) <= 1:
+    if len(messages) <= 1:
         return _extract_latest_user_content(messages)
 
     has_attachments = any(
@@ -2414,14 +2421,19 @@ def _build_initial_prompt(
         for msg in messages
     )
     if has_attachments:
-        latest_user_index = -1
-        for idx, msg in enumerate(messages):
-            if msg.get("role") == "user":
-                latest_user_index = idx
+        # The trailing run of consecutive user messages is "current" input;
+        # everything before it is history. No trailing user message means
+        # no current attachment at all.
+        current_start: int | None = None
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") == "user":
+                current_start = idx
+            else:
+                break
 
         blocks: list[CodexParams] = [{"type": "input_text", "text": "Conversation so far:"}]
         for idx, msg in enumerate(messages):
-            is_latest_user_message = idx == latest_user_index
+            is_current = current_start is not None and idx >= current_start
             role = str(msg.get("role", "user")).replace("_", " ")
             blocks.append({"type": "input_text", "text": f"{role}:"})
             content = msg.get("content")
@@ -2436,9 +2448,17 @@ def _build_initial_prompt(
                         text = block.get("text")
                         if isinstance(text, str):
                             blocks.append({"type": "input_text", "text": text})
-                    elif kind == "input_image" and isinstance(block.get("image_url"), str):
-                        if is_latest_user_message:
-                            blocks.append({"type": "input_image", "image_url": block["image_url"]})
+                    elif kind == "input_image":
+                        image_url = block.get("image_url")
+                        if not isinstance(image_url, str):
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": unresolved_attachment_marker(block),
+                                }
+                            )
+                        elif is_current:
+                            blocks.append({"type": "input_image", "image_url": image_url})
                         else:
                             blocks.append(
                                 {
@@ -2446,8 +2466,16 @@ def _build_initial_prompt(
                                     "text": _history_attachment_placeholder(block, "image"),
                                 }
                             )
-                    elif kind == "input_file" and isinstance(block.get("file_data"), str):
-                        if is_latest_user_message:
+                    elif kind == "input_file":
+                        file_data = block.get("file_data")
+                        if not isinstance(file_data, str):
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": unresolved_attachment_marker(block),
+                                }
+                            )
+                        elif is_current:
                             blocks.append(block)
                         else:
                             blocks.append(
