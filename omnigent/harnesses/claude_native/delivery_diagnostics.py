@@ -19,6 +19,32 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 _Parameters = ParamSpec("_Parameters")
 
+# Verification outcomes that positively confirm delivery: the draft verifiably
+# left the composer, Claude Code's own ``UserPromptSubmit`` hook recorded the
+# prompt, or the submit popped a boxed dialog over the composer. Anything else
+# logs the delivery summary at WARNING.
+_CONFIRMED_VERIFICATIONS = frozenset({"draft_absent", "prompt_hook_recorded", "popped_surface"})
+
+
+def _delivery_outcome(outcome: str | None, verification: str | None) -> str:
+    """
+    Summarise whether a returned delivery is known to have reached Claude.
+
+    :param outcome: How the attempt ended (``"returned"`` on success).
+    :param verification: How the submit was verified, if at all.
+    :returns: ``"draft_cleared"`` when the draft visibly left the input box,
+        ``"submit_confirmed"`` when Claude's own UserPromptSubmit hook or a
+        popped dialog proved the submit landed on an unreadable composer,
+        else ``"unknown"``.
+    """
+    if outcome != "returned":
+        return "unknown"
+    if verification == "draft_absent":
+        return "draft_cleared"
+    if verification in _CONFIRMED_VERIFICATIONS:
+        return "submit_confirmed"
+    return "unknown"
+
 
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
     @functools.wraps(function)
@@ -108,7 +134,8 @@ def trace_delivery(
                     last_attempt = trace.attempts[-1] if trace.attempts else {}
                     verification = last_attempt.get("verification", "not_started")
                     uncertain = any(
-                        attempt.get("verification") != "draft_absent" for attempt in trace.attempts
+                        attempt.get("verification") not in _CONFIRMED_VERIFICATIONS
+                        for attempt in trace.attempts
                     )
                     level = logging.WARNING if outcome != "returned" or uncertain else logging.INFO
                     if _logger.isEnabledFor(level):
@@ -125,11 +152,7 @@ def trace_delivery(
                             and not normalized.split("\n", 1)[0].strip(),
                             "outcome": outcome,
                             "verification": verification,
-                            "delivery_outcome": (
-                                "draft_cleared"
-                                if outcome == "returned" and verification == "draft_absent"
-                                else "unknown"
-                            ),
+                            "delivery_outcome": _delivery_outcome(outcome, verification),
                             **last_attempt,
                             **{
                                 f"stage_{stage}_ms": round(seconds * 1000)
