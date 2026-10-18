@@ -100,9 +100,23 @@ def test_delivery_diagnostics(
             if scenario == "prompt_hook":
                 # Claude Code's own UserPromptSubmit record: the only acceptance
                 # signal for a pane whose composer cannot be read.
+                # Correlated with this submit: this prompt, the pinned session,
+                # recorded no earlier than the Enter.
                 with (tmp_path / bridge._HOOKS_FILE).open("a", encoding="utf-8") as handle:
                     handle.write(
-                        json.dumps({"payload": {"hook_event_name": "UserPromptSubmit"}}) + "\n"
+                        json.dumps(
+                            {
+                                # Written after the Enter (the fake clock does
+                                # not advance inside the keystroke).
+                                "recorded_at": elapsed + 0.001,
+                                "payload": {
+                                    "hook_event_name": "UserPromptSubmit",
+                                    "session_id": "claude-session",
+                                    "prompt": content,
+                                },
+                            }
+                        )
+                        + "\n"
                     )
             pane = {
                 "empty_capture": "",
@@ -126,6 +140,9 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_wait_for_claude_prompt_ready", ready)
     monkeypatch.setattr(bridge, "_run_tmux", run_tmux)
     monkeypatch.setattr(bridge, "_capture_pane", lambda *_a, **_k: pane)
+    # The fake draws no styling, so its ``capture-pane -e`` read is the same
+    # text; a match must hold in the styled re-read before it confirms.
+    monkeypatch.setattr(bridge, "_capture_pane_styled", lambda *_a, **_k: pane)
     if scenario == "observation_error":
         monkeypatch.setattr(delivery_diagnostics, "_draft_observation", broken_observation)
     if scenario.startswith("pending_"):
@@ -138,6 +155,11 @@ def test_delivery_diagnostics(
     monkeypatch.setattr(bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.06)
     monkeypatch.setattr(bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.02)
 
+    if scenario == "prompt_hook":
+        # The session the SessionStart hook pinned.
+        (tmp_path / bridge._STATE_FILE).write_text(
+            json.dumps({"claude_session_id": "claude-session"})
+        )
     if scenario == "session_fallback":
         (tmp_path / bridge._CONFIG_FILE).write_text(
             json.dumps({"active_session_id": "bridge-session"})

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -291,11 +292,21 @@ def test_accepted_submit_can_immediately_raise_a_question(
     fires that hook — and the same shape is what a swallowed draft leaves on
     screen when Claude was already parked on an earlier question. The record is
     appended from the capture stub, i.e. after the pre-submit cursor, exactly as
-    the hook subprocess does in production.
+    the hook subprocess does in production. It carries what makes it THIS
+    submit's record: the submitted prompt, the pinned session, and a
+    ``recorded_at`` after the Enter (an uncorrelated record never counts).
     """
     sent: list[tuple[str, ...]] = []
     _park_hook(native_bridge)
     hooks = native_bridge / "hooks.jsonl"
+    # The session the SessionStart hook pinned.
+    (native_bridge / bridge._STATE_FILE).write_text(json.dumps({"claude_session_id": "claude-s"}))
+    claim = bridge._new_submit_claim(
+        native_bridge,
+        prompt="Follow-up question please",
+        hooks_cursor=bridge.count_hook_events(native_bridge),
+        submitted_after=time.time(),
+    )
 
     def capture(*_: str) -> str:
         # APPEND, matching record_hook_event (bridge.py) — do not "simplify" this
@@ -306,7 +317,14 @@ def test_accepted_submit_can_immediately_raise_a_question(
         with hooks.open("a", encoding="utf-8") as handle:
             handle.write(
                 json.dumps(
-                    {"recorded_at": 1.0, "payload": {"hook_event_name": "UserPromptSubmit"}}
+                    {
+                        "recorded_at": time.time(),
+                        "payload": {
+                            "hook_event_name": "UserPromptSubmit",
+                            "session_id": "claude-s",
+                            "prompt": "Follow-up question please",
+                        },
+                    }
                 )
                 + "\n"
             )
@@ -322,6 +340,7 @@ def test_accepted_submit_can_immediately_raise_a_question(
         what="submitted message",
         bridge_dir=native_bridge,
         hooks_cursor=bridge.count_hook_events(native_bridge),
+        submit_claim=claim,
     )
     assert sent == []
 

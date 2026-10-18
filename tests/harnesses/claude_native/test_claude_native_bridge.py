@@ -4105,8 +4105,9 @@ def test_inject_user_message_pastes_content_then_submits(
     with interior newlines encoded as CR so Claude Code's TUI keeps
     multi-line input as a single editable block instead of submitting on
     each newline (anthropics/claude-code#52126). Fails if the harness
-    regresses to send-keys argv delivery, drops the trailing Enter, or
-    stops clearing the stale buffer.
+    regresses to send-keys argv delivery or drops the trailing Enter. The
+    composer here is already empty, so the verified pre-paste clear sends no
+    key at all (the multi-row clear itself is pinned by the #9026 tests).
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     bridge_dir = tmp_path / "bridge"
@@ -4157,15 +4158,12 @@ def test_inject_user_message_pastes_content_then_submits(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content=content)
 
-    # CSI-u Ctrl+A, Ctrl+K (clear), load-buffer, paste-buffer, Enter — fewer than 5
-    # means a delivery step was dropped.
-    assert len(captured) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(captured)}."
+    # load-buffer, paste-buffer, Enter — fewer than 3 means a delivery step was
+    # dropped; more means a key went to a box already verified empty.
+    assert len(captured) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(captured)}."
     )
-    clear_home, clear_kill, load, paste, submit = captured
-    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
-    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    load, paste, submit = captured
     # The buffer file carried the normalized content + trailing CR. A
     # missing trailing CR is the trailing-CR regression; a newline that stayed
     # \n (not CR) is the anthropics/claude-code#52126 multi-line collapse.
@@ -4651,18 +4649,15 @@ def test_inject_user_message_waits_for_claude_prompt_before_typing(
     inject_user_message(bridge_dir, content="hello")
 
     # Gate polled until the third capture (prompt present), then the
-    # five delivery calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter)
-    # fired.
+    # three delivery calls (load-buffer, paste-buffer, Enter) fired; the
+    # verified clear found the box already empty and sent nothing.
     assert capture_calls["n"] >= 3, (
         f"Expected >=3 capture-pane polls before the prompt rendered, got {capture_calls['n']}."
     )
-    assert len(send_keys) == 5, (
-        f"Expected 5 tmux calls (CSI-u Ctrl+A, Ctrl+K, load-buffer, paste-buffer, Enter), "
-        f"got {len(send_keys)}."
+    assert len(send_keys) == 3, (
+        f"Expected 3 tmux calls (load-buffer, paste-buffer, Enter), got {len(send_keys)}."
     )
-    clear_home, clear_kill, load, paste, submit = send_keys
-    assert clear_home[-4:] == ["-l", "-t", "claude:0.0", "\x1b[97;5u"]
-    assert clear_kill[-4:] == ["-l", "-t", "claude:0.0", "\x1b[107;5u"]
+    load, paste, submit = send_keys
     # The paste fires after the gate via the buffer path. The exact
     # payload/flag assertions live in the dedicated paste test; here the
     # gate ordering is the claim.
@@ -5345,32 +5340,51 @@ def test_delivery_signal_requires_a_record_after_the_pre_submit_cursor(
 
     # Pane text cannot produce the signal, and neither can writing a convincing
     # envelope into a file that is not the hook log.
+    _pin_session_9026(bridge_dir)
     (bridge_dir / "pane.txt").write_text(_FORGED_SURFACE_PANE)
     (bridge_dir / "not-hooks.jsonl").write_text(
         json.dumps({"payload": {"hook_event_name": "UserPromptSubmit"}}) + "\n"
     )
-    assert _submit_reached_claude(bridge_dir, 0) is False
-    assert _submit_reached_claude(None, 0) is False, "no bridge dir => no channel"
+
+    def _claim(bridge: Path) -> Any:
+        return claude_native_bridge._new_submit_claim(
+            bridge,
+            prompt="Follow-up",
+            hooks_cursor=claude_native_bridge.count_hook_events(bridge),
+            submitted_after=time.time(),
+        )
 
     # A previous prompt's record, already on file when the cursor was taken.
-    _hook_record(bridge_dir, "UserPromptSubmit")
+    _prompt_hook_9026(bridge_dir, "Follow-up")
     cursor = claude_native_bridge.count_hook_events(bridge_dir)
-    assert _submit_reached_claude(bridge_dir, cursor) is False, "pre-submit record is not ours"
+    claim = _claim(bridge_dir)
+    assert _submit_reached_claude(bridge_dir, cursor, claim=claim) is False, "pre-submit record"
+    assert _submit_reached_claude(None, cursor, claim=claim) is False, (
+        "no bridge dir => no channel"
+    )
     # Without a baseline the signal is unsound, so it is off rather than guessed.
-    assert _submit_reached_claude(bridge_dir, None) is False
+    assert _submit_reached_claude(bridge_dir, None, claim=claim) is False
 
-    # Our own record, appended after the cursor.
-    _hook_record(bridge_dir, "UserPromptSubmit")
-    assert _submit_reached_claude(bridge_dir, cursor) is True
+    # Our own record, appended after the cursor (and after the Enter).
+    _prompt_hook_9026(bridge_dir, "Follow-up")
+    assert _submit_reached_claude(bridge_dir, cursor, claim=claim) is True
+    # ...but only when the caller can say which prompt and which Enter it is.
+    assert _submit_reached_claude(bridge_dir, cursor) is False
 
     # A subagent's record never answers for the parent turn, and another event
     # is not a delivery.
     sub = tmp_path / "sub"
-    _hook_record(sub, "UserPromptSubmit", transcript_path="/p/subagents/a.jsonl")
-    assert _submit_reached_claude(sub, 0) is False
+    _pin_session_9026(sub)
+    sub_claim = _claim(sub)
+    _prompt_hook_9026(sub, "Follow-up", transcript_path="/p/subagents/a.jsonl")
+    assert _submit_reached_claude(sub, sub_claim.hooks_cursor, claim=sub_claim) is False
     stopped = tmp_path / "stopped"
+    _pin_session_9026(stopped)
+    stopped_claim = _claim(stopped)
     _hook_record(stopped, "Stop")
-    assert _submit_reached_claude(stopped, 0) is False
+    assert (
+        _submit_reached_claude(stopped, stopped_claim.hooks_cursor, claim=stopped_claim) is False
+    )
 
 
 def test_submit_accepted_when_claude_records_the_prompt(
@@ -5387,7 +5401,14 @@ def test_submit_accepted_when_claude_records_the_prompt(
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
+    _pin_session_9026(bridge_dir)
     cursor = claude_native_bridge.count_hook_events(bridge_dir)
+    claim = claude_native_bridge._new_submit_claim(
+        bridge_dir,
+        prompt="Follow-up on the review",
+        hooks_cursor=cursor,
+        submitted_after=time.time(),
+    )
     captures = 0
 
     def capture(*_: str) -> str:
@@ -5395,7 +5416,7 @@ def test_submit_accepted_when_claude_records_the_prompt(
         captures += 1
         assert captures <= 3, "a recorded prompt must be accepted promptly, not polled out"
         if captures == 2:
-            _hook_record(bridge_dir, "UserPromptSubmit")
+            _prompt_hook_9026(bridge_dir, "Follow-up on the review")
         return "  ⎿  \x00 torn frame\n"
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
@@ -5410,6 +5431,7 @@ def test_submit_accepted_when_claude_records_the_prompt(
         what="submitted message",
         bridge_dir=bridge_dir,
         hooks_cursor=cursor,
+        submit_claim=claim,
     )
     assert time.monotonic() - started < claude_native_bridge._SUBMIT_VERIFY_TIMEOUT_S / 4
 
@@ -5438,7 +5460,8 @@ def test_submit_baseline_is_captured_before_the_enter_keystroke(
     )
     # A previous turn's record is already on file, so a correct baseline excludes
     # it and only the record written by this Enter can accept.
-    _hook_record(bridge_dir, "UserPromptSubmit")
+    _pin_session_9026(bridge_dir)
+    _prompt_hook_9026(bridge_dir, "ask me something")
     tui: dict[str, Any] = {"pane": _composer_pane()}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
@@ -5450,7 +5473,7 @@ def test_submit_baseline_is_captured_before_the_enter_keystroke(
         if cmd[-1] == "Enter":
             # The hook wins the race against the first capture, and the pane is
             # left showing only the question — no composer, no boxed chrome.
-            _hook_record(bridge_dir, "UserPromptSubmit")
+            _prompt_hook_9026(bridge_dir, "ask me something")
             tui["pane"] = _QUESTION_SURFACE_PANE
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -5766,11 +5789,16 @@ def test_submit_torn_capture_with_transcript_hint_does_not_accept(
     draft_pane = _composer_pane("keep me unsent")
     # Torn capture: composer missing, only a transcript echo of a dialog title.
     torn_pane = "  ⎿ earlier: Switch model? was discussed\n  more scrollback here\n"
-    state: dict[str, Any] = {"submitted": False, "verify_captures": 0}
+    state: dict[str, Any] = {"pasted": False, "submitted": False, "verify_captures": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
+        if "paste-buffer" in cmd:
+            state["pasted"] = True
         if "capture-pane" in cmd:
+            if not state["pasted"]:
+                # The box is empty until the paste lands (pre-paste clear check).
+                return SimpleNamespace(returncode=0, stdout=_composer_pane(), stderr="")
             if not state["submitted"]:
                 # Paste-observation: the draft is visibly committed.
                 return SimpleNamespace(returncode=0, stdout=draft_pane, stderr="")
@@ -11880,10 +11908,13 @@ def test_inject_user_message_restores_an_occupied_input_box_first(
     inject_user_message(bridge_dir, content="restore my composer")
 
     tails = [cmd[-1] for cmd in captured]
-    # Escape (dismiss the surface) must precede every delivery keystroke.
-    assert tails[:3] == ["Escape", "\x1b[97;5u", "\x1b[107;5u"], (
-        f"Expected the occupying surface to be Escaped before the clear; got {tails}."
+    # Escape (dismiss the surface) must precede every delivery keystroke; the
+    # restored box is verifiably empty, so no clear key follows it.
+    assert tails[0] == "Escape", (
+        f"Expected the occupying surface to be Escaped before the paste; got {tails}."
     )
+    assert "load-buffer" in captured[1], f"Expected the paste right after the Escape; got {tails}."
+    assert not {"\x1b[97;5u", "\x1b[107;5u", "C-u"} & set(tails), tails
     assert tails.count("Escape") == 1, f"One sighting, one Escape — got {tails.count('Escape')}."
     assert tails[-1] == "Enter"
 
@@ -13725,3 +13756,1346 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+# ---------------------------------------------------------------------------
+# Hidden-head drafts and stale-draft clearing (omnigent-ai/omnigent#9026)
+# ---------------------------------------------------------------------------
+
+_SENTENCE_9026 = (
+    "the review found that the knight kit mesh still clips through the shoulder plate "
+    "when the arm rotates past ninety degrees so please re-export with the corrected "
+    "weights and rerun the multiview render check before you push again"
+)
+
+
+def _prose_9026(size: int, *, tag: str = "Rework request") -> str:
+    """
+    Build a single-line message of exactly *size* characters.
+
+    :param size: Target length, e.g. ``600``.
+    :param tag: Distinct lead-in, so two messages never share a head.
+    :returns: Message text with no newline.
+    """
+    vocabulary = _SENTENCE_9026.split()
+    words: list[str] = [f"{tag}:"]
+    idx = 0
+    while len(" ".join(words)) < size:
+        words.append(vocabulary[idx % len(vocabulary)])
+        idx += 1
+    return " ".join(words)[:size].rstrip()
+
+
+class _ScrollingComposerTui:
+    """
+    Fake Claude Code 2.1.280 composer in an 80x24 pane, driven by tmux argv.
+
+    Models what the live repro showed (omnigent-ai/omnigent#9026):
+
+    - the draft wraps at the pane width and the box shows at most
+      :attr:`visible_rows` rows, scrolled to the END of the draft, with the
+      ``❯`` glyph still leading the first visible row — so the head of a
+      450-799 char single-line draft is off-screen;
+    - pastes of 800+ chars or 2+ interior newlines collapse to a
+      ``[Pasted text #N +M lines]`` placeholder;
+    - CSI-u Ctrl+A then Ctrl+K empties only the cursor's (last) row;
+    - each ``C-u`` deletes one rendered row backwards (joining the previous
+      row when the cursor row is already empty), and is a no-op when empty;
+    - ``Enter`` submits whatever the draft holds as one user turn.
+
+    Captured with ``-e`` it adds the styling 2.1.280 really emits: an empty
+    box can show a ghost placeholder/prompt suggestion — inverse first cell
+    plus dim text while focused, all dim while unfocused — which ``C-u``
+    leaves untouched. A stacked dialog can sit above the box (it owns the
+    keyboard: ``Enter`` answers it, ``Escape`` dismisses it unless sticky).
+    """
+
+    width = 76
+    visible_rows = 6
+
+    def __init__(self, *, transcript: str = "", draft: str = "") -> None:
+        self.transcript = transcript
+        self.draft = draft
+        self.placeholders: dict[str, str] = {}
+        self.pending = ""
+        self.submitted: list[str] = []
+        self.events: list[tuple[str, str]] = []
+        self.mangle_render = False
+        self.ignore_clear = False
+        self.swallow_enter = False
+        self.drop_paste = False
+        self.fail_clear_keys = False
+        self.paste_visible_after_captures = 0
+        self._hidden_captures_left = 0
+        self.ghost: str | None = None
+        self.ghost_focused = True
+        self.ghost_after_submit: str | None = None
+        self.dim_draft = False
+        self.dialog = False
+        self.dialog_sticky = False
+        self.dialog_on_paste = False
+        self.enter_into_dialog = 0
+        self.clear_keys_into_dialog = 0
+        self.torn_captures = 0
+        # Whether a draft shows its caret (an inverse cell after the text) in
+        # styled captures; a focus-in event turns it on, as on the real TUI.
+        self.draft_cursor = False
+        self.dim_on_enter = False
+        # Called on every Enter (e.g. to append the hook record Claude writes).
+        self.on_enter: Any = None
+        # Captures that come back torn right after an Enter.
+        self.torn_after_enter = 0
+
+    # -- rendering ---------------------------------------------------------
+    def _rows(self) -> list[str]:
+        rows: list[str] = []
+        for logical in self.draft.split("\n"):
+            if not logical:
+                rows.append("")
+                continue
+            rows.extend(logical[i : i + self.width] for i in range(0, len(logical), self.width))
+        return rows
+
+    def composer_text_visible(self) -> list[str]:
+        rows = self._rows()[-self.visible_rows :] if self.draft else [""]
+        if self._hidden_captures_left > 0:
+            rows = [""]
+        if self.mangle_render:
+            rows = [row.swapcase() for row in rows]
+        return rows
+
+    def render(self, *, styled: bool = False) -> str:
+        rows = self.composer_text_visible()
+        if self.dim_draft and styled:
+            rows = [f"\x1b[2m{row}\x1b[0m" if row else row for row in rows]
+        if styled and self.draft and self.draft_cursor:
+            rows = [*rows[:-1], f"{rows[-1]}\x1b[7m \x1b[0m"]
+        first = f"❯\u00a0{rows[0]}"
+        if not self.draft and self.ghost and self._hidden_captures_left <= 0:
+            if not styled:
+                first = f"❯\u00a0{self.ghost}"
+            elif self.ghost_focused:
+                first = f"❯\u00a0\x1b[7m{self.ghost[0]}\x1b[0;2m{self.ghost[1:]}\x1b[0m"
+            else:
+                first = f"❯\u00a0\x1b[2m{self.ghost}\x1b[0m"
+        body = [first, *(f"  {row}" for row in rows[1:])]
+        rule = "─" * 80
+        dialog = (
+            [
+                rule,
+                "  Teach auto mode about your environment?",
+                "  ❯ 1. Yes",
+                "    2. Not now",
+                "  Enter to confirm · Esc to cancel",
+            ]
+            if self.dialog
+            else []
+        )
+        return "\n".join(
+            [self.transcript, *dialog, rule, *body, "", rule, "", "  ⏵⏵ auto mode on", ""]
+        )
+
+    def logical_submission(self) -> str:
+        text = self.draft
+        for token, real in self.placeholders.items():
+            text = text.replace(token, real)
+        return text.rstrip("\n")
+
+    # -- key handling ------------------------------------------------------
+    def _delete_row_backwards(self) -> None:
+        if not self.draft:
+            return
+        if self.draft.endswith("\n"):
+            self.draft = self.draft[:-1]
+            return
+        rows = self._rows()
+        last = rows[-1]
+        self.draft = self.draft[: len(self.draft) - len(last)]
+
+    def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        if "capture-pane" in cmd:
+            if self.torn_captures > 0:
+                self.torn_captures -= 1
+                self.events.append(("capture", "torn"))
+                return SimpleNamespace(returncode=0, stdout="  ⎿ torn frame\n", stderr="")
+            pane = self.render(styled="-e" in cmd)
+            if self._hidden_captures_left > 0:
+                self._hidden_captures_left -= 1
+            self.events.append(("capture", pane))
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "load-buffer" in cmd:
+            self.pending = Path(cmd[-1]).read_bytes().decode("utf-8").replace("\r", "\n")
+            self.events.append(("load-buffer", ""))
+        elif "paste-buffer" in cmd:
+            self.events.append(("paste-buffer", ""))
+            if not self.drop_paste:
+                text = self.pending
+                interior_newlines = text.rstrip("\n").count("\n")
+                if len(text.rstrip("\n")) >= 800 or interior_newlines >= 2:
+                    token = (
+                        f"[Pasted text #{len(self.placeholders) + 1} +{interior_newlines} lines]"
+                    )
+                    self.placeholders[token] = text.rstrip("\n")
+                    text = token + "\n"
+                self.draft += text
+                self._hidden_captures_left = self.paste_visible_after_captures
+            if self.dialog_on_paste:
+                self.dialog = True
+            # Pasted text is never dim; only a stale draft from before is.
+            self.dim_draft = False
+        elif "send-keys" in cmd:
+            keys = [cmd[-1]] if "-l" in cmd else cmd[cmd.index("-t") + 2 :]
+            if self.fail_clear_keys and "C-u" in keys:
+                return SimpleNamespace(returncode=1, stdout="", stderr="no server running")
+            for key in keys:
+                self.events.append(("key", key))
+                if key == "\x1b[I":
+                    # Focus-in: a focus event, never text.
+                    self.ghost_focused = True
+                    self.draft_cursor = True
+                    continue
+                if self.dialog:
+                    # The dialog owns the keyboard.
+                    if key == "Enter":
+                        self.enter_into_dialog += 1
+                    elif key == "C-u":
+                        self.clear_keys_into_dialog += 1
+                    elif key == "Escape" and not self.dialog_sticky:
+                        self.dialog = False
+                    continue
+                if key == "Enter":
+                    if self.on_enter is not None:
+                        self.on_enter()
+                    self.torn_captures += self.torn_after_enter
+                    if self.dim_on_enter:
+                        self.dim_draft = True
+                    if not self.swallow_enter and self.draft:
+                        self.submitted.append(self.logical_submission())
+                        self.draft = ""
+                        if self.ghost_after_submit is not None:
+                            self.ghost = self.ghost_after_submit
+                elif key == "\x1b[107;5u" and not self.ignore_clear:
+                    # Ctrl+K after Ctrl+A: only the cursor's (last) row empties.
+                    rows = self._rows()
+                    self.draft = self.draft[: len(self.draft) - len(rows[-1])] if rows else ""
+                elif key == "C-u" and not self.ignore_clear:
+                    self._delete_row_backwards()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def key_presses(self) -> list[str]:
+        return [value for kind, value in self.events if kind == "key"]
+
+
+@pytest.fixture
+def _fast_delivery_9026(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Shrink the delivery timeouts so failure paths finish in well under a second.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_CLAUDE_READY_POLL_INTERVAL_S", 0.005)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_VERIFY_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_SLOW_ACCEPT_WARN_S", 10.0)
+    monkeypatch.setattr(claude_native_bridge, "_OCCUPIED_INPUT_DISMISS_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(claude_native_bridge, "_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S", 0.01)
+    for name, value in (
+        ("_COMPOSER_CLEAR_TIMEOUT_S", 0.3),
+        ("_COMPOSER_CLEAR_SETTLE_S", 0.01),
+        ("_PRE_SUBMIT_REVALIDATE_TIMEOUT_S", 0.3),
+        ("_FAILED_SUBMIT_CLEANUP_TIMEOUT_S", 0.3),
+    ):
+        if hasattr(claude_native_bridge, name):
+            monkeypatch.setattr(claude_native_bridge, name, value)
+
+
+def _install_tui_9026(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tui: _ScrollingComposerTui
+) -> Path:
+    """
+    Point a bridge dir at a fake pane and route every tmux call to *tui*.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tui: The fake composer.
+    :returns: The bridge directory.
+    """
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir, socket_path=Path("/tmp/example/tmux.sock"), tmux_target="claude:0.0"
+    )
+    monkeypatch.setattr("subprocess.run", tui.run)
+    return bridge_dir
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        _prose_9026(450),
+        _prose_9026(600),
+        _prose_9026(799),
+        _prose_9026(250) + "\n" + _prose_9026(330, tag="Second paragraph"),
+    ],
+    ids=["single-450", "single-600", "single-799", "one-newline-581"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_hidden_head_draft_confirms_via_tail_and_submits_once(
+    content: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A draft whose head scrolled off the 7-row composer still confirms.
+
+    Live failure (#9026): 450-799 B single-line drafts (or ~460+ B with one
+    newline) are neither collapsed to a placeholder nor fully visible in an
+    80x24 pane, so the head-only needle never matched and delivery raised
+    "could not be confirmed" before Enter. The tail of the message IS in the
+    live composer; it must confirm, and the accepted submit gets exactly one
+    Enter.
+    """
+    tui = _ScrollingComposerTui()
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    # Precondition: the head really is off-screen once pasted.
+    probe = _ScrollingComposerTui(draft=content + "\n")
+    head = claude_native_bridge._submit_needle(content)
+    assert "".join(head.split()) not in "".join("".join(probe.composer_text_visible()).split())
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content]
+    assert tui.key_presses().count("Enter") == 1, tui.key_presses()
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_no_enter_before_the_draft_is_observed_in_the_composer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Enter only follows a capture that positively showed the current draft."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.paste_visible_after_captures = 5
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content=content)
+
+    enter_at = next(i for i, (kind, v) in enumerate(tui.events) if (kind, v) == ("key", "Enter"))
+    tail = "".join(content.split())[-20:]
+    seen_at = [
+        i
+        for i, (kind, pane) in enumerate(tui.events[:enter_at])
+        if kind == "capture" and tail in "".join(pane.split())
+    ]
+    assert seen_at, "Enter was sent before any capture showed the pasted draft"
+    paste_at = next(i for i, (kind, _) in enumerate(tui.events) if kind == "paste-buffer")
+    assert paste_at < seen_at[0] < enter_at
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_message_tail_outside_the_framed_composer_does_not_confirm(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The tail needle is read from the live composer only, never scrollback.
+
+    Here the paste is swallowed while the transcript above the box already
+    shows the message's last words (an earlier echo). Matching pane-wide would
+    press Enter on an empty composer; delivery must fail before Enter instead.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui(transcript="> " + content[-200:])
+    tui.drop_paste = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+def test_draft_in_input_box_tail_needle_reads_only_the_composer() -> None:
+    """Unit-level: the tail matches inside the frame, not in the transcript."""
+    content = _prose_9026(600)
+    tail = claude_native_bridge._submit_tail_needle(content)
+    head = claude_native_bridge._submit_needle(content)
+    assert tail
+    assert "".join(tail.split()) == tail, "the tail needle is whitespace-folded"
+    assert "".join(content.split()).endswith(tail)
+
+    scrolled = _ScrollingComposerTui(draft=content + "\n").render()
+    assert claude_native_bridge._draft_in_input_box(scrolled, head) is False
+    assert claude_native_bridge._draft_in_input_box(scrolled, head, tail) is True
+
+    echoed = _ScrollingComposerTui(transcript=content, draft="").render()
+    assert claude_native_bridge._draft_in_input_box(echoed, head, tail) is False
+
+
+def test_submit_tail_needle_normalizes_like_the_paste_payload() -> None:
+    """Whitespace folds away, dropped controls vanish, and a tab bounds the tail."""
+    assert claude_native_bridge._submit_tail_needle("   \n\t ") == ""
+    assert claude_native_bridge._submit_tail_needle("short msg") == "shortmsg"
+    assert claude_native_bridge._submit_tail_needle("a\r\nb c\x07d") == "abcd"
+    assert claude_native_bridge._submit_tail_needle("head\twrap tail end") == "wraptailend"
+    long_tail = claude_native_bridge._submit_tail_needle("x" * 10 + " " + "y" * 100)
+    assert long_tail == "y" * claude_native_bridge._DRAFT_TAIL_NEEDLE_MAX_CHARS
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_failed_confirmation_clears_the_whole_draft_before_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A draft that never confirms is removed from the composer, then delivery raises.
+
+    Left behind (#9026 part B), the unconfirmed draft was merged into the next
+    retry and submitted as one turn with it.
+    """
+    tui = _ScrollingComposerTui()
+    tui.mangle_render = True  # lands, but neither needle can be read back
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.draft == "", f"stale draft left in the composer: {tui.draft!r}"
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_failing_cleanup_does_not_mask_the_undelivered_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A tmux error while discarding the draft still reports "not confirmed"."""
+    tui = _ScrollingComposerTui()
+    tui.mangle_render = True
+    tui.fail_clear_keys = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert "Enter" not in tui.key_presses()
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_row_only_clear_concatenated_but_retry_now_carries_only_the_new_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A second injection after a failure submits only the second message.
+
+    The fake models Ctrl+A/Ctrl+K emptying just the cursor row, which is what
+    the old pre-paste clear did: the stale multi-row draft survived and the
+    next message was appended below it, so its Enter sent both as one turn.
+    """
+    stale = _prose_9026(600)
+    old_style = _ScrollingComposerTui(draft=stale + "\n")
+    old_style.run(["tmux", "send-keys", "-l", "-t", "t", "\x1b[97;5u"])
+    old_style.run(["tmux", "send-keys", "-l", "-t", "t", "\x1b[107;5u"])
+    assert old_style.draft.strip(), "row-only clear leaves the multi-row draft behind"
+
+    tui = _ScrollingComposerTui()
+    tui.mangle_render = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=stale)
+    tui.mangle_render = False
+
+    inject_user_message(bridge_dir, content="second message only")
+
+    assert tui.submitted == ["second message only"]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_stale_multi_row_draft_is_cleared_before_pasting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A draft the person left (or an earlier failure left) never rides along."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(700, tag="Stale draft") + "\n")
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+    first_paste = next(i for i, (kind, _) in enumerate(tui.events) if kind == "paste-buffer")
+    assert ("key", "C-u") in tui.events[:first_paste]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_unverifiable_clear_sends_no_paste_and_no_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When the composer cannot be shown empty, nothing is pasted or submitted."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(300, tag="Stuck draft") + "\n")
+    tui.ignore_clear = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="must not be pasted")
+
+    kinds = [kind for kind, _ in tui.events]
+    assert "load-buffer" not in kinds
+    assert "paste-buffer" not in kinds
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_unaccepted_submit_clears_the_still_present_draft_before_raising(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A submit that verifiably never landed leaves no draft for the next retry."""
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.draft == ""
+    assert tui.key_presses()[-1] == "C-u", (
+        "cleanup must be the last keystroke, never another Enter"
+    )
+
+
+def test_composer_placeholder_ghost_text_counts_as_empty() -> None:
+    """
+    A dim placeholder (prompt suggestion) in an empty box is not a draft.
+
+    Claude Code renders the placeholder as an inverse first cell plus dim text,
+    and only while the draft is empty; real draft text is never dim.
+    """
+    rule = "─" * 80
+    ghost = f"{rule}\n\x1b[39m❯ \x1b[7mT\x1b[27m\x1b[2mry fixing the lint errors\x1b[22m\n{rule}\n"
+    real = f"{rule}\n\x1b[39m❯ fix the lint errors\x1b[7m \x1b[27m\n{rule}\n"
+    cursor_on_char = f"{rule}\n❯ \x1b[7mx\x1b[27m\n{rule}\n"
+    signature = claude_native_bridge._composer_ghost_signature
+    assert signature(ghost) == "focused"
+    assert signature(real) is None
+    assert signature(cursor_on_char) is None
+    assert signature("") is None
+
+
+# -- Rework of #19 (cross-vendor review): ghost text, dialogs, torn cleanup --
+
+_RULE_9026 = "─" * 80
+
+
+def _styled_composer_9026(first_row: str, *more_rows: str) -> str:
+    """
+    Build a ``capture-pane -e`` style pane around one composer.
+
+    :param first_row: The ``❯`` row's text after the glyph, escapes included.
+    :param more_rows: Continuation rows.
+    :returns: Pane text with SGR escapes.
+    """
+    body = [f"\x1b[39m❯ {first_row}", *(f"  {row}" for row in more_rows)]
+    return "\n".join([_RULE_9026, *body, _RULE_9026, "", "  ⏵⏵ auto mode on", ""])
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_swallowed_paste_never_confirms_on_a_matching_ghost_suggestion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dim prompt suggestion equal to the message is not the draft.
+
+    The paste is swallowed while the empty box shows Claude's ghost suggestion
+    with the same words. Matching plain text confirmed it and pressed Enter
+    on an empty composer; only real (non-ghost) composer text may confirm.
+    """
+    content = 'Try "fix typecheck errors"'
+    tui = _ScrollingComposerTui()
+    tui.ghost = content
+    tui.drop_paste = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    head = claude_native_bridge._submit_needle(content)
+    tail = claude_native_bridge._submit_tail_needle(content)
+    assert claude_native_bridge._draft_in_input_box(tui.render(), head, tail) is True
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.parametrize("focused", [True, False], ids=["focused-ghost", "unfocused-ghost"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_accepted_submit_is_not_re_entered_when_a_matching_suggestion_appears(
+    focused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    After a successful submit the box may show a suggestion with the same words.
+
+    Read as plain text that ghost looked like the draft still sitting there,
+    so verification sent retry Enters — into a box whose Enter would act on
+    the suggestion. The accepted submit must get exactly one Enter.
+    """
+    content = "run the full test suite again and report the failures"
+    tui = _ScrollingComposerTui()
+    tui.ghost_after_submit = content
+    tui.ghost_focused = focused
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content]
+    assert tui.key_presses().count("Enter") == 1, tui.key_presses()
+
+
+def test_ghost_signature_is_exact_and_never_a_collapsed_paste_badge() -> None:
+    """
+    Only the two verified ghost renderings count; a badge never does.
+
+    2.1.280 draws a placeholder as an inverse first cell plus dim text while
+    focused and as all-dim text while unfocused (captured live). Anything
+    else — a collapsed ``[Pasted text …]`` badge in any styling, a real draft
+    with the cursor block on its first character (vim normal mode / Home) —
+    is draft content.
+    """
+    signature = claude_native_bridge._composer_ghost_signature
+    focused = _styled_composer_9026('\x1b[7mT\x1b[0;2m\x1b[39m\x1b[49mry "fix typecheck errors"')
+    unfocused = _styled_composer_9026('\x1b[2mTry "fix typecheck errors"')
+    assert signature(focused) == "focused"
+    assert signature(unfocused) == "unfocused"
+    assert signature(_styled_composer_9026("\x1b[7m[\x1b[0;2mPasted text #1 +3 lines]")) is None
+    assert signature(_styled_composer_9026("\x1b[2m[Pasted text #1 +3 lines]\x1b[0m")) is None
+    assert signature(_styled_composer_9026("[Pasted text #1 +3 lines]\x1b[7m \x1b[0m")) is None
+    assert signature(_styled_composer_9026("\x1b[7mf\x1b[0mix the bug")) is None
+    assert signature(_styled_composer_9026("\x1b[7mf\x1b[0mix \x1b[2mthe bug")) is None
+    assert signature(_styled_composer_9026("fix the bug\x1b[7m \x1b[0m")) is None
+    assert signature(_styled_composer_9026("\x1b[7m \x1b[0m")) is None
+    assert signature(_styled_composer_9026("\x1b[7mx\x1b[0m")) is None
+    assert signature("") is None
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_all_dim_real_draft_is_cleared_not_mistaken_for_a_ghost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An all-dim draft is cleared first, never pasted over.
+
+    All-dim is also how an unfocused ghost looks, so it is never empty on its
+    own: a focus-in event makes a ghost take the verified focused rendering
+    while real text shows its caret, and the caret-bearing box is cleared
+    like any other draft.
+    """
+    tui = _ScrollingComposerTui(draft="stale dim draft text\n")
+    tui.dim_draft = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+@pytest.mark.parametrize("focused", [True, False], ids=["focused-ghost", "unfocused-ghost"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_ghost_in_the_empty_box_does_not_block_delivery(
+    focused: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both verified ghost renderings read as an empty box; the message delivers."""
+    tui = _ScrollingComposerTui()
+    tui.ghost = 'Try "fix typecheck errors"'
+    tui.ghost_focused = focused
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_dim_collapsed_paste_badge_is_cleared_before_pasting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale ``[Pasted text …]`` badge is never read as an empty box."""
+    tui = _ScrollingComposerTui()
+    tui.run(["tmux", "load-buffer", str(_write_9026(tmp_path, "a\nb\nc\nd\n"))])
+    tui.run(["tmux", "paste-buffer", "-t", "t"])
+    tui.dim_draft = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+def _write_9026(tmp_path: Path, text: str) -> Path:
+    """
+    Write *text* as a paste-buffer source file for the fake.
+
+    :param tmp_path: Per-test temp directory.
+    :param text: Buffer contents.
+    :returns: The file path.
+    """
+    path = tmp_path / "stale-paste.bin"
+    path.write_bytes(text.replace("\n", "\r").encode("utf-8"))
+    return path
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_tail_visible_draft_with_a_stacked_dialog_gets_no_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dialog that pops with the paste is never answered by the submit Enter.
+
+    The draft's tail is plainly in the box under the dialog, so a needle-first
+    check confirmed it and the Enter went to the dialog's selected option.
+    Dialogs are checked before any needle match; one that will not go away
+    fails the delivery with no Enter at all.
+    """
+    tui = _ScrollingComposerTui()
+    tui.dialog_on_paste = True
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.enter_into_dialog == 0
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dialog_that_opens_right_before_the_enter_is_not_answered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The box is re-validated immediately before Enter.
+
+    Here the dialog opens after the draft was confirmed — during the settle
+    and pending-prompt check, which ignores stacked dialogs because the
+    composer is still drawn.
+    """
+    tui = _ScrollingComposerTui()
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_pending = claude_native_bridge.has_pending_user_prompt
+    calls = {"n": 0}
+
+    def _pending_then_dialog(bridge: Path) -> bool:
+        calls["n"] += 1
+        if calls["n"] == 2:  # the pre-Enter check, after the draft confirmed
+            tui.dialog = True
+        return real_pending(bridge)
+
+    monkeypatch.setattr(claude_native_bridge, "has_pending_user_prompt", _pending_then_dialog)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert calls["n"] >= 2
+    assert "Enter" not in tui.key_presses()
+    assert tui.enter_into_dialog == 0
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_unaccepted_submit_cleanup_waits_through_a_torn_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A torn first cleanup capture does not skip the post-submit cleanup.
+
+    The one-shot check saw no composer, left the stale draft in the box, and
+    the next delivery's text was merged with it.
+    """
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    def _verify_fails_then_tear(*_args: object, **_kwargs: object) -> bool:
+        tui.torn_captures = 2
+        return False
+
+    monkeypatch.setattr(claude_native_bridge, "_verify_submit_accepted", _verify_fails_then_tear)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.draft == "", f"stale draft left after a torn cleanup capture: {tui.draft!r}"
+    assert tui.key_presses().count("Enter") == 1
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_clear_stops_pressing_once_a_dialog_appears(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clear keys go out in small bursts and stop the moment a dialog owns the keys."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(700, tag="Stale draft") + "\n")
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_run = tui.run
+
+    def _dialog_after_first_burst(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = real_run(cmd, **kwargs)
+        if "send-keys" in cmd and "C-u" in cmd:
+            tui.dialog = True
+        return result
+
+    monkeypatch.setattr("subprocess.run", _dialog_after_first_burst)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    bursts = [e for e in tui.events if e == ("key", "C-u")]
+    assert 0 < len(bursts) <= claude_native_bridge._COMPOSER_CLEAR_KEYS_PER_BURST
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "Enter" not in tui.key_presses()
+
+
+def test_tail_needle_ignores_trailing_whitespace_and_keeps_wide_characters() -> None:
+    """Trailing blanks never enter the marker; CJK characters are kept verbatim."""
+    tail = claude_native_bridge._submit_tail_needle
+    assert tail("please review   \n\n\t \n") == tail("please review")
+    assert tail("日本語のテキストを確認してください。") == "日本語のテキストを確認してください。"
+    long_cjk = "確認" * 40
+    assert tail(long_cjk) == long_cjk[-claude_native_bridge._DRAFT_TAIL_NEEDLE_MAX_CHARS :]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_wide_character_draft_with_hidden_head_confirms_via_tail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A long CJK single-line draft (head scrolled away) still delivers once."""
+    content = "レビュー結果：" + "肩のプレートを貫通するメッシュを修正してください。" * 25
+    tui = _ScrollingComposerTui()
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content=content[:700])
+
+    assert tui.submitted == [content[:700]]
+    assert tui.key_presses().count("Enter") == 1
+
+
+# -- Rework round 3: unfocused all-dim text, hook-baseline gap, stale retry frames --
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_long_repetitive_dim_draft_is_never_read_as_an_unchanged_ghost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dim draft longer than the box loses rows to C-u yet renders the same viewport.
+
+    760 dim ``x`` (no caret, as unfocused) scroll so the visible six rows are
+    identical before and after a 4-key burst. "Unchanged after C-u" therefore
+    proved nothing: the box was called empty with 456 chars left and the
+    next paste was appended to them. All-dim text is only resolved by a
+    focus-in event, after which a real draft shows its caret.
+    """
+    tui = _ScrollingComposerTui(draft="x" * 760)
+    tui.dim_draft = True
+    before = tui.render(styled=True)
+    probe = _ScrollingComposerTui(draft="x" * (760 - 4 * tui.width))
+    probe.dim_draft = True
+    assert probe.render(styled=True) == before, "precondition: the viewport hides the loss"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._composer_ghost_signature(tui.render(styled=True)) == "unfocused"
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dim_still_present_draft_is_never_reported_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Submit verification never calls an all-dim box "draft gone".
+
+    The swallowed submit leaves the draft in place, rendered dim with no
+    caret. Read as an unfocused ghost it was reported accepted.
+    """
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    tui.dim_on_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.key_presses().count("Enter") == 1, "an unknowable box gets no retry Enter"
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_an_unfocused_ghost_is_resolved_by_focus_in_not_by_clear_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The default state of a detached pane (focus-events on) is unfocused.
+
+    Measured on 2.1.280 with omnigent's tmux options and no client: the ghost
+    is all dim. A focus-in event turns it into the verified focused rendering,
+    so delivery proceeds with no C-u probing a box that holds no draft.
+    """
+    tui = _ScrollingComposerTui()
+    tui.ghost = 'Try "refactor <filepath>"'
+    tui.ghost_focused = False
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+    assert "\x1b[I" in tui.key_presses()
+    assert "C-u" not in tui.key_presses()
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dialog_opening_during_hook_baseline_acquisition_gets_no_enter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Draft/dialog re-validation is the last pane read before Enter.
+
+    The hook baseline was taken AFTER re-validation, so a dialog that opened
+    while ``hooks.jsonl`` was being counted got the submit Enter.
+    """
+    tui = _ScrollingComposerTui()
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_count = claude_native_bridge.count_hook_events
+
+    def _count_then_dialog(bridge: Path) -> int:
+        tui.dialog = True
+        return real_count(bridge)
+
+    monkeypatch.setattr(claude_native_bridge, "count_hook_events", _count_then_dialog)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.enter_into_dialog == 0
+    assert "Enter" not in tui.key_presses()
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_retry_enter_is_decided_on_a_fresh_frame(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dialog opening between a verification read and the retry Enter is not answered.
+
+    The pending-prompt check runs between the read and the retry; a dialog
+    that opened then was invisible to the stale frame the retry relied on.
+    """
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_raise = claude_native_bridge._raise_if_user_prompt_pending
+
+    def _pending_check_then_dialog(bridge: Path | None, pane: str) -> None:
+        tui.dialog = True
+        real_raise(bridge, pane)
+
+    monkeypatch.setattr(
+        claude_native_bridge, "_raise_if_user_prompt_pending", _pending_check_then_dialog
+    )
+
+    with pytest.raises(RuntimeError, match="not"):
+        inject_user_message(bridge_dir, content=_prose_9026(600))
+
+    assert tui.enter_into_dialog == 0
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_clear_keys_are_decided_on_the_frame_they_land_on(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dialog opening between the clear's read and its burst gets no C-u."""
+    tui = _ScrollingComposerTui(draft=_prose_9026(300, tag="Stale draft") + "\n")
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_run = tui.run
+
+    def _dialog_on_styled_read(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = real_run(cmd, **kwargs)
+        if "capture-pane" in cmd and "-e" in cmd:
+            tui.dialog = True
+        return result
+
+    monkeypatch.setattr("subprocess.run", _dialog_on_styled_read)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.clear_keys_into_dialog == 0
+    assert "Enter" not in tui.key_presses()
+
+
+def test_real_styled_pasted_text_badge_still_confirms() -> None:
+    """
+    The collapsed-paste badge as 2.1.280 really renders it (captured live).
+
+    Plain text with the caret on the empty row after it — never a ghost, and
+    accepted as the draft exactly as before.
+    """
+    styled = "\n".join(
+        [
+            "\x1b[38;5;244m" + _RULE_9026,
+            "\x1b[39m❯\xa0[Pasted text #1 +5 lines]\x1b[7m",
+            "\x1b[0m\x1b[38;5;244m\x1b[49m" + _RULE_9026,
+            "",
+            "\x1b[39m  \x1b[38;5;246mpaste again to expand",
+            "",
+        ]
+    )
+    assert claude_native_bridge._composer_ghost_signature(styled) is None
+    assert claude_native_bridge._draft_in_styled_input_box(styled, "line 0", "line4") is True
+
+
+# -- Rework round 4: the UserPromptSubmit record must be THIS prompt's --
+
+_SESSION_9026 = "8a1d72fb-2a76-4158-baf0-52fe663236bd"
+
+
+def _pin_session_9026(bridge_dir: Path) -> None:
+    """
+    Pin the active Claude session the way its SessionStart hook does.
+
+    :param bridge_dir: Bridge directory.
+    :returns: None.
+    """
+    claude_native_bridge.record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "SessionStart",
+            "session_id": _SESSION_9026,
+            "transcript_path": f"/p/{_SESSION_9026}.jsonl",
+        },
+    )
+
+
+def _prompt_hook_9026(bridge_dir: Path, prompt: str | None, **extra: object) -> None:
+    """
+    Append a parent-process UserPromptSubmit record shaped like 2.1.280's.
+
+    The live payload (captured with a blocking hook) carries ``cwd``,
+    ``hook_event_name``, ``permission_mode``, ``prompt``, ``prompt_id``,
+    ``session_id`` and ``transcript_path``.
+
+    :param bridge_dir: Bridge directory.
+    :param prompt: The ``prompt`` field, or ``None`` to omit it.
+    :param extra: Field overrides, e.g. ``session_id="other"``.
+    :returns: None.
+    """
+    payload: dict[str, object] = {
+        "cwd": "/w",
+        "permission_mode": "default",
+        "prompt_id": "p-1",
+        "session_id": _SESSION_9026,
+        "transcript_path": f"/p/{_SESSION_9026}.jsonl",
+        **extra,
+    }
+    if prompt is not None:
+        payload["prompt"] = prompt
+    _hook_record(bridge_dir, "UserPromptSubmit", **payload)
+
+
+def _hook_during_revalidation_9026(
+    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, prompt: str
+) -> None:
+    """
+    Append a prompt record while the pre-Enter re-validation runs.
+
+    That is after the hook-cursor baseline and before this delivery's Enter —
+    a previous prompt's late record landing in the gap.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param bridge_dir: Bridge directory.
+    :param prompt: The late record's prompt.
+    :returns: None.
+    """
+    real = claude_native_bridge._revalidate_draft_before_enter
+
+    def _revalidate_then_late_hook(*args: Any, **kwargs: Any) -> None:
+        real(*args, **kwargs)
+        _prompt_hook_9026(bridge_dir, prompt)
+
+    monkeypatch.setattr(
+        claude_native_bridge, "_revalidate_draft_before_enter", _revalidate_then_late_hook
+    )
+
+
+@pytest.mark.parametrize(
+    "late_prompt",
+    ["the previous prompt, delivered a moment ago", "SAME"],
+    ids=["unrelated-prompt", "identical-prompt"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_late_hook_from_a_previous_prompt_never_confirms_this_submit(
+    late_prompt: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A record appended after the baseline but before this Enter is not this prompt's.
+
+    The baseline is taken before re-validation, so a previous prompt's late
+    record can land in between. Here this Enter is swallowed and the next
+    frames are torn, so only the hook could answer — and accepting by line
+    position alone credited the old record, returned success, and skipped the
+    cleanup with the draft still in the box. Even an identical prompt (the
+    same message sent twice) recorded before this Enter is not this submit.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    _hook_during_revalidation_9026(
+        monkeypatch, bridge_dir, content if late_prompt == "SAME" else late_prompt
+    )
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert tui.draft == "", "the cleanup must still run"
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"prompt": None},
+        {"session_id": None},
+        {"session_id": "another-session"},
+        {"prompt": "a different prompt"},
+    ],
+    ids=["no-prompt", "no-session", "other-session", "other-prompt"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_an_uncorrelated_hook_after_the_enter_never_confirms(
+    fields: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A record that lacks, or contradicts, this prompt and session is not evidence."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    prompt = fields.get("prompt", content)
+    extra = {k: v for k, v in fields.items() if k != "prompt" and v is not None}
+    if fields.get("session_id", "") is None:
+        extra["session_id"] = ""
+
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, prompt, **extra)  # type: ignore[arg-type]
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert tui.draft == ""
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [
+        lambda c: c,
+        lambda c: c + "\n",
+        lambda c: c.replace("\t", "    ").replace("\r\n", "\n") + "\n",
+    ],
+    ids=["exact", "trailing-newline", "tabs-crlf-normalized"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_the_correlated_prompt_hook_still_confirms_an_unreadable_frame(
+    recorded: Any, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    This prompt's own record, written after this Enter, still confirms delivery.
+
+    The submit lands but every frame after it is torn, so the record is the
+    only evidence. Claude records the prompt with CRLF folded to LF, tabs as
+    four spaces and a trailing newline on multi-line drafts (all captured
+    live), so the match is on whitespace-folded content.
+    """
+    content = "Rework request:\r\n\tre-export the knight kit mesh " + _prose_9026(200)
+    tui = _ScrollingComposerTui()
+    tui.torn_after_enter = 10_000
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, recorded(content))
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert len(tui.submitted) == 1
+    assert tui.key_presses().count("Enter") == 1
+
+
+def test_prompt_correlation_normalizes_like_claude_records_it() -> None:
+    """Whitespace folds away (CRLF, tabs→spaces, trailing newline); the U+FEFF escape too."""
+    same = claude_native_bridge._same_prompt
+    assert same("a b\r\n\tc", "a b\n    c\n")
+    assert same("﻿/help me", "/help me")
+    assert same("line 0\nline 1", "line 0\nline 1\n")
+    assert not same("a b c", "a b c d")
+    assert not same("", "")
+    assert not same("abc", None)
+
+
+# -- Rework round 5: exact prompt canonicalization; hook accounting across deliveries --
+
+
+def test_prompt_correlation_canonicalizes_only_the_measured_transforms() -> None:
+    """
+    Only what 2.1.280 was measured to do to a prompt is forgiven; the rest is exact.
+
+    Measured with a blocking UserPromptSubmit hook: CR and CRLF arrive as LF,
+    a tab as four spaces (fixed, not to a tab stop: ``ab\\tc`` -> ``ab    c``),
+    ESC/BEL vanish (the paste payload drops them), and trailing whitespace is
+    not transported reliably — an uncollapsed draft is trimmed (``"hello
+    world   "`` -> ``"hello world"``) while a collapsed paste keeps the
+    bridge's synthetic trailing newline. Leading and interior whitespace is
+    kept verbatim, so it must match verbatim.
+    """
+    same = claude_native_bridge._same_prompt
+    # measured transforms still correlate
+    assert same("a1\r\nb2", "a1\nb2\n")
+    assert same("x1\ry2\rz3", "x1\ny2\nz3\n")
+    assert same("ab\tc", "ab    c")
+    assert same("\tindented", "    indented")
+    assert same("be\x1bfore\x07after", "beforeafter")
+    assert same("hello world   ", "hello world")
+    assert same("hello world\n", "hello world")
+    assert same("a1\nb2\nc3\n", "a1\nb2\nc3\n\n")
+    assert same("﻿/help me", "/help me")
+    assert same("  ﻿/help me", "  /help me")
+    assert same("   indented start", "   indented start")
+    # whitespace placement is content
+    assert not same("review ab c", "review a bc")
+    assert not same("a\nb c", "a b\nc")
+    assert not same("a  b", "a b")
+    assert not same("   indented start", "indented start")
+    assert not same("ab\tc", "ab  c")
+    # U+FEFF is only forgiven at the slash-escape position
+    assert not same("mid﻿text", "midtext")
+    assert not same("﻿plain", "plain")
+    assert not same("", "")
+    assert not same("abc", None)
+
+
+def _deliver_confirmed_by_pane_9026(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, tui: _ScrollingComposerTui, content: str
+) -> Path:
+    """
+    Deliver *content* once, confirmed by the pane, with no hook record written.
+
+    :param tmp_path: Per-test temp directory.
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param tui: The fake composer.
+    :param content: Message text.
+    :returns: The bridge directory.
+    """
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    inject_user_message(bridge_dir, content=content)
+    assert tui.submitted == [content]
+    return bridge_dir
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_an_earlier_identical_deliverys_late_hook_never_confirms_this_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Codex's sequence: the earlier delivery's hook is written during this Enter.
+
+    The same message was delivered before and confirmed by the pane before its
+    hook arrived. That hook is then written while this delivery's ``send-keys
+    Enter`` is still in flight — after the baseline and after
+    ``submitted_after``, so position, time, prompt and session all match. This
+    Enter is swallowed and the frames are torn. The record pays off the
+    earlier delivery's outstanding claim, so it cannot confirm this one.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    bridge_dir = _deliver_confirmed_by_pane_9026(tmp_path, monkeypatch, tui, content)
+
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert tui.draft == "", "the cleanup must still run"
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_one_record_written_twice_never_pays_two_deliveries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A duplicated record (same ``prompt_id``) is counted once."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    bridge_dir = _deliver_confirmed_by_pane_9026(tmp_path, monkeypatch, tui, content)
+
+    tui.swallow_enter = True
+    tui.torn_after_enter = 5
+
+    def _same_record_twice() -> None:
+        _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+        _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+
+    tui.on_enter = _same_record_twice
+
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_when_both_the_earlier_and_the_current_hook_arrive_the_current_confirms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The earlier record pays the earlier claim; this prompt's own record confirms this one."""
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    bridge_dir = _deliver_confirmed_by_pane_9026(tmp_path, monkeypatch, tui, content)
+
+    tui.torn_after_enter = 10_000
+
+    def _earlier_then_current() -> None:
+        _prompt_hook_9026(bridge_dir, content, prompt_id="earlier")
+        _prompt_hook_9026(bridge_dir, content + "\n", prompt_id="current")
+
+    tui.on_enter = _earlier_then_current
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content, content]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_verifiably_undelivered_attempt_does_not_absorb_the_retrys_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A claim whose draft was positively cleared (never submitted) owes no record.
+
+    Otherwise the caller's retry of the same message — delivered, its pane
+    unreadable — would have its genuine record paid to the failed attempt and
+    be reported undelivered, prompting a duplicate send.
+    """
+    content = _prose_9026(600)
+    tui = _ScrollingComposerTui()
+    tui.swallow_enter = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    _pin_session_9026(bridge_dir)
+    with pytest.raises(RuntimeError, match="did not accept"):
+        inject_user_message(bridge_dir, content=content)
+    assert tui.draft == ""
+
+    tui.swallow_enter = False
+    tui.torn_after_enter = 10_000
+    tui.on_enter = lambda: _prompt_hook_9026(bridge_dir, content, prompt_id="retry")
+
+    inject_user_message(bridge_dir, content=content)
+
+    assert tui.submitted == [content]

@@ -127,7 +127,8 @@ def test_panes_without_a_stacked_dialog_draw_no_escape(pane: str) -> None:
 
 
 # The pre-paste clear is sent as literal CSI-u sequences for Ctrl+A / Ctrl+K.
-_CLEAR_KEYS = {"\x1b[97;5u": "C-a", "\x1b[107;5u": "C-k"}
+# Every key that could clear the composer, so a stray clear shows up in ``keys``.
+_CLEAR_KEYS = {"\x1b[97;5u": "C-a", "\x1b[107;5u": "C-k", "C-u": "C-u"}
 
 
 def _setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
@@ -183,7 +184,8 @@ def test_a_stacked_dialog_is_escaped_before_the_message_is_pasted(
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content="what is 17 plus 25")
 
-    assert keys == ["Escape", "C-a", "C-k", "paste", "Enter"], keys
+    # The restored box is verifiably empty, so the pre-paste clear sends no key.
+    assert keys == ["Escape", "paste", "Enter"], keys
 
 
 def test_a_dialog_that_opens_mid_paste_is_dismissed_and_the_paste_retried(
