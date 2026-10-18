@@ -3437,12 +3437,21 @@ class ClaudeSDKExecutor(Executor):
         if len(messages) <= 1 or len(user_messages) <= 1:
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
 
-        # Check if the latest user message is multimodal — if so,
-        # serialize prior history as a text prefix but preserve the
-        # latest message's content blocks for native multimodal
-        # delivery to the Anthropic API.
-        latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
-        prior = messages[:-1] if messages else []
+        # The trailing run of consecutive user messages is the current
+        # input and travels natively (multimodal blocks preserved); only
+        # what precedes it is serialized as the text history prefix. With
+        # no trailing user message, fall back to the last user message.
+        run_start = len(messages)
+        while run_start > 0 and messages[run_start - 1].get("role") == "user":
+            run_start -= 1
+        if run_start == len(messages):
+            run_start -= 1
+            latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
+        else:
+            latest_content = ClaudeSDKExecutor._extract_trailing_user_content(messages[run_start:])
+        prior = messages[:run_start]
+        if not prior:
+            return latest_content
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:
