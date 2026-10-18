@@ -2363,14 +2363,40 @@ def _extract_latest_user_content(
     return ""
 
 
+def _history_attachment_placeholder(block: CodexParams, kind: str) -> str:
+    """
+    Compact text placeholder for a resolved historical attachment.
+
+    A block replayed inside "Conversation so far:" is indistinguishable from
+    one attached to the current turn, so sending it as a real ``input_image``/
+    ``input_file`` block makes a fresh Codex thread report an earlier turn's
+    photo as just sent. This placeholder keeps the attachment visible in the
+    transcript without the model mistaking it for new input.
+
+    :param block: The prior-turn ``input_image``/``input_file`` block.
+    :param kind: ``"image"`` or ``"attachment"``, matching ``block``'s type.
+    :returns: e.g. ``"[image previously shared: screenshot.png]"``, naming
+        the attachment by ``filename`` then ``file_id``, or the bare
+        ``"[image previously shared]"`` marker when neither is available.
+    """
+    identifier = block.get("filename") or block.get("file_id")
+    if isinstance(identifier, str) and identifier:
+        return f"[{kind} previously shared: {identifier}]"
+    return f"[{kind} previously shared]"
+
+
 def _build_initial_prompt(
     messages: list[Message],
 ) -> str | list[CodexParams]:
     """
     Build the initial prompt for a fresh Codex thread.
 
-    Replays prior turns with role labels, keeping attachments as native
-    content blocks. Text-only history retains its plain-string format.
+    Replays prior turns with role labels. Only the latest user message's own
+    attachments stay native content blocks; earlier turns' resolved
+    image/file attachments become text placeholders (see
+    ``_history_attachment_placeholder``) so a cold-started thread cannot
+    mistake replayed history for something just attached. Text-only history
+    retains its plain-string format.
 
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
@@ -2388,8 +2414,14 @@ def _build_initial_prompt(
         for msg in messages
     )
     if has_attachments:
+        latest_user_index = -1
+        for idx, msg in enumerate(messages):
+            if msg.get("role") == "user":
+                latest_user_index = idx
+
         blocks: list[CodexParams] = [{"type": "input_text", "text": "Conversation so far:"}]
-        for msg in messages:
+        for idx, msg in enumerate(messages):
+            is_latest_user_message = idx == latest_user_index
             role = str(msg.get("role", "user")).replace("_", " ")
             blocks.append({"type": "input_text", "text": f"{role}:"})
             content = msg.get("content")
@@ -2405,9 +2437,25 @@ def _build_initial_prompt(
                         if isinstance(text, str):
                             blocks.append({"type": "input_text", "text": text})
                     elif kind == "input_image" and isinstance(block.get("image_url"), str):
-                        blocks.append({"type": "input_image", "image_url": block["image_url"]})
+                        if is_latest_user_message:
+                            blocks.append({"type": "input_image", "image_url": block["image_url"]})
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": _history_attachment_placeholder(block, "image"),
+                                }
+                            )
                     elif kind == "input_file" and isinstance(block.get("file_data"), str):
-                        blocks.append(block)
+                        if is_latest_user_message:
+                            blocks.append(block)
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": _history_attachment_placeholder(block, "attachment"),
+                                }
+                            )
                     else:
                         blocks.append(
                             {
