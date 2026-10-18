@@ -57,6 +57,7 @@ from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigne
 from omnigent.models.codex_model_vocabulary import codex_spawn_model
 from omnigent.models.model_fallbacks import CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runner.synthetic_markers import CANCELLATION_MARKER_TEXT
 
 
 def _run(coro):
@@ -620,6 +621,38 @@ class TestCodexExecutor(unittest.TestCase):
         )
         text = "\n".join(item["text"] for item in wire if item["type"] == "text")
         self.assertNotIn("previously shared", text)
+
+    def test_build_initial_prompt_interruption_marker_closes_the_current_run(self):
+        # The abandoned request's image precedes the runner's
+        # [System: interrupted] marker, so it is history (placeholder); only
+        # the replacement after the marker is current.
+        uri_old = "data:image/png;base64,QQ=="
+        uri_new = "data:image/png;base64,Qg=="
+        messages = [
+            {"role": "assistant", "content": "Working on it..."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": uri_old, "filename": "abandoned.png"}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": uri_new, "filename": "new.png"}],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "url": uri_new}])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertIn("[image previously shared: abandoned.png]", text)
+        self.assertNotIn("new.png", text)
 
     def test_build_initial_prompt_unresolved_historical_attachment_keeps_could_not_be_loaded(
         self,

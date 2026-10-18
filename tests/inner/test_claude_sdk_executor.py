@@ -26,6 +26,7 @@ from omnigent.inner.executor import (
     ToolCallStatus,
     TurnComplete,
 )
+from omnigent.runner.synthetic_markers import CANCELLATION_MARKER_TEXT
 
 
 class _SDKClient:
@@ -571,6 +572,122 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("middle.png", text)
         tail = [b.get("type") if b.get("type") != "text" else b["text"] for b in prompt[-4:]]
         self.assertEqual(tail, ["one", "image", "two", "three"])
+
+    def test_fresh_start_interruption_marker_closes_the_current_run(self):
+        # The abandoned request (and its image) precedes the runner's
+        # [System: interrupted] marker; only the replacement is current.
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Working on it..."},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"abandoned", "abandoned.png"),
+                    {"type": "input_text", "text": "ABANDONED-REQUEST"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            },
+            {"role": "user", "content": "REPLACEMENT-REQUEST"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        # Nothing native survives, so the prompt collapses to plain text.
+        self.assertIsInstance(prompt, str)
+        text = prompt
+        head, sep, _tail = text.partition("Respond to the latest user message")
+        self.assertTrue(sep)
+        self.assertIn("[image previously shared: abandoned.png]", head)
+        self.assertIn("ABANDONED-REQUEST", head)
+        self.assertIn("[System: interrupted]", head)
+        self.assertNotIn("REPLACEMENT-REQUEST", head)
+        self.assertEqual(text.count("REPLACEMENT-REQUEST"), 1)
+        self.assertEqual(text.count("ABANDONED-REQUEST"), 1)
+        self.assertEqual(text.count("[System: interrupted]"), 1)
+
+    def test_fresh_start_run_after_interruption_marker_keeps_images_native(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "Working on it..."},
+            {"role": "user", "content": "abandoned"},
+            {"role": "user", "content": CANCELLATION_MARKER_TEXT},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"new1", "new1.png"),
+                    {"type": "input_text", "text": "first"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"new2", "new2.png"),
+                    {"type": "input_text", "text": "second"},
+                ],
+            },
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        images = [b for b in prompt if b.get("type") == "image"]
+        self.assertEqual(
+            [b["source"]["data"] for b in images],
+            [base64.b64encode(b"new1").decode(), base64.b64encode(b"new2").decode()],
+        )
+        self.assertNotIn("previously shared", self._text_of(prompt))
+
+    def test_fresh_start_compact_inside_trailing_run_loses_nothing(self):
+        # A synthesized /compact inside the trailing run: everything up to and
+        # including it is history, what follows is current; every message
+        # appears exactly once.
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": "PRE-COMPACT-CONTENT"},
+            {"role": "user", "content": "/compact"},
+            {"role": "user", "content": "FOLLOW-UP"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        text = prompt if isinstance(prompt, str) else self._text_of(prompt)
+        head, sep, tail = text.partition("Respond to the latest user message")
+        self.assertTrue(sep)
+        self.assertEqual(text.count("PRE-COMPACT-CONTENT"), 1)
+        self.assertEqual(text.count("FOLLOW-UP"), 1)
+        self.assertIn("PRE-COMPACT-CONTENT", head)
+        self.assertIn("user: /compact", head)
+        self.assertNotIn("FOLLOW-UP", head)
+        self.assertIn("FOLLOW-UP", tail)
+
+    def test_fresh_start_compact_inside_trailing_run_keeps_pre_compact_image_once(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "Ready."},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"pre", "pre.png"),
+                    {"type": "input_text", "text": "PRE-COMPACT"},
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "/compact"}]},
+            {"role": "user", "content": "FOLLOW-UP"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        text = prompt
+        self.assertEqual(text.count("PRE-COMPACT"), 1)
+        self.assertEqual(text.count("FOLLOW-UP"), 1)
+        self.assertIn("[image previously shared: pre.png]", text)
 
     def test_fresh_start_single_trailing_user_output_is_unchanged(self):
         # One current user message: the exact prompt shape must not change.

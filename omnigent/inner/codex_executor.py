@@ -62,6 +62,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG, CODEX_DEFAULT_MODEL
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runner.synthetic_markers import is_cancellation_marker
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.reasoning_effort import CODEX_EFFORTS, EFFORT_ALIASES, validate_effort
@@ -2422,14 +2423,14 @@ def _build_initial_prompt(
     )
     if has_attachments:
         # The trailing run of consecutive user messages is "current" input;
-        # everything before it is history. No trailing user message means
-        # no current attachment at all.
+        # everything before it is history. The runner's interruption marker
+        # closes an abandoned request, so the run stops there. No trailing
+        # user message means no current attachment at all.
         current_start: int | None = None
         for idx in range(len(messages) - 1, -1, -1):
-            if messages[idx].get("role") == "user":
-                current_start = idx
-            else:
+            if messages[idx].get("role") != "user" or is_cancellation_marker(messages[idx]):
                 break
+            current_start = idx
 
         blocks: list[CodexParams] = [{"type": "input_text", "text": "Conversation so far:"}]
         for idx, msg in enumerate(messages):
