@@ -257,10 +257,12 @@ class TestPromptExtraction(unittest.TestCase):
         """Join the text blocks of a structured prompt for framing assertions."""
         return "\n".join(block["text"] for block in prompt if block.get("type") == "text")
 
-    def test_cold_reload_replays_historical_image_as_structured_block(self):
-        # A restarted/fresh SDK client must be able to *look at* an image from
-        # an earlier turn. Flattening it into a text marker leaves the model
-        # describing an attachment it cannot see.
+    def test_cold_reload_replays_historical_image_as_placeholder_text(self):
+        # A restarted/fresh SDK client packs prior history into one replay
+        # message. Re-sending a prior turn's image as a real content block
+        # there is indistinguishable from a freshly attached image, so the
+        # model reports the old photo as just sent. History attachments must
+        # become a visible text placeholder instead.
         executor = self._make_executor()
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
         image_data_uri = f"data:image/png;base64,{image_payload}"
@@ -282,26 +284,24 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
-        self.assertIsInstance(prompt, list)
-        images = [block for block in prompt if block.get("type") == "image"]
-        self.assertEqual(len(images), 1)
-        self.assertEqual(
-            images[0]["source"],
-            {"type": "base64", "media_type": "image/png", "data": image_payload},
-        )
-        # The bytes travel as a structured block, never as prompt text.
-        text = self._text_of(prompt)
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
         self.assertNotIn(image_payload, text)
         self.assertNotIn("data:", text)
-        # Framing and ordering survive around the replayed image.
+        self.assertIn("[image previously shared: screenshot.png]", text)
+        # Framing and ordering survive around the replayed placeholder.
         self.assertIn("Conversation so far:", text)
         self.assertIn("What is shown here?", text)
         self.assertIn("Respond to the latest user message", text)
         self.assertIn("Summarize our conversation.", text)
 
-    def test_cold_reload_replays_historical_file_as_structured_document(self):
-        # The same fidelity requirement applies to non-image attachments: a
-        # resolved PDF must reach the SDK as a document block, not a marker.
+    def test_cold_reload_replays_historical_file_as_placeholder_text(self):
+        # The same requirement applies to non-image attachments: a resolved
+        # PDF from history must become a text placeholder, not a document
+        # block the model reads as a freshly attached file.
         executor = self._make_executor()
         file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
         file_data_uri = f"data:application/pdf;base64,{file_payload}"
@@ -323,21 +323,113 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "document"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
+        self.assertNotIn(file_payload, text)
+        self.assertIn("[attachment previously shared: doc.pdf]", text)
+        self.assertIn("What does this document say?", text)
+
+    def test_cold_reload_new_turn_image_stays_real_while_history_is_placeholder(self):
+        # The latest user message's own attachments must still travel as
+        # real content blocks (the model needs to see what was just sent);
+        # only the replayed history is downgraded to a placeholder.
+        executor = self._make_executor()
+        history_payload = base64.b64encode(b"old synthetic png bytes").decode("ascii")
+        new_payload = base64.b64encode(b"new synthetic png bytes").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{history_payload}",
+                        "filename": "old.png",
+                    },
+                    {"type": "input_text", "text": "look at this old photo"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the old photo."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{new_payload}",
+                        "filename": "new.png",
+                    },
+                    {"type": "input_text", "text": "and now this one"},
+                ],
+            },
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
         self.assertIsInstance(prompt, list)
-        documents = [block for block in prompt if block.get("type") == "document"]
-        self.assertEqual(len(documents), 1)
+        images = [b for b in prompt if b.get("type") == "image"]
+        self.assertEqual(len(images), 1)
         self.assertEqual(
-            documents[0]["source"],
-            {"type": "base64", "media_type": "application/pdf", "data": file_payload},
+            images[0]["source"],
+            {"type": "base64", "media_type": "image/png", "data": new_payload},
         )
         text = self._text_of(prompt)
-        self.assertNotIn(file_payload, text)
-        self.assertIn("What does this document say?", text)
+        self.assertIn("[image previously shared: old.png]", text)
+        self.assertNotIn(history_payload, text)
+        self.assertIn("look at this old photo", text)
+        self.assertIn("and now this one", text)
+
+    def test_cold_reload_multiple_historical_images_placeholder_handles_missing_filename(self):
+        # Several historical images in the same replay, one missing a
+        # filename: each becomes its own placeholder, falling back to the
+        # bare marker when no filename/file_id metadata is available.
+        executor = self._make_executor()
+        payload_one = base64.b64encode(b"first synthetic png").decode("ascii")
+        payload_two = base64.b64encode(b"second synthetic png").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{payload_one}",
+                        "filename": "first.png",
+                    },
+                    {"type": "input_text", "text": "first photo"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the first photo."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{payload_two}",
+                    },
+                    {"type": "input_text", "text": "second photo, no filename"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the second photo."},
+            {"role": "user", "content": "Summarize both photos."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
+        self.assertIn("[image previously shared: first.png]", text)
+        self.assertIn("[image previously shared]", text)
+        self.assertNotIn(payload_one, text)
+        self.assertNotIn(payload_two, text)
 
     def test_cold_reload_keeps_unresolved_history_attachment_visible(self):
         # A resolved and an unresolved attachment in the same history: the
-        # resolved one becomes real bytes, the unresolved one must still say
-        # so out loud rather than vanish from the structured prompt.
+        # resolved one becomes a placeholder, the unresolved one must still
+        # say so out loud rather than vanish from the prompt.
         executor = self._make_executor()
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
         messages = [
@@ -363,9 +455,13 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
-        self.assertIsInstance(prompt, list)
-        self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 1)
-        text = self._text_of(prompt)
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
+        self.assertIn("[image previously shared: resolved.png]", text)
+        self.assertNotIn(image_payload, text)
         self.assertIn("[Attachment lost.png could not be loaded]", text)
         self.assertNotIn("file_id", text)
         self.assertIn("two attachments", text)

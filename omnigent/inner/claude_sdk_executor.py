@@ -376,9 +376,9 @@ def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ig
 
     (non-image files carry the same payload under ``file_data`` instead of
     ``image_url``.) Returns e.g. ``("image/png", 519324)`` — the media type and
-    payload size used to build the compact
-    ``[image: screenshot.png, image/png, 519324 base64 chars]`` placeholder,
-    so the raw base64 never lands in the ``Conversation so far:`` prompt text.
+    payload size, used only to confirm an attachment resolved to real bytes
+    before the caller swaps it for a text placeholder, so the raw base64
+    never lands in the ``Conversation so far:`` prompt text.
     """
     if isinstance(value, str):
         parsed = _parse_replay_data_uri(value)
@@ -462,24 +462,20 @@ def _coalesce_text_blocks(blocks: list[_JsonObject]) -> list[_JsonObject]:
     return merged
 
 
-def _structured_history_block(block: _JsonObject) -> _JsonObject | None:
+def _history_attachment_placeholder(block: _JsonObject, kind: str) -> str:
     """
-    Convert a resolved history attachment to a real Anthropic block.
+    Compact text placeholder for a resolved historical attachment.
 
-    :param block: A prior-turn content block carrying an inline data URI.
-    :returns: The ``image``/``document`` block, or ``None`` when the block
-        is not a convertible attachment shape — the caller then falls back
-        to the compact text marker rather than dropping the attachment.
+    :param block: The prior-turn ``input_image``/``input_file`` block.
+    :param kind: ``"image"`` or ``"attachment"``, matching ``block``'s type.
+    :returns: e.g. ``"[image previously shared: screenshot.png]"``, naming
+        the attachment by ``filename`` then ``file_id``, or the bare
+        ``"[image previously shared]"`` marker when neither is available.
     """
-    if block.get("type") not in ("input_image", "input_file"):
-        return None
-    try:
-        # Covers a malformed data URI and a bad base64 payload alike
-        # (``binascii.Error`` subclasses ``ValueError``).
-        converted = _to_anthropic_content_blocks([block])
-    except ValueError:
-        return None
-    return converted[0] if converted else None
+    identifier = block.get("filename") or block.get("file_id")
+    if isinstance(identifier, str) and identifier:
+        return f"[{kind} previously shared: {identifier}]"
+    return f"[{kind} previously shared]"
 
 
 def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
@@ -493,25 +489,27 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
     historical image/file block's ``file_id`` has already been resolved to a
     ``data:<media>;base64,...`` URI.
 
-    Those resolved attachments are replayed as **structured** ``image`` /
-    ``document`` blocks, interleaved in order with the surrounding text, so the
-    cold-started client can actually inspect the image instead of reading a
-    description of it. Structured blocks are also what keeps the prompt small:
-    ``json.dumps()``-ing the block flattened the whole base64 payload into
-    prompt TEXT, so the model tokenized the bytes as text rather than counting
-    them as an image — seven ~390KB PNGs expand to ~2.5M tokens, and one real
-    shared session hit a 3.5M-token prompt against a 1M limit.
+    A resolved attachment is **never** replayed as a real ``image``/``document``
+    block: a block inside the "Conversation so far:" replay is indistinguishable
+    from one attached to the current turn, so the cold-started client reports a
+    photo from three turns ago as freshly sent. Instead it becomes a compact
+    ``[image/attachment previously shared: <name>]`` text placeholder — visible
+    proof an attachment existed, without handing the model something it will
+    mistake for new input. (Only the *latest* user message's own attachments,
+    built separately in ``_extract_latest_user_content``, travel as real blocks.)
 
-    Anything that cannot become a structured block never leaks bytes into text.
-    A resolver-produced inline attachment *value* — a whole-string
-    ``data:*;base64,...`` under ``image_url`` / ``file_data``, including nested
-    in dict/list values — is redacted, and an unconvertible attachment falls
-    back to a compact ``[image/attachment: <id>, <media_type>, <N> base64
-    chars]`` marker that preserves *that an attachment was present* without its
-    bytes. An attachment the resolver never inlined renders as the visible
-    "could not be loaded" marker. (This does not attempt to cover non-resolver
-    shapes such as a data URI used as a dict key, a tuple member, or a substring
-    embedded mid-text — the runner never emits those.)
+    Placeholders also keep the prompt small: ``json.dumps()``-ing a resolved
+    block flattens the whole base64 payload into prompt TEXT, so the model
+    tokenizes the bytes as text rather than counting them as an image — seven
+    ~390KB PNGs expand to ~2.5M tokens, and one real shared session hit a
+    3.5M-token prompt against a 1M limit. A resolver-produced inline attachment
+    *value* — a whole-string ``data:*;base64,...`` under ``image_url`` /
+    ``file_data``, including nested in dict/list values — is redacted wherever
+    it isn't converted to a placeholder first. An attachment the resolver never
+    inlined renders as the visible "could not be loaded" marker. (This does not
+    attempt to cover non-resolver shapes such as a data URI used as a dict key,
+    a tuple member, or a substring embedded mid-text — the runner never emits
+    those.)
     """
     if isinstance(content, str):
         sanitized = _redact_inline_base64(content)
@@ -531,18 +529,8 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
 
             inline_data = _get_inline_data_uri_info(block)
             if inline_data is not None:
-                structured = _structured_history_block(block)
-                if structured is not None:
-                    rendered.append(structured)
-                    continue
-                media_type, payload_chars = inline_data
                 kind = "image" if block_type == "input_image" else "attachment"
-                identifier = block.get("filename") or block.get("file_id") or block_type
-                rendered.append(
-                    _text_block(
-                        f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
-                    )
-                )
+                rendered.append(_text_block(_history_attachment_placeholder(block, kind)))
                 continue
 
             if block.get("file_id"):
