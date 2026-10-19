@@ -16087,7 +16087,8 @@ def test_cleanup_sends_no_key_into_a_dialog_behind_torn_frames(
 def test_the_probe_is_recognised_only_as_the_cell_before_the_caret() -> None:
     """
     Cleanup evidence: a located box, no dialog, caret one past the probe, the
-    probe real, and the text after it a prefix of what the box showed before.
+    probe real, and the text after it exactly what the box showed before
+    (whitespace folded).
     """
     before = claude_native_bridge._probe_before_caret
     cursor = claude_native_bridge._PaneCursor

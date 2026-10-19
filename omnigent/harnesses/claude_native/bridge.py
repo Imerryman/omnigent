@@ -7397,9 +7397,10 @@ def _cursor_at_draft_start(styled_pane: str, cursor: _PaneCursor | None) -> bool
     That cell is the one right after the ``❯`` glyph and its one spacing cell
     on the box's first row, and it must hold a non-space character. A probe
     typed there is INSERTED before that character, on the caret's own row,
-    so it can never show alone beside a draft whatever the box's viewport
-    does: on a real draft it lands beside the draft's text, and only an empty
-    box, whose placeholder it replaces, shows it alone. The box then needs no
+    so — provided the box is showing the whole draft, which
+    :func:`_probe_can_prove` requires of it — it can never show alone beside
+    a draft: on a real draft it lands beside the draft's text, and only an
+    empty box, whose placeholder it replaces, shows it alone. The box then needs no
     free cells on the row and may be taller than one row. A blank caret row
     (a draft starting with a newline, the caret at its start) or leading
     spaces (the caret after them, where the probe could push the first
