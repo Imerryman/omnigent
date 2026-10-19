@@ -13813,6 +13813,8 @@ class _ScrollingComposerTui:
 
     width = 76
     visible_rows = 6
+    # Width of the box's rules (the pane's width).
+    rule_width = 80
 
     def __init__(self, *, transcript: str = "", draft: str = "") -> None:
         self.transcript = transcript
@@ -13862,6 +13864,16 @@ class _ScrollingComposerTui:
         self.on_enter: Any = None
         # Captures that come back torn right after an Enter.
         self.torn_after_enter = 0
+        # The terminal cursor tmux reports (``display-message``): on the draft's
+        # first cell (the person pressed Home, or the box is empty) rather than
+        # after its last visible character; hidden (``#{cursor_flag}`` 0); or
+        # the query answered with an error message instead of numbers. With
+        # the cursor at the start, typed text is inserted there, ``BSpace``
+        # deletes before it and ``C-u`` kills only what precedes it on the row.
+        self.cursor_home = False
+        self.cursor_hidden = False
+        self.cursor_unreadable = False
+        self._cursor_index = 0
 
     # -- rendering ---------------------------------------------------------
     def _row_spans(self) -> list[tuple[int, str]]:
@@ -13901,15 +13913,23 @@ class _ScrollingComposerTui:
         if styled and self.draft and self.draft_cursor and not self.native_cursor:
             rows = [*rows[:-1], f"{rows[-1]}\x1b[7m \x1b[0m"]
         first = f"❯\u00a0{rows[0]}"
+        more = rows[1:]
         if not self.draft and self.ghost and self._hidden_captures_left <= 0:
+            # A suggestion wraps at the pane width like a draft (a phone-width
+            # pane shows one on two rows).
+            ghost, *more = [
+                self.ghost[i : i + self.width] for i in range(0, len(self.ghost), self.width)
+            ]
             if not styled:
-                first = f"❯\u00a0{self.ghost}"
+                first = f"❯\u00a0{ghost}"
             elif self.ghost_focused and not self.native_cursor:
-                first = f"❯\u00a0\x1b[7m{self.ghost[0]}\x1b[0;2m{self.ghost[1:]}\x1b[0m"
+                first = f"❯\u00a0\x1b[7m{ghost[0]}\x1b[0;2m{ghost[1:]}\x1b[0m"
+                more = [f"\x1b[2m{row}\x1b[0m" for row in more]
             else:
-                first = f"❯\u00a0\x1b[2m{self.ghost}\x1b[0m"
-        body = [first, *(f"  {row}" for row in rows[1:])]
-        rule = "─" * 80
+                first = f"❯\u00a0\x1b[2m{ghost}\x1b[0m"
+                more = [f"\x1b[2m{row}\x1b[0m" for row in more]
+        body = [first, *(f"  {row}" for row in more)]
+        rule = "─" * self.rule_width
         dialog = (
             [
                 rule,
@@ -13956,6 +13976,19 @@ class _ScrollingComposerTui:
                 self._hidden_captures_left -= 1
             self.events.append(("capture", pane))
             return SimpleNamespace(returncode=0, stdout=pane, stderr="")
+        if "display-message" in cmd:
+            self.events.append(("display-message", cmd[-1]))
+            if self.cursor_unreadable:
+                return SimpleNamespace(returncode=0, stdout="can't find pane: main\n", stderr="")
+            pane_lines = self.render().split("\n")
+            glyph_row = next(i for i, line in enumerate(pane_lines) if line.startswith("❯"))
+            if self.draft and not self.cursor_home:
+                rows = self.composer_text_visible()
+                x, y = 2 + len(rows[-1]), glyph_row + len(rows) - 1
+            else:
+                x, y = 2 + self._cursor_index, glyph_row
+            shown = 0 if self.cursor_hidden else 1
+            return SimpleNamespace(returncode=0, stdout=f"{x} {y} {shown}\n", stderr="")
         if "load-buffer" in cmd:
             self.pending = Path(cmd[-1]).read_bytes().decode("utf-8").replace("\r", "\n")
             self.events.append(("load-buffer", ""))
@@ -14016,18 +14049,34 @@ class _ScrollingComposerTui:
                     rows = self._rows()
                     self.draft = self.draft[: len(self.draft) - len(rows[-1])] if rows else ""
                 elif key == "C-u" and not self.ignore_clear:
-                    self._delete_row_backwards()
+                    if self.cursor_home and self.draft:
+                        self.draft = self.draft[self._cursor_index :]
+                        self._cursor_index = 0
+                    else:
+                        self._delete_row_backwards()
                 elif key == "BSpace" and not self.ignore_clear:
-                    self.draft = self.draft[:-1]
+                    if self.cursor_home and self.draft:
+                        if self._cursor_index > 0:
+                            at = self._cursor_index
+                            self.draft = self.draft[: at - 1] + self.draft[at:]
+                            self._cursor_index -= 1
+                    else:
+                        self.draft = self.draft[:-1]
                 elif "-l" in cmd and not self.ignore_typing:
-                    # Typed text replaces a ghost and is appended to a draft;
-                    # it is never dim, and the redraw shows the draft as is.
+                    # Typed text replaces a ghost and is inserted into a draft
+                    # at the cursor (its end unless at home); it is never dim,
+                    # and the redraw shows the draft as is.
                     if self.dim_survives_typing and self.dim_draft and self.draft:
                         if self._dim_upto is None:
                             self._dim_upto = len(self.draft)
                     else:
                         self.dim_draft = False
-                    self.draft += key
+                    if self.cursor_home and self.draft:
+                        at = self._cursor_index
+                        self.draft = self.draft[:at] + key + self.draft[at:]
+                        self._cursor_index += len(key)
+                    else:
+                        self.draft += key
                 if self._dim_upto is not None:
                     self._dim_upto = min(self._dim_upto, len(self.draft))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -15476,6 +15525,221 @@ def test_the_probe_needs_room_on_a_single_dim_row() -> None:
     assert single_row_box(_styled_composer_9026("\x1b[2mdraft", "\x1b[2mmore")) is None
     assert single_row_box("") is None
     assert claude_native_bridge._cell_width("❯\xa0修正a\u0301") == 7
+
+
+# -- Phone-width pane: the suggestion fills the row (live d7d8 refusal, after #22) --
+
+# The live pane that refused two follow-ups on 2026-10-19 (44 columns: a phone's
+# browser terminal had sized it; ``capture-pane -e``, rules spelled as
+# ``"─" * 44``). The post-turn suggestion takes 41 of the 44 cells, so the row
+# leaves no room for the probe and the clear sent 120 C-u before refusing. tmux
+# reported the terminal cursor at column 2 of the ``❯`` row — the draft's first
+# cell — exactly as on the wide pane where the probe is allowed.
+_LIVE_D7D8_PHONE_PANE = (
+    "  \x1b[38;5;246mOption 1 is cheaper and keeps the sticks you just bought.\x1b[39m\n"
+    "\n"
+    "\x1b[38;5;246m✻\x1b[39m \x1b[38;5;246mChurned for 24s · done 11:58 AM\x1b[39m\n"
+    "\n"
+    "\x1b[38;5;244m" + "─" * 44 + "\n"
+    "\x1b[39m❯\xa0\x1b[2myes check the Dell guide for 2DPC speed\n"
+    "\x1b[0m\x1b[38;5;244m\x1b[49m" + "─" * 44 + "\n"
+    "\n"
+    "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle)\n"
+    "\n"
+)
+
+
+class _LiveD7d8PhoneTui(_ScrollingComposerTui):
+    """The fake composer, drawing its empty box exactly as the live phone-width pane did."""
+
+    width = 42
+    rule_width = 44
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.native_cursor = True
+
+    def render(self, *, styled: bool = False) -> str:
+        """
+        Render the pane; an empty box is the live capture, verbatim.
+
+        :param styled: Whether to keep SGR escapes (``capture-pane -e``).
+        :returns: Pane text.
+        """
+        if self.draft or self.dialog or self._hidden_captures_left > 0:
+            return super().render(styled=styled)
+        if styled:
+            return _LIVE_D7D8_PHONE_PANE
+        return claude_native_bridge._strip_capture_escapes(_LIVE_D7D8_PHONE_PANE)
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_live_phone_width_suggestion_filling_its_row_is_probed_at_the_cursor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The live phone-width pane delivers its follow-up with one Enter and no C-u.
+
+    The row leaves no room for a probe appended to a draft, so it proves
+    nothing by itself; but the terminal cursor sits on the draft's first cell,
+    where the probe is inserted ahead of any draft text, so one shown alone
+    proves the box empty.
+    """
+    tui = _LiveD7d8PhoneTui()
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+    assert claude_native_bridge._single_row_box(styled) == (41, 44)
+    assert not claude_native_bridge._probe_can_prove(styled), "no room on the row"
+    glyph_row = tui.render().split("\n").index("❯\xa0yes check the Dell guide for 2DPC speed")
+    assert claude_native_bridge._probe_can_prove(styled, (2, glyph_row))
+
+    inject_user_message(bridge_dir, content="yes, check it")
+
+    assert tui.submitted == ["yes, check it"]
+    assert tui.key_presses() == [claude_native_bridge._GHOST_PROBE_CHAR, "BSpace", "Enter"]
+
+
+@pytest.mark.parametrize(
+    "ghost",
+    ["o" * (_ScrollingComposerTui.width + 1), "o" * (_ScrollingComposerTui.width + 30)],
+    ids=["full-row", "two-rows"],
+)
+@pytest.mark.parametrize(
+    "cursor", ["at-start", "hidden", "unreadable"], ids=["cursor-at-start", "hidden", "unreadable"]
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_suggestion_without_room_is_probed_only_with_the_cursor_on_its_first_cell(
+    ghost: str, cursor: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A full or wrapped suggestion is probed at the cursor, else cleared blind.
+
+    Without a readable cursor on the draft's first cell, a box without room
+    is treated as it was: C-u only, which cannot delete a suggestion, so the
+    paste is refused with no probe, no BSpace and no Enter.
+    """
+    tui = _ScrollingComposerTui()
+    tui.ghost = ghost
+    tui.native_cursor = True
+    tui.cursor_hidden = cursor == "hidden"
+    tui.cursor_unreadable = cursor == "unreadable"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+    assert not claude_native_bridge._probe_can_prove(styled)
+
+    if cursor == "at-start":
+        inject_user_message(bridge_dir, content="fresh message")
+        assert tui.submitted == ["fresh message"]
+        assert tui.key_presses() == [claude_native_bridge._GHOST_PROBE_CHAR, "BSpace", "Enter"]
+        return
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+    assert tui.submitted == []
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert claude_native_bridge._GHOST_PROBE_CHAR not in tui.key_presses()
+    assert "BSpace" not in tui.key_presses()
+    assert "Enter" not in tui.key_presses()
+
+
+@pytest.mark.parametrize("visible_rows", [1, 2], ids=["one-row-box", "two-row-box"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
+    visible_rows: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The cursor on the first cell of a dim real draft never proves it empty.
+
+    A person pressed Home in a draft that fills its row. The probe is inserted
+    ahead of the draft's text, so it shows beside it (box fully shown) or not
+    at all (a one-row viewport scrolled to the draft's end keeps the inserted
+    probe off screen); either way the box is never called empty. C-u at the
+    draft's start removes nothing, so nothing is pasted and no Enter is sent.
+    """
+    width = _ScrollingComposerTui.width
+    stale = ("stale draft head " + "y" * width * 3)[: width * 3 if visible_rows == 1 else width]
+    tui = _ScrollingComposerTui(draft=stale)
+    tui.visible_rows = visible_rows
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+    assert not claude_native_bridge._probe_can_prove(styled), "no room on the row"
+    glyph_row = next(i for i, line in enumerate(tui.render().split("\n")) if line.startswith("❯"))
+    assert claude_native_bridge._probe_can_prove(styled, (2, glyph_row))
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == []
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "BSpace" not in tui.key_presses(), "the probe never proved this box empty"
+    assert "Enter" not in tui.key_presses()
+    assert stale in tui.draft, "the person's draft is intact"
+
+
+def test_the_pane_cursor_is_read_only_from_a_clean_shown_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``display-message`` answers count only as three integers with the cursor shown.
+
+    tmux prints its errors to stdout too, so an error message, a hidden cursor,
+    a failed command or no tmux at all all read as "unknown".
+    """
+    answers: list[Any] = []
+
+    def run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del kwargs
+        assert cmd[:3] == ["tmux", "-S", "/tmp/example/tmux.sock"]
+        assert cmd[3:7] == ["display-message", "-p", "-t", "claude:0.0"]
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return SimpleNamespace(returncode=answer[0], stdout=answer[1], stderr="")
+
+    monkeypatch.setattr("subprocess.run", run)
+    cursor = claude_native_bridge._pane_cursor
+    answers[:] = [(0, "2 65 1\n")]
+    assert cursor("/tmp/example/tmux.sock", "claude:0.0") == (2, 65)
+    answers[:] = [(0, "2 65 0\n")]
+    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
+    answers[:] = [(0, "can't find pane: claude:0.0\n")]
+    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
+    answers[:] = [(1, "2 65 1\n")]
+    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
+    answers[:] = [OSError("no tmux")]
+    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
+
+
+def test_the_cursor_counts_only_on_the_first_draft_cell() -> None:
+    """
+    The draft's first cell is the one after the ``❯`` glyph and its spacing.
+
+    It is measured in cells on the box's first row (``❯`` on row 1 of the
+    fake pane, under its opening rule), whatever the box's height.
+    """
+    at_start = claude_native_bridge._cursor_at_draft_start
+    one_row = _styled_composer_9026("\x1b[2mopen the replay bug")
+    assert at_start(one_row, (2, 1))
+    assert not at_start(one_row, (3, 1))
+    assert not at_start(one_row, (2, 0))
+    assert not at_start(one_row, (2, 2))
+    assert not at_start(one_row, None)
+    assert not at_start("", (2, 1))
+    two_rows = _styled_composer_9026("\x1b[2mopen the", "\x1b[2mreplay bug")
+    assert at_start(two_rows, (2, 1))
+    assert claude_native_bridge._single_row_box(two_rows) is None
+    assert claude_native_bridge._probe_can_prove(two_rows, (2, 1))
+    assert not claude_native_bridge._probe_can_prove(two_rows)
+    # A wide glyph spacing (NBSP, as 2.1.280 draws it) is one cell too.
+    nbsp = _styled_composer_9026("\x1b[2mopen the replay bug").replace("❯ ", "❯\xa0")
+    assert at_start(nbsp, (2, 1))
 
 
 def test_the_probe_proves_an_empty_draft_only_when_it_shows_alone() -> None:

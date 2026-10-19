@@ -418,6 +418,9 @@ _GHOST_PROBE_MAX_ATTEMPTS = 2
 # last row is full wraps onto a row of its own and shows alone. With room on
 # that row it lands beside the draft's text instead. 2.1.280 wraps two cells
 # short of the pane edge; the rest is slack for the probe's word wrapping.
+# A row without that room (a phone-width pane, where a suggestion fills the
+# row) is still probed when the terminal's cursor sits on the draft's first
+# cell: see :func:`_cursor_at_draft_start`.
 _GHOST_PROBE_ROW_SLACK_CELLS = 6
 # Size cap per styled frame logged (at DEBUG) when the box could not be cleared.
 _CLEAR_FAILURE_LOG_FRAME_CHARS = 1500
@@ -6062,6 +6065,54 @@ def _tmux_capture(socket_path: str, tmux_target: str, *flags: str) -> str:
     return proc.stdout if proc.returncode == 0 else ""
 
 
+def _pane_cursor(socket_path: str, tmux_target: str) -> tuple[int, int] | None:
+    """
+    Read where the pane's terminal cursor is drawn, when it is shown.
+
+    Claude Code with its native cursor (``tengu_native_cursor``, see
+    :data:`_GHOST_PROBE_CHAR`) moves the terminal's own cursor to its caret,
+    so tmux knows where the caret is even though no caret cell is drawn:
+    ``#{cursor_x}``/``#{cursor_y}`` count cells from the pane's top-left, and
+    ``#{cursor_flag}`` says whether the cursor is shown at all. Measured on
+    2.1.280: in an empty box the cursor sits on the placeholder's first cell.
+    ``display-message`` prints its errors to stdout too, so only an answer of
+    exactly three integers counts. Never raises, like :func:`_capture_pane`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``(x, y)`` while the cursor is shown; ``None`` when it is hidden,
+        the query failed, or the answer is unreadable.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    args = [
+        "tmux",
+        "-S",
+        socket_path,
+        "display-message",
+        "-p",
+        "-t",
+        tmux_target,
+        "#{cursor_x} #{cursor_y} #{cursor_flag}",
+    ]
+    try:
+        proc = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    fields = proc.stdout.split()
+    if proc.returncode != 0 or len(fields) != 3 or not all(f.isdigit() for f in fields):
+        return None
+    x, y, shown = (int(f) for f in fields)
+    return (x, y) if shown == 1 else None
+
+
 class _ClaudePaneState(NamedTuple):
     """A liveness answer for the Claude pane, with the exit status when dead."""
 
@@ -7255,6 +7306,41 @@ def _cell_width(text: str) -> int:
     )
 
 
+class _ComposerBox(NamedTuple):
+    """The live composer's rows between its rules, located in a capture."""
+
+    # Index of the ``❯`` row among the capture's lines (the pane's rows).
+    first_row: int
+    # The box's rows, escapes stripped, the ``❯`` row first.
+    rows: tuple[str, ...]
+    # Width of the closing rule, in cells.
+    width: int
+
+
+def _composer_box(styled_pane: str) -> _ComposerBox | None:
+    """
+    Locate the live composer's rows and its width in a capture.
+
+    :param styled_pane: Pane captured with SGR escapes (plain text works too).
+    :returns: The last ``❯`` row drawn directly under a box rule, every row
+        below it up to the closing rule, and that rule's width; ``None`` when
+        no ``❯`` row sits under a rule or no closing rule follows it.
+    """
+    lines = _strip_capture_escapes(styled_pane).splitlines()
+    starts = [
+        idx
+        for idx in range(1, len(lines))
+        if _is_box_rule(lines[idx - 1]) and lines[idx].strip().startswith(_CLAUDE_PROMPT_GLYPH)
+    ]
+    if not starts:
+        return None
+    first = starts[-1]
+    end = next((idx for idx in range(first + 1, len(lines)) if _is_box_rule(lines[idx])), None)
+    if end is None:
+        return None
+    return _ComposerBox(first, tuple(lines[first:end]), _cell_width(lines[end].rstrip()))
+
+
 def _single_row_box(styled_pane: str) -> tuple[int, int] | None:
     """
     Measure the live composer when it is exactly one row.
@@ -7266,35 +7352,67 @@ def _single_row_box(styled_pane: str) -> tuple[int, int] | None:
         closing rules; else ``None``. A blank draft row is a row: it keeps the
         closing rule off the ``❯`` row.
     """
-    lines = _strip_capture_escapes(styled_pane).splitlines()
-    rows = [
-        idx
-        for idx in range(1, len(lines))
-        if _is_box_rule(lines[idx - 1]) and lines[idx].strip().startswith(_CLAUDE_PROMPT_GLYPH)
-    ]
-    if not rows or rows[-1] + 1 >= len(lines) or not _is_box_rule(lines[rows[-1] + 1]):
+    box = _composer_box(styled_pane)
+    if box is None or len(box.rows) != 1:
         return None
-    return _cell_width(lines[rows[-1]].rstrip()), _cell_width(lines[rows[-1] + 1].rstrip())
+    return _cell_width(box.rows[0].rstrip()), box.width
 
 
-def _probe_can_prove(styled_pane: str) -> bool:
+def _cursor_at_draft_start(styled_pane: str, cursor: tuple[int, int] | None) -> bool:
+    """
+    Report whether the terminal cursor sits on the box's first draft cell.
+
+    That cell is the one after the ``❯`` glyph and its spacing on the box's
+    first row. A probe typed there is INSERTED before whatever the row holds,
+    so it can never wrap onto a row of its own and show alone beside a hidden
+    draft: on a real draft it lands beside the draft's text (or above its
+    further rows), and only an empty box, whose placeholder it replaces, shows
+    it alone. The box then needs no free cells on the row and may be taller
+    than one row. Claude Code's native cursor parks the terminal cursor
+    exactly there in an empty box (:func:`_pane_cursor`).
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :param cursor: ``(x, y)`` from :func:`_pane_cursor`, or ``None``.
+    :returns: ``True`` only when a composer box is located and *cursor* is
+        that cell.
+    """
+    if cursor is None:
+        return False
+    box = _composer_box(styled_pane)
+    if box is None:
+        return False
+    row = box.rows[0]
+    after_glyph = row.index(_CLAUDE_PROMPT_GLYPH) + len(_CLAUDE_PROMPT_GLYPH)
+    text_at = after_glyph + (len(row[after_glyph:]) - len(row[after_glyph:].lstrip()))
+    return cursor == (_cell_width(row[:text_at]), box.first_row)
+
+
+def _probe_can_prove(styled_pane: str, cursor: tuple[int, int] | None = None) -> bool:
     """
     Report whether a probe shown alone in this all-dim box would prove it empty.
 
-    The box is a viewport scrolled to the draft's end. Only a one-row box
+    The box is a viewport scrolled to the draft's end. A one-row box
     (:func:`_single_row_box`) whose row leaves
     :data:`_GHOST_PROBE_ROW_SLACK_CELLS` free keeps a probe appended to a
     hidden draft on the draft's own last row, beside its text. A taller box,
     a blank draft row or a full row can hide a draft the probe would not
-    touch, so it is cleared with ``C-u`` instead.
+    touch — unless the terminal cursor is on the draft's first cell
+    (:func:`_cursor_at_draft_start`), where the probe is inserted ahead of
+    any draft text and so never shows alone beside a draft. A phone-width
+    pane, whose suggestion fills its row, is proven that way. Anything else
+    is cleared with ``C-u`` instead.
 
     :param styled_pane: Pane captured with SGR escapes.
+    :param cursor: The terminal cursor from :func:`_pane_cursor`, read with
+        the frame; ``None`` when unknown.
     :returns: ``True`` for an ``"unfocused"`` box that a probe can prove.
     """
     if _composer_ghost_signature(styled_pane) != "unfocused":
         return False
     box = _single_row_box(styled_pane)
-    return box is not None and box[0] + _GHOST_PROBE_ROW_SLACK_CELLS <= box[1]
+    if box is not None and box[0] + _GHOST_PROBE_ROW_SLACK_CELLS <= box[1]:
+        return True
+    return _cursor_at_draft_start(styled_pane, cursor)
 
 
 def _composer_holds_only(styled_pane: str, char: str) -> bool:
@@ -7352,12 +7470,13 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> tuple[bool | N
     So one :data:`_GHOST_PROBE_CHAR` shown alone (:func:`_composer_holds_only`)
     means the draft held nothing else — provided no draft can hide outside the
     box. The box is a viewport scrolled to the draft's end, so the probe is
-    only typed into a box it can prove (:func:`_probe_can_prove`): one row,
-    with room for the probe, so a probe appended to a draft lands beside its
-    text and never shows alone. The box must also keep its width (a resize
-    re-wraps the draft). ``BSpace`` then removes the probe; the box must come
-    back bare or with the same placeholder text it showed before (Claude Code
-    redraws its suggestion; the paste replaces it). Nothing about the dim text
+    only typed into a box it can prove (:func:`_probe_can_prove`): one row
+    with room for the probe, or the terminal cursor on the draft's first cell,
+    so a probe typed into a draft lands beside its text and never shows alone.
+    The box must also keep its width (a resize re-wraps the draft). ``BSpace``
+    then removes the probe; the box must come back bare or with the same
+    placeholder text it showed before (Claude Code redraws its suggestion; the
+    paste replaces it). Nothing about the dim text
     itself is judged, so a dim real draft cannot pass: the probe joins it, and
     the caller clears both with ``C-u``.
 
@@ -7379,8 +7498,13 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> tuple[bool | N
     """
     styled_before = _capture_pane_styled(socket_path, tmux_target)
     composer_before = _styled_composer(styled_before)
-    box_before = _single_row_box(styled_before)
-    if not _probe_can_prove(styled_before) or composer_before is None or box_before is None:
+    box_before = _composer_box(styled_before)
+    cursor = _pane_cursor(socket_path, tmux_target)
+    if (
+        not _probe_can_prove(styled_before, cursor)
+        or composer_before is None
+        or box_before is None
+    ):
         return None, ""
     folded_before = "".join("".join(ch for ch, _, _ in composer_before.cells).split())
     fresh = _capture_pane(socket_path, tmux_target)
@@ -7406,8 +7530,8 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> tuple[bool | N
         return None, frame
     if not _composer_holds_only(frame, _GHOST_PROBE_CHAR):
         return False, frame
-    box_after = _single_row_box(frame)
-    if box_after is None or box_after[1] != box_before[1]:
+    box_after = _composer_box(frame)
+    if box_after is None or box_after.width != box_before.width:
         # The pane was resized under the probe: a re-wrapped draft could be
         # scrolled out of the box. Draft content until cleared.
         return False, frame
@@ -7508,9 +7632,10 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
     only rendering a native-cursor TUI ever draws, or a dimmed real draft —
     is never judged by its looks. It counts as empty only once a probe
     (:func:`_probe_ghost_candidate`) proves no draft was there, and is only
-    probed where a probe can prove that (:func:`_probe_can_prove`: one row,
-    with room); a taller or full box may hide a scrolled draft and is cleared
-    with ``C-u``. A draft the probe exposes is cleared with ``C-u`` too, after
+    probed where a probe can prove that (:func:`_probe_can_prove`: one row
+    with room, or the terminal cursor on the draft's first cell); a taller or
+    full box otherwise may hide a scrolled draft and is cleared with ``C-u``.
+    A draft the probe exposes is cleared with ``C-u`` too, after
     which one more probe may prove the redrawn suggestion (at most
     :data:`_GHOST_PROBE_MAX_ATTEMPTS` + 1 probes per clear).
     Anything else is cleared like any draft, and the paste abandoned if it
@@ -7555,7 +7680,7 @@ def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
                 signature == "unfocused"
                 and settled
                 and probes < probe_limit
-                and _probe_can_prove(styled)
+                and _probe_can_prove(styled, _pane_cursor(socket_path, tmux_target))
             ):
                 probes += 1
                 outcome, frame = _probe_ghost_candidate(socket_path, tmux_target)
