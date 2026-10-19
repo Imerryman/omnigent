@@ -422,6 +422,13 @@ _GHOST_PROBE_MAX_ATTEMPTS = 2
 # row) is still probed when the terminal's cursor sits on the draft's first
 # cell: see :func:`_cursor_at_draft_start`.
 _GHOST_PROBE_ROW_SLACK_CELLS = 6
+# For that cursor rule the box must be showing the WHOLE draft, so no row can
+# be scrolled out of it. Measured on 2.1.280 (80 columns): the box grows with
+# the draft up to a cap of 3 rows in a 12-row pane, 7 in 24, 15 in 40. So in a
+# pane of at least this many rows, a box of at most this many rows is uncapped
+# — a draft with more rows would be showing more.
+_GHOST_PROBE_CURSOR_MIN_PANE_ROWS = 12
+_GHOST_PROBE_CURSOR_MAX_BOX_ROWS = 2
 # Size cap per styled frame logged (at DEBUG) when the box could not be cleared.
 _CLEAR_FAILURE_LOG_FRAME_CHARS = 1500
 # Pane rows logged (at DEBUG) per frame: the composer box, its footer and a
@@ -7430,10 +7437,16 @@ def _probe_can_prove(styled_pane: str, cursor: _PaneCursor | None = None) -> boo
     hidden draft on the draft's own last row, beside its text. A taller box,
     a blank draft row or a full row can hide a draft the probe would not
     touch — unless the terminal cursor is on the draft's first cell
-    (:func:`_cursor_at_draft_start`), where the probe is inserted ahead of
-    any draft text and so never shows alone beside a draft. A phone-width
-    pane, whose suggestion fills its row, is proven that way. Anything else
-    is cleared with ``C-u`` instead.
+    (:func:`_cursor_at_draft_start`) of a box showing the whole draft, where
+    the probe is inserted ahead of any draft text and so never shows alone
+    beside a draft. A phone-width pane, whose suggestion fills its row, is
+    proven that way. Anything else is cleared with ``C-u`` instead.
+
+    The cursor rule also needs the box to be showing the whole draft, so that
+    no draft row is scrolled out of it: a pane of at least
+    :data:`_GHOST_PROBE_CURSOR_MIN_PANE_ROWS` rows and a box of at most
+    :data:`_GHOST_PROBE_CURSOR_MAX_BOX_ROWS` rows (measured: such a box is
+    below the TUI's cap, so a draft with more rows would be showing more).
 
     :param styled_pane: Pane captured with SGR escapes.
     :param cursor: The terminal cursor read with the frame
@@ -7445,6 +7458,14 @@ def _probe_can_prove(styled_pane: str, cursor: _PaneCursor | None = None) -> boo
     box = _single_row_box(styled_pane)
     if box is not None and box[0] + _GHOST_PROBE_ROW_SLACK_CELLS <= box[1]:
         return True
+    whole = _composer_box(styled_pane)
+    if (
+        cursor is None
+        or whole is None
+        or cursor.pane_height < _GHOST_PROBE_CURSOR_MIN_PANE_ROWS
+        or len(whole.rows) > _GHOST_PROBE_CURSOR_MAX_BOX_ROWS
+    ):
+        return False
     return _cursor_at_draft_start(styled_pane, cursor)
 
 

@@ -16324,6 +16324,51 @@ def test_cleanup_never_takes_a_drafts_own_x_for_the_probe(
     )
 
 
+@pytest.mark.parametrize(
+    ("pane_height", "ghost_rows", "probed"),
+    [(12, 2, True), (11, 2, False), (24, 3, False), (40, 1, True)],
+    ids=["min-height-two-rows", "too-short", "three-rows", "tall-one-row"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_the_cursor_lets_the_probe_in_only_where_the_box_shows_the_whole_draft(
+    pane_height: int,
+    ghost_rows: int,
+    probed: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    By the cursor, only an uncapped box is probed: no row can hide outside it.
+
+    Measured on 2.1.280: the box shows every draft row up to a cap of 3 rows
+    in a 12-row pane (7 in 24, 15 in 40). So a box of at most two rows in a
+    pane of at least 12 rows is showing the whole draft; a shorter pane or a
+    taller box is not proven that way and goes to C-u, and the paste is
+    refused when that cannot clear a placeholder.
+    """
+    width = _ScrollingComposerTui.width
+    tui = _ScrollingComposerTui()
+    tui.pane_height = pane_height
+    tui.ghost = "o" * (width * ghost_rows)
+    tui.native_cursor = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+    assert not claude_native_bridge._probe_can_prove(styled), "no room on the row"
+    assert len(claude_native_bridge._composer_box(styled).rows) == ghost_rows
+
+    if probed:
+        inject_user_message(bridge_dir, content="fresh message")
+        assert tui.submitted == ["fresh message"]
+        assert tui.key_presses() == [claude_native_bridge._GHOST_PROBE_CHAR, "BSpace", "Enter"]
+        return
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+    assert claude_native_bridge._GHOST_PROBE_CHAR not in tui.key_presses()
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+
+
 def test_the_pane_cursor_is_read_with_its_frame_only_from_a_clean_shown_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
