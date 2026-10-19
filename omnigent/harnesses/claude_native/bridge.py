@@ -7590,9 +7590,13 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> _ProbeResult:
     probe alone above a draft's blank first row, then that blank row — which
     reads as an empty box, as it would after ``C-u`` removed only the probe.
     So the pane's height must hold on the frame that shows the probe alone,
-    on the one before ``BSpace`` and on the one after; after ``BSpace`` the
-    placeholder must come back, never a bare box; and a box that never
-    settles (torn frames) is given up too. Giving up, the probe is removed
+    on the one before ``BSpace`` and on the one after; the caret must sit
+    right after the probe shown alone, and back on the draft's first cell
+    once the placeholder is back (deleting a draft character that sat alone
+    on a wrapped row leaves the caret at the end of the row before it
+    instead, measured on 2.1.280); after ``BSpace`` the placeholder must come
+    back, never a bare box; and a box that never settles (torn frames) is
+    given up too. Giving up, the probe is removed
     again with one ``BSpace`` only on positive evidence that it is the cell
     right before the caret with the box otherwise as it was
     (:func:`_probe_before_caret`), waited for briefly, and never once a
@@ -7644,6 +7648,17 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> _ProbeResult:
 
     probe_x = cursor.x if cursor is not None else None
 
+    def _caret_at(
+        cursor: _PaneCursor | None, x: int | None, offset: int, box: _ComposerBox | None
+    ) -> bool:
+        # The caret is *offset* cells past *x* on the box's first row.
+        return (
+            cursor is not None
+            and x is not None
+            and box is not None
+            and (cursor.x, cursor.y) == (x + offset, box.first_row)
+        )
+
     def _give_up(frame: str, *, cleanup: bool = True) -> _ProbeResult:
         # Remove the probe only where it verifiably is (``_probe_before_caret``),
         # and only if no BSpace went out already: a delayed one would make a
@@ -7684,6 +7699,11 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> _ProbeResult:
         # scrolled out of the box, or a shorter box show the probe alone above
         # a draft's blank first row. Draft content until cleared.
         return _give_up(frame) if by_cursor else _ProbeResult(False, frame)
+    if by_cursor and not _caret_at(cursor, probe_x, 1, box_after):
+        # The probe shows alone but the caret is not right after it on the
+        # box's first row: a box scrolled elsewhere (End pressed) can show a
+        # lone character of the draft's own instead.
+        return _give_up(frame)
     # The BSpace needs the same positive evidence on the frame it lands on: a
     # readable box still holding just the probe, with no dialog above it. A
     # torn frame proves nothing about who owns the keyboard.
@@ -7710,7 +7730,14 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> _ProbeResult:
         return "".join("".join(ch for ch, _, _ in composer.cells).split()) == folded_before
 
     gone, after, cursor = _await_styled_frame(socket_path, tmux_target, _probe_gone)
-    if by_cursor and not (gone and _height_held(cursor)):
+    if by_cursor and not (
+        gone and _height_held(cursor) and _caret_at(cursor, probe_x, 0, _composer_box(after))
+    ):
+        # Measured on 2.1.280: deleting the probe puts the caret back on the
+        # placeholder's first cell. Deleting a draft character that sat alone
+        # on a wrapped row leaves the caret at the END of the row before it
+        # (col 78 of an 80-column pane), so a repeated dim row there cannot
+        # pass as the placeholder come back.
         return _give_up(after, cleanup=False)
     return _ProbeResult(True if gone else None, after)
 

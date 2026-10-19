@@ -16237,6 +16237,53 @@ def test_a_caret_after_leading_spaces_lets_no_probe_in(
 
 
 @pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_drafts_own_lone_x_shown_after_end_is_never_the_proof(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A draft's own lone ``x`` at its end, scrolled into view, proves nothing.
+
+    A dim draft of three full rows ends with a real ``x`` the person typed,
+    alone on a fourth wrapped row; its third row repeats its first. The probe
+    lands at the head (Home); right after, the person presses End, and the
+    one-row viewport shows that trailing ``x`` alone with the caret after it
+    — the probe's own shape. Deleting it exposes the repeated row, which
+    reads like the placeholder come back. But the caret then sits at the end
+    of that full row (as on 2.1.280), not on the draft's first cell, so the
+    box is never called empty: the paste is refused, and the draft keeps
+    everything but that one trailing ``x`` (the documented price).
+    """
+    width = _ScrollingComposerTui.width
+    body = "a" * width + "z" * (width - 1) + "a" * width
+    tui = _ScrollingComposerTui(draft=body + "x")
+    tui.visible_rows = 1
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui._dim_span = (0, len(body))
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui.end_after_typing = True
+    tui.ghost = "a" * width
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._composer_ghost_signature(tui.render(styled=True)) == "unfocused"
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+    assert "Enter" not in tui.key_presses()
+    assert "C-u" not in tui.key_presses()
+    assert tui.draft == probe + body
+    assert any(
+        claude_native_bridge._composer_holds_only(pane, probe)
+        for kind, pane in tui.events
+        if kind == "capture"
+    ), "precondition: the draft's own x did show alone"
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
 def test_cleanup_never_takes_a_drafts_own_x_for_the_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
