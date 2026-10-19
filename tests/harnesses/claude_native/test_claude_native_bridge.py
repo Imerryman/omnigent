@@ -13888,6 +13888,13 @@ class _ScrollingComposerTui:
         # captures (an on-screen keyboard), then grows back.
         self.shrink_after_typing_for_captures = 0
         self._shrunk_captures_left = 0
+        # After the next typed character: captures come back torn for this
+        # long; the person presses End (caret and viewport to the draft's
+        # end); a dialog opens.
+        self.torn_after_typing_s = 0.0
+        self._torn_until = 0.0
+        self.end_after_typing = False
+        self.dialog_after_typing = False
 
     # -- rendering ---------------------------------------------------------
     def _row_spans(self) -> list[tuple[int, str]]:
@@ -14000,8 +14007,8 @@ class _ScrollingComposerTui:
         self.draft = self.draft[: len(self.draft) - len(last)]
 
     def _capture(self, cmd: list[str]) -> str:
-        if self.torn_captures > 0:
-            self.torn_captures -= 1
+        if self.torn_captures > 0 or time.monotonic() < self._torn_until:
+            self.torn_captures = max(0, self.torn_captures - 1)
             self.events.append(("capture", "torn"))
             return "  ⎿ torn frame\n"
         pane = self.render(styled="-e" in cmd)
@@ -14127,8 +14134,14 @@ class _ScrollingComposerTui:
                     at = self._cursor_index if self.cursor_home and self.draft else len(self.draft)
                     self.draft = self.draft[:at] + key + self.draft[at:]
                     self._shrunk_captures_left = self.shrink_after_typing_for_captures
+                    self._torn_until = time.monotonic() + self.torn_after_typing_s
+                    if self.dialog_after_typing:
+                        self.dialog = True
                     if self.cursor_home:
                         self._cursor_index += len(key)
+                    if self.end_after_typing:
+                        self.cursor_home = False
+                        self._cursor_index = 0
                     if self._dim_span is not None:
                         lo, hi = self._dim_span
                         self._dim_span = (lo + len(key), hi + len(key)) if at <= lo else (lo, hi)
@@ -15870,6 +15883,147 @@ def test_a_dialog_opening_as_the_cursor_is_read_gets_no_probe(
     assert claude_native_bridge._GHOST_PROBE_CHAR not in tui.key_presses()
     assert "paste-buffer" not in [kind for kind, _ in tui.events]
     assert tui.submitted == []
+
+
+@pytest.mark.parametrize(
+    "torn_s", [0.08, 0.5], ids=["readable-for-cleanup", "torn-through-cleanup"]
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_cursor_let_probe_that_never_renders_fails_closed(
+    torn_s: float, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A probe let in on the cursor that never shows gives the clear up.
+
+    Captures come back torn from the keystroke past the probe's settle
+    timeout. Unresolved, the probe used to be handed to C-u, which at the
+    caret's start removes only the probe and then meets the draft's blank
+    first row — an "empty" box. Now the clear is refused there, with no C-u
+    and no paste. The probe is removed again once a readable frame shows it
+    right before the caret; while frames stay torn it is left in the draft.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_GHOST_PROBE_SETTLE_TIMEOUT_S", 0.05)
+    tui = _ScrollingComposerTui(draft="\nstale draft")
+    tui.visible_rows = 2
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui.torn_after_typing_s = torn_s
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    assert tui.submitted == []
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "C-u" not in tui.key_presses()
+    assert "Enter" not in tui.key_presses()
+    keys = [key for key in tui.key_presses() if key != "\x1b[I"]
+    if torn_s < 0.2:
+        assert keys == [probe, "BSpace"]
+        assert tui.draft == "\nstale draft"
+    else:
+        assert keys == [probe]
+        assert tui.draft == probe + "\nstale draft", "left for the person to see, not guessed at"
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_the_probe_is_not_removed_once_the_caret_moved_away_from_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Cleanup never deletes a draft character in the probe's stead.
+
+    The person presses End right after the probe landed at the draft's start:
+    the caret and the viewport move to the draft's end. A BSpace there would
+    delete the draft's last character, so none is sent: the probe stays at
+    the draft's start, where the person can see it, and the paste is refused.
+    """
+    width = _ScrollingComposerTui.width
+    stale = ("stale draft head " + "y" * width * 3)[: width * 3]
+    tui = _ScrollingComposerTui(draft=stale)
+    tui.visible_rows = 1
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui.end_after_typing = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    assert [key for key in tui.key_presses() if key != "\x1b[I"] == [probe]
+    assert tui.draft == probe + stale
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_cleanup_sends_no_key_into_a_dialog_behind_torn_frames(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A torn frame is no evidence the composer owns the keyboard.
+
+    A dialog opens as the probe lands, and every capture from then on comes
+    back torn: nothing locates the composer, so the cleanup BSpace is not
+    sent (it would answer the dialog), and the paste is refused.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_GHOST_PROBE_SETTLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_FOCUS_IN_SETTLE_TIMEOUT_S", 0.05)
+    width = _ScrollingComposerTui.width
+    tui = _ScrollingComposerTui(draft=("stale draft head " + "y" * width)[:width])
+    tui.visible_rows = 1
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui.dialog_after_typing = True
+    tui.dialog_sticky = True
+    tui.torn_after_typing_s = 5.0
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.typed_into_dialog == 0
+    assert tui.enter_into_dialog == 0
+    assert tui.clear_keys_into_dialog == 0
+    assert "BSpace" not in tui.key_presses()
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+
+
+def test_the_probe_is_recognised_only_as_the_cell_before_the_caret() -> None:
+    """
+    Cleanup evidence: a located box, no dialog, caret one past the probe, the probe real.
+    """
+    before = claude_native_bridge._probe_before_caret
+    cursor = claude_native_bridge._PaneCursor
+    pane = _styled_composer_9026("x\x1b[2mstale draft")
+    assert before(pane, cursor(3, 1, 24), 2)
+    assert not before(pane, cursor(2, 1, 24), 2), "caret on the probe, not past it"
+    assert not before(pane, cursor(3, 2, 24), 2), "caret on another row"
+    assert not before(pane, None, 2)
+    assert not before(_styled_composer_9026("\x1b[2mxstale draft"), cursor(3, 1, 24), 2), "dim"
+    assert not before(_styled_composer_9026("\x1b[2mstale draft"), cursor(3, 1, 24), 2), "gone"
+    assert not before("  ⎿ torn frame\n", cursor(3, 1, 24), 2)
+    dialog = "\n".join(
+        [
+            _RULE_9026,
+            "  Teach auto mode about your environment?",
+            "  ❯ 1. Yes",
+            "    2. Not now",
+            "  Enter to confirm · Esc to cancel",
+            _styled_composer_9026("x\x1b[2mstale draft"),
+        ]
+    )
+    assert not before(dialog, cursor(3, 6, 24), 2)
 
 
 def test_the_pane_cursor_is_read_with_its_frame_only_from_a_clean_shown_answer(
