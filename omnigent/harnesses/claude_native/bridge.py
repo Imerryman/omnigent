@@ -7387,22 +7387,25 @@ def _cursor_at_draft_start(styled_pane: str, cursor: _PaneCursor | None) -> bool
     """
     Report whether the terminal cursor sits on the box's first draft cell.
 
-    That cell is the one after the ``❯`` glyph and its spacing on the box's
-    first row, and the row must hold text from that cell on. A probe typed
-    there is INSERTED before that text, on the caret's own row, so it can
-    never show alone beside a draft whatever the box's viewport does: on a
-    real draft it lands beside the draft's text, and only an empty box, whose
-    placeholder it replaces, shows it alone. The box then needs no free cells
-    on the row and may be taller than one row. A blank caret row (a draft
-    starting with a newline, the caret at its start) is not probed: there the
-    probe would sit on a row of its own. Claude Code's native cursor parks the
-    terminal cursor exactly on that cell in an empty box
+    That cell is the one right after the ``❯`` glyph and its one spacing cell
+    on the box's first row, and it must hold a non-space character. A probe
+    typed there is INSERTED before that character, on the caret's own row,
+    so it can never show alone beside a draft whatever the box's viewport
+    does: on a real draft it lands beside the draft's text, and only an empty
+    box, whose placeholder it replaces, shows it alone. The box then needs no
+    free cells on the row and may be taller than one row. A blank caret row
+    (a draft starting with a newline, the caret at its start) or leading
+    spaces (the caret after them, where the probe could push the first
+    character onto the next row) are not probed: there the probe could sit
+    on a row of its own. Claude Code's native cursor parks the terminal
+    cursor exactly on that cell in an empty box
     (:func:`_capture_pane_with_cursor`).
 
     :param styled_pane: Pane captured with SGR escapes (plain text works too).
     :param cursor: The cursor read with that frame, or ``None``.
-    :returns: ``True`` only when a composer box is located, its first row
-        holds text after the glyph, and *cursor* is that text's first cell.
+    :returns: ``True`` only when a composer box is located, the cell after
+        the glyph's spacing holds a non-space character, and *cursor* is that
+        cell.
     """
     if cursor is None:
         return False
@@ -7411,10 +7414,10 @@ def _cursor_at_draft_start(styled_pane: str, cursor: _PaneCursor | None) -> bool
         return False
     row = box.rows[0]
     after_glyph = row.index(_CLAUDE_PROMPT_GLYPH) + len(_CLAUDE_PROMPT_GLYPH)
-    text_at = after_glyph + (len(row[after_glyph:]) - len(row[after_glyph:].lstrip()))
-    if not row[text_at:].strip():
+    first_cell = after_glyph + 1
+    if len(row) <= first_cell or not row[after_glyph].isspace() or row[first_cell].isspace():
         return False
-    return (cursor.x, cursor.y) == (_cell_width(row[:text_at]), box.first_row)
+    return (cursor.x, cursor.y) == (_cell_width(row[:first_cell]), box.first_row)
 
 
 def _probe_can_prove(styled_pane: str, cursor: _PaneCursor | None = None) -> bool:
@@ -7501,10 +7504,13 @@ def _probe_before_caret(
 
     Screen coordinates alone do not identify the probe once the viewport has
     scrolled (a draft's own ``x`` on another row can sit at the same cell), so
-    the box must also still show what it showed before the probe, with the
-    probe inserted ahead of it: the composer's text, whitespace folded, is the
-    probe followed by a non-empty prefix of *folded_before* (a prefix, since a
-    full row's last character may have wrapped out of a short viewport).
+    the box must also still show exactly what it showed before the probe,
+    with the probe inserted ahead of it: the composer's text, whitespace
+    folded, is the probe followed by *folded_before*. A short viewport that
+    wrapped a full row's last character away fails this and keeps the probe;
+    that is the price of never deleting a character of the draft (a draft
+    that repeats its own head after an ``x``, with the caret moved there in
+    the probe's few milliseconds, is the one shape this cannot tell apart).
 
     :param styled_pane: Pane captured with SGR escapes.
     :param cursor: The cursor read with that frame, or ``None``.
@@ -7527,11 +7533,7 @@ def _probe_before_caret(
     if composer is None:
         return False
     folded = "".join("".join(ch for ch, _, _ in composer.cells).split())
-    if (
-        len(folded) < 2
-        or not folded.startswith(_GHOST_PROBE_CHAR)
-        or not folded_before.startswith(folded[1:])
-    ):
+    if folded != _GHOST_PROBE_CHAR + folded_before:
         return False
     lines = styled_pane.splitlines()
     if box.first_row >= len(lines):

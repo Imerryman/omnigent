@@ -13905,6 +13905,9 @@ class _ScrollingComposerTui:
         self._proof_seen = False
         # The next BSpace is lost (a dropped key).
         self.swallow_bspace_once = False
+        # Right after the next typed character the person moves the caret to
+        # this index (``cursor_home`` mode); the viewport follows it.
+        self.move_caret_after_typing: int | None = None
 
     # -- rendering ---------------------------------------------------------
     def _row_spans(self) -> list[tuple[int, str]]:
@@ -13922,12 +13925,21 @@ class _ScrollingComposerTui:
     def _rows(self) -> list[str]:
         return [row for _, row in self._row_spans()]
 
+    def _caret_row(self) -> int:
+        # The row holding the index-based caret (``cursor_home`` mode).
+        spans = self._row_spans()
+        return max(i for i, (start, _) in enumerate(spans) if start <= self._cursor_index)
+
     def _visible_spans(self) -> list[tuple[int, str]]:
         # The box is a viewport scrolled around the caret: the draft's end,
-        # or its head once the person pressed Home.
+        # or, with an index-based caret (the person pressed Home, then maybe
+        # moved), the rows from the caret's row down.
         spans = self._row_spans()
         visible = self.visible_rows - (1 if self._shrunk_captures_left > 0 else 0)
-        return spans[:visible] if self.cursor_home else spans[-visible:]
+        if self.cursor_home:
+            row = self._caret_row()
+            return spans[row : row + visible]
+        return spans[-visible:]
 
     def composer_text_visible(self) -> list[str]:
         rows = [row for _, row in self._visible_spans()] if self.draft else [""]
@@ -14050,6 +14062,9 @@ class _ScrollingComposerTui:
         if self.draft and not self.cursor_home:
             rows = self.composer_text_visible()
             x, y = 2 + len(rows[-1]), glyph_row + len(rows) - 1
+        elif self.draft:
+            start, _ = self._row_spans()[self._caret_row()]
+            x, y = 2 + (self._cursor_index - start), glyph_row
         else:
             x, y = 2 + self._cursor_index, glyph_row
         shown = 0 if self.cursor_hidden else 1
@@ -14161,6 +14176,8 @@ class _ScrollingComposerTui:
                     if self.end_after_typing:
                         self.cursor_home = False
                         self._cursor_index = 0
+                    if self.move_caret_after_typing is not None:
+                        self._cursor_index = self.move_caret_after_typing
                     if self._dim_span is not None:
                         lo, hi = self._dim_span
                         self._dim_span = (lo + len(key), hi + len(key)) if at <= lo else (lo, hi)
@@ -15745,8 +15762,11 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
     over a three-row draft, or a two-row box holding the whole draft. The
     probe is inserted ahead of the draft's text and shows beside it, dim text
     unchanged after it, so the box is never called empty. C-u at the draft's
-    start would remove nothing but the probe, so the clear is given up at once
-    with the probe removed again: nothing is pasted and no Enter is sent.
+    start would remove nothing but the probe, so the clear is given up at
+    once: nothing is pasted and no Enter is sent. The probe is removed again
+    where the box shows exactly the probe ahead of what it showed before (the
+    two-row box); the one-row viewport wrapped the row's last character away,
+    so there the probe is left for the person to see.
     """
     width = _ScrollingComposerTui.width
     stale = ("stale draft head " + "y" * width * 3)[: width * 3 if visible_rows == 1 else width]
@@ -15773,8 +15793,12 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
     assert "Enter" not in tui.key_presses()
     probe = claude_native_bridge._GHOST_PROBE_CHAR
     keys = [key for key in tui.key_presses() if key != "\x1b[I"]  # the failure log's focus-in
-    assert keys == [probe, "BSpace"], "the probe was typed once and removed again"
-    assert tui.draft == stale, "the person's draft is intact"
+    if visible_rows == 2:
+        assert keys == [probe, "BSpace"], "the probe was typed once and removed again"
+        assert tui.draft == stale, "the person's draft is intact"
+    else:
+        assert keys == [probe], "no cleanup on a box that lost a character to the viewport"
+        assert tui.draft == probe + stale
     probed = [pane for kind, pane in tui.events if kind == "capture" and "\x1b[2m" in pane]
     assert any(f"❯\xa0{probe}\x1b[2mstale draft head" in pane for pane in probed), (
         "the probe showed as real text ahead of the unchanged dim draft"
@@ -15871,9 +15895,10 @@ def test_a_box_shrunk_under_the_probe_never_proves_a_draft_at_its_caret(
 
     The caret sits on the first row of a dim two-row draft (Home), beside its
     text, so the probe lands ahead of that text and never alone, whatever the
-    box's rows do; the clear is given up, the probe removed again on the
-    evidence that the box still shows the probe followed by what it showed
-    before, and the draft is left as it was.
+    box's rows do; the clear is given up. The probe is removed again only on
+    the evidence that the box shows exactly the probe followed by what it
+    showed before: a box that grew back does, a box that stays one row short
+    does not, and there the probe is left for the person to see.
     """
     tui = _ScrollingComposerTui(draft="a\nstale draft")
     tui.visible_rows = 2
@@ -15895,8 +15920,13 @@ def test_a_box_shrunk_under_the_probe_never_proves_a_draft_at_its_caret(
     assert "paste-buffer" not in [kind for kind, _ in tui.events]
     assert "C-u" not in tui.key_presses()
     assert "Enter" not in tui.key_presses()
-    assert [key for key in tui.key_presses() if key != "\x1b[I"] == [probe, "BSpace"]
-    assert tui.draft == "a\nstale draft"
+    keys = [key for key in tui.key_presses() if key != "\x1b[I"]
+    if shrunk_for == 1:
+        assert keys == [probe, "BSpace"]
+        assert tui.draft == "a\nstale draft"
+    else:
+        assert keys == [probe]
+        assert tui.draft == probe + "a\nstale draft"
     assert not any(
         claude_native_bridge._composer_holds_only(pane, probe)
         for kind, pane in tui.events
@@ -15956,9 +15986,9 @@ def test_a_cursor_let_probe_that_never_renders_fails_closed(
     """
     monkeypatch.setattr(claude_native_bridge, "_GHOST_PROBE_SETTLE_TIMEOUT_S", 0.05)
     width = _ScrollingComposerTui.width
-    stale = ("stale draft head " + "y" * width * 3)[: width * 3]
+    stale = ("stale draft head " + "y" * width)[:width]
     tui = _ScrollingComposerTui(draft=stale)
-    tui.visible_rows = 1
+    tui.visible_rows = 2
     tui.dim_draft = True
     tui.dim_survives_typing = True
     tui.native_cursor = True
@@ -15966,6 +15996,7 @@ def test_a_cursor_let_probe_that_never_renders_fails_closed(
     tui.torn_after_typing_s = torn_s
     tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
     bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert not claude_native_bridge._probe_can_prove(tui.render(styled=True)), "no room"
 
     with pytest.raises(RuntimeError, match="could not be cleared"):
         inject_user_message(bridge_dir, content="fresh message")
@@ -16062,7 +16093,8 @@ def test_the_probe_is_recognised_only_as_the_cell_before_the_caret() -> None:
     cursor = claude_native_bridge._PaneCursor
     pane = _styled_composer_9026("x\x1b[2mstale draft")
     assert before(pane, cursor(3, 1, 24), 2, "staledraft")
-    assert before(pane, cursor(3, 1, 24), 2, "staledraftlastcharwrappedaway")
+    assert not before(pane, cursor(3, 1, 24), 2, "staledraftlastcharwrappedaway"), "not all of it"
+    assert not before(pane, cursor(3, 1, 24), 2, "staledraf"), "more than it"
     assert not before(pane, cursor(3, 1, 24), 2, "otherdraft"), "not what the box showed"
     assert not before(pane, cursor(2, 1, 24), 2, "staledraft"), "caret on the probe, not past it"
     assert not before(pane, cursor(3, 2, 24), 2, "staledraft"), "caret on another row"
@@ -16151,6 +16183,98 @@ def test_a_dropped_backspace_is_never_sent_twice(
     assert tui.draft == probe
     assert "paste-buffer" not in [kind for kind, _ in tui.events]
     assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_caret_after_leading_spaces_lets_no_probe_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Only the cell right after the glyph's spacing counts as the draft's start.
+
+    A dim draft begins with 75 spaces and then ``a`` on a full row; the caret
+    sits before ``a``. A probe typed there would push ``a`` onto the next row
+    and, the spaces being invisible, show alone in a box shrunk to one row.
+    So the caret after leading spaces is not the draft's first cell: the box
+    goes to C-u first (which kills the spaces before the caret, as on the real
+    TUI); only then, the caret on a real first cell, is a probe typed, beside
+    ``a``, never alone. The paste is refused.
+    """
+    width = _ScrollingComposerTui.width
+    tui = _ScrollingComposerTui(draft=" " * (width - 1) + "a\nstale draft")
+    tui.visible_rows = 2
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui._cursor_index = width - 1
+    tui.shrink_after_typing_for_captures = 2
+    tui.shrink_changes_height = False
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+    glyph_row = next(i for i, line in enumerate(tui.render().split("\n")) if line.startswith("❯"))
+    cursor = claude_native_bridge._PaneCursor(2 + width - 1, glyph_row, tui.pane_height)
+    assert not claude_native_bridge._cursor_at_draft_start(styled, cursor)
+    assert not claude_native_bridge._probe_can_prove(styled, cursor)
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    keys = [key for key in tui.key_presses() if key != "\x1b[I"]
+    assert keys[0] == "C-u", "no probe into the box as first seen"
+    assert not any(
+        claude_native_bridge._composer_holds_only(pane, probe)
+        for kind, pane in tui.events
+        if kind == "capture"
+    ), "the probe never showed alone"
+    assert "Enter" not in tui.key_presses()
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+    assert tui.draft.endswith("a\nstale draft")
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_cleanup_never_takes_a_drafts_own_x_for_the_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A draft's own ``x`` at the caret, with text after it, is not the probe.
+
+    The probe lands at the head of a dim four-line draft (Home); right after,
+    the person moves the caret past the ``x`` that starts the draft's third
+    line, and the two-row viewport follows: it shows ``x`` under the caret
+    and the last line after it, redrawn as real text. The cell and the caret
+    match the probe's, but the box no longer shows what it showed before the
+    probe with the probe ahead of it, so no BSpace is sent: the draft keeps
+    its ``x``, and the probe stays at its head for the person to see.
+    """
+    draft = "stale draft head\nmore content\nx\nstale draft"
+    tui = _ScrollingComposerTui(draft=draft)
+    tui.visible_rows = 2
+    tui.dim_draft = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    tui.move_caret_after_typing = len(probe) + draft.index("\nx\n") + 2
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._composer_ghost_signature(tui.render(styled=True)) == "unfocused"
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert [key for key in tui.key_presses() if key != "\x1b[I"] == [probe]
+    assert tui.draft == probe + draft
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+    # Precondition: the box did show the draft's own x under the caret.
+    assert any(
+        "❯\xa0x" in pane and "stale draft" in pane and "more content" not in pane
+        for kind, pane in tui.events
+        if kind == "capture"
+    )
 
 
 def test_the_pane_cursor_is_read_with_its_frame_only_from_a_clean_shown_answer(
