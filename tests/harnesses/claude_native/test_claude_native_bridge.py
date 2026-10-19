@@ -13813,8 +13813,10 @@ class _ScrollingComposerTui:
 
     width = 76
     visible_rows = 6
-    # Width of the box's rules (the pane's width).
+    # Width of the box's rules (the pane's width), and the pane's height in
+    # rows (``#{pane_height}``: the terminal's, whatever the box's height).
     rule_width = 80
+    pane_height = 24
 
     def __init__(self, *, transcript: str = "", draft: str = "") -> None:
         self.transcript = transcript
@@ -13878,6 +13880,14 @@ class _ScrollingComposerTui:
         # After this many cursor reads the person presses End: the caret moves
         # to the draft's end and the viewport scrolls there with it.
         self.cursor_home_until_reads: int | None = None
+        # A dialog opens (and the cursor hides under it) as the Nth cursor
+        # read is answered: the frame served with that read already shows it.
+        self.dialog_on_cursor_read: int | None = None
+        self._cursor_reads = 0
+        # After the next typed character the pane loses a row for this many
+        # captures (an on-screen keyboard), then grows back.
+        self.shrink_after_typing_for_captures = 0
+        self._shrunk_captures_left = 0
 
     # -- rendering ---------------------------------------------------------
     def _row_spans(self) -> list[tuple[int, str]]:
@@ -13899,7 +13909,8 @@ class _ScrollingComposerTui:
         # The box is a viewport scrolled around the caret: the draft's end,
         # or its head once the person pressed Home.
         spans = self._row_spans()
-        return spans[: self.visible_rows] if self.cursor_home else spans[-self.visible_rows :]
+        visible = self.visible_rows - (1 if self._shrunk_captures_left > 0 else 0)
+        return spans[:visible] if self.cursor_home else spans[-visible:]
 
     def composer_text_visible(self) -> list[str]:
         rows = [row for _, row in self._visible_spans()] if self.draft else [""]
@@ -13988,36 +13999,53 @@ class _ScrollingComposerTui:
         last = rows[-1]
         self.draft = self.draft[: len(self.draft) - len(last)]
 
+    def _capture(self, cmd: list[str]) -> str:
+        if self.torn_captures > 0:
+            self.torn_captures -= 1
+            self.events.append(("capture", "torn"))
+            return "  ⎿ torn frame\n"
+        pane = self.render(styled="-e" in cmd)
+        if self._hidden_captures_left > 0:
+            self._hidden_captures_left -= 1
+        if self._shrunk_captures_left > 0:
+            self._shrunk_captures_left -= 1
+        self.events.append(("capture", pane))
+        return pane
+
+    def _cursor_answer(self) -> str:
+        # ``display-message -p '#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}'``.
+        self._cursor_reads += 1
+        if self.dialog_on_cursor_read == self._cursor_reads:
+            self.dialog = True
+            self.cursor_hidden = True
+        if self.cursor_unreadable:
+            return "can't find pane: main\n"
+        pane_lines = self.render().split("\n")
+        height = self.pane_height - (1 if self._shrunk_captures_left > 0 else 0)
+        glyph_row = next(i for i, line in enumerate(pane_lines) if line.startswith("❯"))
+        if self.draft and not self.cursor_home:
+            rows = self.composer_text_visible()
+            x, y = 2 + len(rows[-1]), glyph_row + len(rows) - 1
+        else:
+            x, y = 2 + self._cursor_index, glyph_row
+        shown = 0 if self.cursor_hidden else 1
+        if self.cursor_home_until_reads is not None:
+            self.cursor_home_until_reads -= 1
+            if self.cursor_home_until_reads <= 0:
+                self.cursor_home = False
+                self._cursor_index = 0
+        return f"{x} {y} {shown} {height}\n"
+
     def run(self, cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
-        if "capture-pane" in cmd:
-            if self.torn_captures > 0:
-                self.torn_captures -= 1
-                self.events.append(("capture", "torn"))
-                return SimpleNamespace(returncode=0, stdout="  ⎿ torn frame\n", stderr="")
-            pane = self.render(styled="-e" in cmd)
-            if self._hidden_captures_left > 0:
-                self._hidden_captures_left -= 1
-            self.events.append(("capture", pane))
-            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         if "display-message" in cmd:
-            self.events.append(("display-message", cmd[-1]))
-            if self.cursor_unreadable:
-                return SimpleNamespace(returncode=0, stdout="can't find pane: main\n", stderr="")
-            pane_lines = self.render().split("\n")
-            glyph_row = next(i for i, line in enumerate(pane_lines) if line.startswith("❯"))
-            if self.draft and not self.cursor_home:
-                rows = self.composer_text_visible()
-                x, y = 2 + len(rows[-1]), glyph_row + len(rows) - 1
-            else:
-                x, y = 2 + self._cursor_index, glyph_row
-            shown = 0 if self.cursor_hidden else 1
-            if self.cursor_home_until_reads is not None:
-                self.cursor_home_until_reads -= 1
-                if self.cursor_home_until_reads <= 0:
-                    self.cursor_home = False
-                    self._cursor_index = 0
-            return SimpleNamespace(returncode=0, stdout=f"{x} {y} {shown}\n", stderr="")
+            self.events.append(("display-message", cmd[cmd.index("display-message") + 4]))
+            answer = self._cursor_answer()
+            # The frame is served with the answer, in one command sequence.
+            frame = self._capture(cmd) if "capture-pane" in cmd else ""
+            return SimpleNamespace(returncode=0, stdout=answer + frame, stderr="")
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=self._capture(cmd), stderr="")
         if "load-buffer" in cmd:
             self.pending = Path(cmd[-1]).read_bytes().decode("utf-8").replace("\r", "\n")
             self.events.append(("load-buffer", ""))
@@ -14098,6 +14126,7 @@ class _ScrollingComposerTui:
                         self.dim_draft = False
                     at = self._cursor_index if self.cursor_home and self.draft else len(self.draft)
                     self.draft = self.draft[:at] + key + self.draft[at:]
+                    self._shrunk_captures_left = self.shrink_after_typing_for_captures
                     if self.cursor_home:
                         self._cursor_index += len(key)
                     if self._dim_span is not None:
@@ -15619,7 +15648,8 @@ def test_live_phone_width_suggestion_filling_its_row_is_probed_at_the_cursor(
     assert claude_native_bridge._single_row_box(styled) == (41, 44)
     assert not claude_native_bridge._probe_can_prove(styled), "no room on the row"
     glyph_row = tui.render().split("\n").index("❯\xa0yes check the Dell guide for 2DPC speed")
-    assert claude_native_bridge._probe_can_prove(styled, (2, glyph_row))
+    cursor = claude_native_bridge._PaneCursor(2, glyph_row, tui.pane_height)
+    assert claude_native_bridge._probe_can_prove(styled, cursor)
 
     inject_user_message(bridge_dir, content="yes, check it")
 
@@ -15629,7 +15659,7 @@ def test_live_phone_width_suggestion_filling_its_row_is_probed_at_the_cursor(
 
 @pytest.mark.parametrize(
     "ghost",
-    ["o" * (_ScrollingComposerTui.width + 1), "o" * (_ScrollingComposerTui.width + 30)],
+    ["o" * _ScrollingComposerTui.width, "o" * (_ScrollingComposerTui.width + 30)],
     ids=["full-row", "two-rows"],
 )
 @pytest.mark.parametrize(
@@ -15699,7 +15729,8 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
     assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
     assert not claude_native_bridge._probe_can_prove(styled), "no room on the row"
     glyph_row = next(i for i, line in enumerate(tui.render().split("\n")) if line.startswith("❯"))
-    assert claude_native_bridge._probe_can_prove(styled, (2, glyph_row))
+    cursor = claude_native_bridge._PaneCursor(2, glyph_row, tui.pane_height)
+    assert claude_native_bridge._probe_can_prove(styled, cursor)
 
     with pytest.raises(RuntimeError, match="could not be cleared"):
         inject_user_message(bridge_dir, content="fresh message")
@@ -15755,38 +15786,128 @@ def test_a_caret_moved_to_the_end_before_the_probe_is_typed_sends_no_probe(
     assert sum(kind == "display-message" for kind, _ in tui.events) > reads
 
 
-def test_the_pane_cursor_is_read_only_from_a_clean_shown_answer(
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_pane_shrunk_under_the_probe_never_proves_a_draft_with_a_blank_first_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A probe shown alone in a box that lost a row proves nothing.
+
+    A dim draft starts with a blank row; the person pressed Home, so the
+    two-row box shows that blank row with the caret on it and the dim text
+    below. The probe lands on the blank row, and as it does the pane loses a
+    row (an on-screen keyboard): the one-row box shows the probe alone, and
+    would show a bare row once it is deleted. The cursor let the probe in,
+    so the pane's height must hold across it: it did not, so the probe is
+    draft content, cleared with C-u, and the box is never called empty.
+    """
+    tui = _ScrollingComposerTui(draft="\nstale draft")
+    tui.visible_rows = 2
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.cursor_home = True
+    tui.shrink_after_typing_for_captures = 4
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+    assert not claude_native_bridge._probe_can_prove(styled), "a two-row box has no room"
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == []
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "BSpace" not in tui.key_presses(), "the probe never proved this box empty"
+    assert "Enter" not in tui.key_presses()
+    assert tui.draft == "\nstale draft"
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    assert any(
+        claude_native_bridge._composer_holds_only(pane, probe)
+        for kind, pane in tui.events
+        if kind == "capture"
+    ), "precondition: the shrunk box did show the probe alone"
+
+
+@pytest.mark.parametrize("read", [1, 2, 3], ids=["clear-loop", "probe-frame", "pre-keystroke"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dialog_opening_as_the_cursor_is_read_gets_no_probe(
+    read: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A dialog that opens with any cursor read owns the keyboard: no probe.
+
+    The cursor comes with the frame it describes, so a dialog opening as the
+    cursor is read — in the clear loop, with the probe's styled frame, or with
+    the fresh frame right before the keystroke — is on that frame, and the
+    probe is withheld. With room on the row the cursor is not even consulted,
+    yet the frame still is.
+    """
+    tui = _ScrollingComposerTui()
+    tui.ghost = "open the replay bug"
+    tui.native_cursor = True
+    tui.dialog_sticky = True
+    tui.dialog_on_cursor_read = read
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._probe_can_prove(tui.render(styled=True)), "room on the row"
+
+    with pytest.raises((RuntimeError, claude_native_bridge.ClaudeTerminalDialog)):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.typed_into_dialog == 0
+    assert tui.enter_into_dialog == 0
+    assert claude_native_bridge._GHOST_PROBE_CHAR not in tui.key_presses()
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+
+
+def test_the_pane_cursor_is_read_with_its_frame_only_from_a_clean_shown_answer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    ``display-message`` answers count only as three integers with the cursor shown.
+    The cursor comes first in one ``display-message ; capture-pane`` output.
 
-    tmux prints its errors to stdout too, so an error message, a hidden cursor,
-    a failed command or no tmux at all all read as "unknown".
+    Only four integers with the cursor shown count; tmux prints its errors to
+    stdout too, so an error line, a hidden cursor, a failed command or no
+    tmux at all read as "unknown", and the frame is whatever followed.
     """
     answers: list[Any] = []
+    seen: list[list[str]] = []
 
     def run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         del kwargs
-        assert cmd[:3] == ["tmux", "-S", "/tmp/example/tmux.sock"]
-        assert cmd[3:7] == ["display-message", "-p", "-t", "claude:0.0"]
+        seen.append(cmd)
         answer = answers.pop(0)
         if isinstance(answer, Exception):
             raise answer
         return SimpleNamespace(returncode=answer[0], stdout=answer[1], stderr="")
 
     monkeypatch.setattr("subprocess.run", run)
-    cursor = claude_native_bridge._pane_cursor
-    answers[:] = [(0, "2 65 1\n")]
-    assert cursor("/tmp/example/tmux.sock", "claude:0.0") == (2, 65)
-    answers[:] = [(0, "2 65 0\n")]
-    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
-    answers[:] = [(0, "can't find pane: claude:0.0\n")]
-    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
-    answers[:] = [(1, "2 65 1\n")]
-    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
+    read = claude_native_bridge._capture_pane_with_cursor
+    frame = "─" * 80 + "\n❯ draft\n" + "─" * 80 + "\n"
+    answers[:] = [(0, "2 65 1 69\n" + frame)]
+    assert read("/tmp/example/tmux.sock", "claude:0.0") == (
+        frame,
+        claude_native_bridge._PaneCursor(2, 65, 69),
+    )
+    assert seen[-1][:3] == ["tmux", "-S", "/tmp/example/tmux.sock"]
+    assert seen[-1][3:7] == ["display-message", "-p", "-t", "claude:0.0"]
+    assert seen[-1].index(";") < seen[-1].index("capture-pane")
+    assert "-e" not in seen[-1]
+    answers[:] = [(0, "2 65 1 69\n" + frame)]
+    read("/tmp/example/tmux.sock", "claude:0.0", styled=True)
+    assert seen[-1][-1] == "-e"
+    answers[:] = [(0, "2 65 0 69\n" + frame)]
+    assert read("/tmp/example/tmux.sock", "claude:0.0") == (frame, None)
+    answers[:] = [(0, "can't find pane: claude:0.0\n" + frame)]
+    assert read("/tmp/example/tmux.sock", "claude:0.0") == (frame, None)
+    answers[:] = [(0, "2 65 1\n" + frame)]
+    assert read("/tmp/example/tmux.sock", "claude:0.0") == (frame, None)
+    answers[:] = [(1, "2 65 1 69\n" + frame)]
+    assert read("/tmp/example/tmux.sock", "claude:0.0") == ("", None)
     answers[:] = [OSError("no tmux")]
-    assert cursor("/tmp/example/tmux.sock", "claude:0.0") is None
+    assert read("/tmp/example/tmux.sock", "claude:0.0") == ("", None)
 
 
 def test_the_cursor_counts_only_on_the_first_draft_cell() -> None:
@@ -15797,21 +15918,22 @@ def test_the_cursor_counts_only_on_the_first_draft_cell() -> None:
     fake pane, under its opening rule), whatever the box's height.
     """
     at_start = claude_native_bridge._cursor_at_draft_start
+    _PaneCursor = claude_native_bridge._PaneCursor
     one_row = _styled_composer_9026("\x1b[2mopen the replay bug")
-    assert at_start(one_row, (2, 1))
-    assert not at_start(one_row, (3, 1))
-    assert not at_start(one_row, (2, 0))
-    assert not at_start(one_row, (2, 2))
+    assert at_start(one_row, _PaneCursor(2, 1, 24))
+    assert not at_start(one_row, _PaneCursor(3, 1, 24))
+    assert not at_start(one_row, _PaneCursor(2, 0, 24))
+    assert not at_start(one_row, _PaneCursor(2, 2, 24))
     assert not at_start(one_row, None)
-    assert not at_start("", (2, 1))
+    assert not at_start("", _PaneCursor(2, 1, 24))
     two_rows = _styled_composer_9026("\x1b[2mopen the", "\x1b[2mreplay bug")
-    assert at_start(two_rows, (2, 1))
+    assert at_start(two_rows, _PaneCursor(2, 1, 24))
     assert claude_native_bridge._single_row_box(two_rows) is None
-    assert claude_native_bridge._probe_can_prove(two_rows, (2, 1))
+    assert claude_native_bridge._probe_can_prove(two_rows, _PaneCursor(2, 1, 24))
     assert not claude_native_bridge._probe_can_prove(two_rows)
     # A wide glyph spacing (NBSP, as 2.1.280 draws it) is one cell too.
     nbsp = _styled_composer_9026("\x1b[2mopen the replay bug").replace("❯ ", "❯\xa0")
-    assert at_start(nbsp, (2, 1))
+    assert at_start(nbsp, _PaneCursor(2, 1, 24))
 
 
 def test_the_probe_proves_an_empty_draft_only_when_it_shows_alone() -> None:
