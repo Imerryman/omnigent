@@ -13853,9 +13853,10 @@ class _ScrollingComposerTui:
         self.ignore_typing = False
         # A dim draft stays dim when typed into: only the typed text is real
         # text, so deleting it shows the dim draft again (the worst case a
-        # probe must survive). ``_dim_upto`` is where its dim text ends.
+        # probe must survive). ``_dim_span`` is where its dim text sits in the
+        # draft; it moves with text inserted or deleted before it.
         self.dim_survives_typing = False
-        self._dim_upto: int | None = None
+        self._dim_span: tuple[int, int] | None = None
         # The draft each paste landed on (``""`` for an empty box).
         self.pasted_onto: list[str] = []
         # Typed characters / BSpace that landed on a dialog.
@@ -13874,6 +13875,9 @@ class _ScrollingComposerTui:
         self.cursor_hidden = False
         self.cursor_unreadable = False
         self._cursor_index = 0
+        # After this many cursor reads the person presses End: the caret moves
+        # to the draft's end and the viewport scrolls there with it.
+        self.cursor_home_until_reads: int | None = None
 
     # -- rendering ---------------------------------------------------------
     def _row_spans(self) -> list[tuple[int, str]]:
@@ -13891,8 +13895,14 @@ class _ScrollingComposerTui:
     def _rows(self) -> list[str]:
         return [row for _, row in self._row_spans()]
 
+    def _visible_spans(self) -> list[tuple[int, str]]:
+        # The box is a viewport scrolled around the caret: the draft's end,
+        # or its head once the person pressed Home.
+        spans = self._row_spans()
+        return spans[: self.visible_rows] if self.cursor_home else spans[-self.visible_rows :]
+
     def composer_text_visible(self) -> list[str]:
-        rows = self._rows()[-self.visible_rows :] if self.draft else [""]
+        rows = [row for _, row in self._visible_spans()] if self.draft else [""]
         if self._hidden_captures_left > 0:
             rows = [""]
         if self.mangle_render:
@@ -13901,13 +13911,15 @@ class _ScrollingComposerTui:
 
     def render(self, *, styled: bool = False) -> str:
         rows = self.composer_text_visible()
-        if self.dim_draft and styled and self._dim_upto is not None and self.draft:
-            dim_upto = self._dim_upto
-            rows = [
-                (f"\x1b[2m{row[: dim_upto - start]}\x1b[0m" if dim_upto > start else "")
-                + row[max(0, dim_upto - start) :]
-                for start, row in self._row_spans()[-self.visible_rows :]
-            ]
+        if self.dim_draft and styled and self._dim_span is not None and self.draft:
+            lo, hi = self._dim_span
+            styled_rows = []
+            for start, row in self._visible_spans():
+                dim_from, dim_to = max(lo, start) - start, min(hi, start + len(row)) - start
+                if dim_from < dim_to:
+                    row = f"{row[:dim_from]}\x1b[2m{row[dim_from:dim_to]}\x1b[0m{row[dim_to:]}"
+                styled_rows.append(row)
+            rows = styled_rows
         elif self.dim_draft and styled:
             rows = [f"\x1b[2m{row}\x1b[0m" if row else row for row in rows]
         if styled and self.draft and self.draft_cursor and not self.native_cursor:
@@ -13954,6 +13966,18 @@ class _ScrollingComposerTui:
         return text.rstrip("\n")
 
     # -- key handling ------------------------------------------------------
+    def _delete_before_cursor(self, count: int) -> None:
+        """Delete up to *count* characters before the home-mode cursor."""
+        count = min(count, self._cursor_index)
+        if count <= 0:
+            return
+        at = self._cursor_index
+        self.draft = self.draft[: at - count] + self.draft[at:]
+        self._cursor_index -= count
+        if self._dim_span is not None:
+            lo, hi = self._dim_span
+            self._dim_span = (max(0, lo - count), max(0, hi - count))
+
     def _delete_row_backwards(self) -> None:
         if not self.draft:
             return
@@ -13988,6 +14012,11 @@ class _ScrollingComposerTui:
             else:
                 x, y = 2 + self._cursor_index, glyph_row
             shown = 0 if self.cursor_hidden else 1
+            if self.cursor_home_until_reads is not None:
+                self.cursor_home_until_reads -= 1
+                if self.cursor_home_until_reads <= 0:
+                    self.cursor_home = False
+                    self._cursor_index = 0
             return SimpleNamespace(returncode=0, stdout=f"{x} {y} {shown}\n", stderr="")
         if "load-buffer" in cmd:
             self.pending = Path(cmd[-1]).read_bytes().decode("utf-8").replace("\r", "\n")
@@ -14050,16 +14079,12 @@ class _ScrollingComposerTui:
                     self.draft = self.draft[: len(self.draft) - len(rows[-1])] if rows else ""
                 elif key == "C-u" and not self.ignore_clear:
                     if self.cursor_home and self.draft:
-                        self.draft = self.draft[self._cursor_index :]
-                        self._cursor_index = 0
+                        self._delete_before_cursor(self._cursor_index)
                     else:
                         self._delete_row_backwards()
                 elif key == "BSpace" and not self.ignore_clear:
                     if self.cursor_home and self.draft:
-                        if self._cursor_index > 0:
-                            at = self._cursor_index
-                            self.draft = self.draft[: at - 1] + self.draft[at:]
-                            self._cursor_index -= 1
+                        self._delete_before_cursor(1)
                     else:
                         self.draft = self.draft[:-1]
                 elif "-l" in cmd and not self.ignore_typing:
@@ -14067,18 +14092,20 @@ class _ScrollingComposerTui:
                     # at the cursor (its end unless at home); it is never dim,
                     # and the redraw shows the draft as is.
                     if self.dim_survives_typing and self.dim_draft and self.draft:
-                        if self._dim_upto is None:
-                            self._dim_upto = len(self.draft)
+                        if self._dim_span is None:
+                            self._dim_span = (0, len(self.draft))
                     else:
                         self.dim_draft = False
-                    if self.cursor_home and self.draft:
-                        at = self._cursor_index
-                        self.draft = self.draft[:at] + key + self.draft[at:]
+                    at = self._cursor_index if self.cursor_home and self.draft else len(self.draft)
+                    self.draft = self.draft[:at] + key + self.draft[at:]
+                    if self.cursor_home:
                         self._cursor_index += len(key)
-                    else:
-                        self.draft += key
-                if self._dim_upto is not None:
-                    self._dim_upto = min(self._dim_upto, len(self.draft))
+                    if self._dim_span is not None:
+                        lo, hi = self._dim_span
+                        self._dim_span = (lo + len(key), hi + len(key)) if at <= lo else (lo, hi)
+                if self._dim_span is not None:
+                    lo, hi = self._dim_span
+                    self._dim_span = (min(lo, len(self.draft)), min(hi, len(self.draft)))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def key_presses(self) -> list[str]:
@@ -15651,11 +15678,12 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
     """
     The cursor on the first cell of a dim real draft never proves it empty.
 
-    A person pressed Home in a draft that fills its row. The probe is inserted
-    ahead of the draft's text, so it shows beside it (box fully shown) or not
-    at all (a one-row viewport scrolled to the draft's end keeps the inserted
-    probe off screen); either way the box is never called empty. C-u at the
-    draft's start removes nothing, so nothing is pasted and no Enter is sent.
+    A person pressed Home in a draft that fills its row, so the viewport shows
+    the draft's head with the caret on its first cell — a one-row viewport
+    over a three-row draft, or a two-row box holding the whole draft. The
+    probe is inserted ahead of the draft's text and shows beside it, dim text
+    unchanged after it, so the box is never called empty. C-u at the draft's
+    start removes only the probe, so nothing is pasted and no Enter is sent.
     """
     width = _ScrollingComposerTui.width
     stale = ("stale draft head " + "y" * width * 3)[: width * 3 if visible_rows == 1 else width]
@@ -15680,7 +15708,51 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
     assert "paste-buffer" not in [kind for kind, _ in tui.events]
     assert "BSpace" not in tui.key_presses(), "the probe never proved this box empty"
     assert "Enter" not in tui.key_presses()
-    assert stale in tui.draft, "the person's draft is intact"
+    assert tui.draft == stale, "the person's draft is intact"
+    probed = [pane for kind, pane in tui.events if kind == "capture" and "\x1b[2m" in pane]
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    assert any(f"❯\xa0{probe}\x1b[2mstale draft head" in pane for pane in probed), (
+        "the probe showed as real text ahead of the unchanged dim draft"
+    )
+
+
+@pytest.mark.parametrize("reads", [1, 2], ids=["before-the-first-check", "before-the-keystroke"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_caret_moved_to_the_end_before_the_probe_is_typed_sends_no_probe(
+    reads: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The cursor is decided on a read taken right before the probe keystroke.
+
+    A person pressed Home in a dim draft filling a one-row viewport, then End
+    just as the bridge was about to probe. Appended to the draft's full last
+    row, the probe would wrap onto a row of its own and show alone, so once
+    the caret is no longer on the first cell no probe is typed at all: the
+    box is cleared with C-u, which removes nothing at the draft's end here
+    either (the fake keeps the draft), and the paste is refused.
+    """
+    width = _ScrollingComposerTui.width
+    stale = ("stale draft head " + "y" * width * 3)[: width * 3]
+    tui = _ScrollingComposerTui(draft=stale)
+    tui.visible_rows = 1
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.ignore_clear = True
+    tui.cursor_home = True
+    tui.cursor_home_until_reads = reads
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._composer_ghost_signature(tui.render(styled=True)) == "unfocused"
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert claude_native_bridge._GHOST_PROBE_CHAR not in tui.key_presses()
+    assert "BSpace" not in tui.key_presses()
+    assert "Enter" not in tui.key_presses()
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.draft == stale
+    assert sum(kind == "display-message" for kind, _ in tui.events) > reads
 
 
 def test_the_pane_cursor_is_read_only_from_a_clean_shown_answer(

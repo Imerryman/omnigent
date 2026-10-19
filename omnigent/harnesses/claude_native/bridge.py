@@ -7499,16 +7499,21 @@ def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> tuple[bool | N
     styled_before = _capture_pane_styled(socket_path, tmux_target)
     composer_before = _styled_composer(styled_before)
     box_before = _composer_box(styled_before)
-    cursor = _pane_cursor(socket_path, tmux_target)
     if (
-        not _probe_can_prove(styled_before, cursor)
-        or composer_before is None
+        composer_before is None
         or box_before is None
+        or not _probe_can_prove(styled_before, _pane_cursor(socket_path, tmux_target))
     ):
         return None, ""
     folded_before = "".join("".join(ch for ch, _, _ in composer_before.cells).split())
     fresh = _capture_pane(socket_path, tmux_target)
     if _composer_is_empty(fresh) is not False or _stacked_dialog_headline(fresh) is not None:
+        return None, ""
+    # Where the probe proves anything depends on where it lands, so the cursor
+    # is decided on a read taken right before the keystroke, like the frame:
+    # a caret moved to the draft's end since the first read (a person pressing
+    # End) would wrap the probe onto a row of its own in a one-row viewport.
+    if not _probe_can_prove(styled_before, _pane_cursor(socket_path, tmux_target)):
         return None, ""
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _GHOST_PROBE_CHAR)
 
