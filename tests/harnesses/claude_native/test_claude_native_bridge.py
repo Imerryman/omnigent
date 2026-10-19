@@ -15713,7 +15713,8 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
     over a three-row draft, or a two-row box holding the whole draft. The
     probe is inserted ahead of the draft's text and shows beside it, dim text
     unchanged after it, so the box is never called empty. C-u at the draft's
-    start removes only the probe, so nothing is pasted and no Enter is sent.
+    start would remove nothing but the probe, so the clear is given up at once
+    with the probe removed again: nothing is pasted and no Enter is sent.
     """
     width = _ScrollingComposerTui.width
     stale = ("stale draft head " + "y" * width * 3)[: width * 3 if visible_rows == 1 else width]
@@ -15737,11 +15738,12 @@ def test_a_dim_draft_with_the_cursor_at_its_start_is_never_called_empty(
 
     assert tui.submitted == []
     assert "paste-buffer" not in [kind for kind, _ in tui.events]
-    assert "BSpace" not in tui.key_presses(), "the probe never proved this box empty"
     assert "Enter" not in tui.key_presses()
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    keys = [key for key in tui.key_presses() if key != "\x1b[I"]  # the failure log's focus-in
+    assert keys == [probe, "BSpace"], "the probe was typed once and removed again"
     assert tui.draft == stale, "the person's draft is intact"
     probed = [pane for kind, pane in tui.events if kind == "capture" and "\x1b[2m" in pane]
-    probe = claude_native_bridge._GHOST_PROBE_CHAR
     assert any(f"❯\xa0{probe}\x1b[2mstale draft head" in pane for pane in probed), (
         "the probe showed as real text ahead of the unchanged dim draft"
     )
@@ -15786,20 +15788,26 @@ def test_a_caret_moved_to_the_end_before_the_probe_is_typed_sends_no_probe(
     assert sum(kind == "display-message" for kind, _ in tui.events) > reads
 
 
+@pytest.mark.parametrize(
+    "shrunk_for", [1, 2, 4, 1000], ids=["proof-frame", "two", "four", "stays"]
+)
 @pytest.mark.usefixtures("_fast_delivery_9026")
 def test_a_pane_shrunk_under_the_probe_never_proves_a_draft_with_a_blank_first_row(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    shrunk_for: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
-    A probe shown alone in a box that lost a row proves nothing.
+    A probe shown alone in a box that lost a row proves nothing, then or later.
 
     A dim draft starts with a blank row; the person pressed Home, so the
     two-row box shows that blank row with the caret on it and the dim text
     below. The probe lands on the blank row, and as it does the pane loses a
     row (an on-screen keyboard): the one-row box shows the probe alone, and
-    would show a bare row once it is deleted. The cursor let the probe in,
-    so the pane's height must hold across it: it did not, so the probe is
-    draft content, cleared with C-u, and the box is never called empty.
+    shows a bare row — an "empty" box — once the probe is deleted, for as long
+    as the pane stays short. The cursor let the probe in, so the pane's height
+    must hold on the very frame that shows the probe alone: it did not, so the
+    clear is given up there — not handed to C-u, which at the caret's start
+    removes only the probe and would then meet that bare row. The probe is
+    removed again, so the draft is left as it was.
     """
     tui = _ScrollingComposerTui(draft="\nstale draft")
     tui.visible_rows = 2
@@ -15807,7 +15815,7 @@ def test_a_pane_shrunk_under_the_probe_never_proves_a_draft_with_a_blank_first_r
     tui.dim_survives_typing = True
     tui.native_cursor = True
     tui.cursor_home = True
-    tui.shrink_after_typing_for_captures = 4
+    tui.shrink_after_typing_for_captures = shrunk_for
     tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
     bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
     styled = tui.render(styled=True)
@@ -15819,10 +15827,12 @@ def test_a_pane_shrunk_under_the_probe_never_proves_a_draft_with_a_blank_first_r
 
     assert tui.submitted == []
     assert "paste-buffer" not in [kind for kind, _ in tui.events]
-    assert "BSpace" not in tui.key_presses(), "the probe never proved this box empty"
+    assert "C-u" not in tui.key_presses(), "the clear was given up, not handed to C-u"
     assert "Enter" not in tui.key_presses()
-    assert tui.draft == "\nstale draft"
     probe = claude_native_bridge._GHOST_PROBE_CHAR
+    keys = [key for key in tui.key_presses() if key != "\x1b[I"]  # the failure log's focus-in
+    assert keys == [probe, "BSpace"], "the probe was typed once and removed again"
+    assert tui.draft == "\nstale draft"
     assert any(
         claude_native_bridge._composer_holds_only(pane, probe)
         for kind, pane in tui.events
