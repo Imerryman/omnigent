@@ -7,6 +7,7 @@ import base64
 import io
 import itertools
 import json
+import logging
 import os
 import queue
 import select
@@ -13841,20 +13842,42 @@ class _ScrollingComposerTui:
         # styled captures; a focus-in event turns it on, as on the real TUI.
         self.draft_cursor = False
         self.dim_on_enter = False
+        # Claude Code's native cursor (``tengu_native_cursor``, on for logged-in
+        # accounts): no caret cell is ever drawn, so a ghost stays all dim and a
+        # focus-in changes nothing in a styled capture (measured live).
+        self.native_cursor = False
+        # Typed characters never reach the draft (a key handler that drops
+        # them). Not a model of vim normal mode, where ``x`` deletes a char.
+        self.ignore_typing = False
+        # A dim draft stays dim when typed into: only the typed text is real
+        # text, so deleting it shows the dim draft again (the worst case a
+        # probe must survive). ``_dim_upto`` is where its dim text ends.
+        self.dim_survives_typing = False
+        self._dim_upto: int | None = None
+        # The draft each paste landed on (``""`` for an empty box).
+        self.pasted_onto: list[str] = []
+        # Typed characters / BSpace that landed on a dialog.
+        self.typed_into_dialog = 0
         # Called on every Enter (e.g. to append the hook record Claude writes).
         self.on_enter: Any = None
         # Captures that come back torn right after an Enter.
         self.torn_after_enter = 0
 
     # -- rendering ---------------------------------------------------------
-    def _rows(self) -> list[str]:
-        rows: list[str] = []
+    def _row_spans(self) -> list[tuple[int, str]]:
+        spans: list[tuple[int, str]] = []
+        pos = 0
         for logical in self.draft.split("\n"):
             if not logical:
-                rows.append("")
-                continue
-            rows.extend(logical[i : i + self.width] for i in range(0, len(logical), self.width))
-        return rows
+                spans.append((pos, ""))
+            spans.extend(
+                (pos + i, logical[i : i + self.width]) for i in range(0, len(logical), self.width)
+            )
+            pos += len(logical) + 1
+        return spans
+
+    def _rows(self) -> list[str]:
+        return [row for _, row in self._row_spans()]
 
     def composer_text_visible(self) -> list[str]:
         rows = self._rows()[-self.visible_rows :] if self.draft else [""]
@@ -13866,15 +13889,22 @@ class _ScrollingComposerTui:
 
     def render(self, *, styled: bool = False) -> str:
         rows = self.composer_text_visible()
-        if self.dim_draft and styled:
+        if self.dim_draft and styled and self._dim_upto is not None and self.draft:
+            dim_upto = self._dim_upto
+            rows = [
+                (f"\x1b[2m{row[: dim_upto - start]}\x1b[0m" if dim_upto > start else "")
+                + row[max(0, dim_upto - start) :]
+                for start, row in self._row_spans()[-self.visible_rows :]
+            ]
+        elif self.dim_draft and styled:
             rows = [f"\x1b[2m{row}\x1b[0m" if row else row for row in rows]
-        if styled and self.draft and self.draft_cursor:
+        if styled and self.draft and self.draft_cursor and not self.native_cursor:
             rows = [*rows[:-1], f"{rows[-1]}\x1b[7m \x1b[0m"]
         first = f"❯\u00a0{rows[0]}"
         if not self.draft and self.ghost and self._hidden_captures_left <= 0:
             if not styled:
                 first = f"❯\u00a0{self.ghost}"
-            elif self.ghost_focused:
+            elif self.ghost_focused and not self.native_cursor:
                 first = f"❯\u00a0\x1b[7m{self.ghost[0]}\x1b[0;2m{self.ghost[1:]}\x1b[0m"
             else:
                 first = f"❯\u00a0\x1b[2m{self.ghost}\x1b[0m"
@@ -13891,8 +13921,10 @@ class _ScrollingComposerTui:
             if self.dialog
             else []
         )
+        # The closing rule sits directly under the last box row, as on 2.1.280
+        # (a blank line inside the box is a blank draft row).
         return "\n".join(
-            [self.transcript, *dialog, rule, *body, "", rule, "", "  ⏵⏵ auto mode on", ""]
+            [self.transcript, *dialog, rule, *body, rule, "", "  ⏵⏵ auto mode on", ""]
         )
 
     def logical_submission(self) -> str:
@@ -13930,6 +13962,7 @@ class _ScrollingComposerTui:
         elif "paste-buffer" in cmd:
             self.events.append(("paste-buffer", ""))
             if not self.drop_paste:
+                self.pasted_onto.append(self.draft)
                 text = self.pending
                 interior_newlines = text.rstrip("\n").count("\n")
                 if len(text.rstrip("\n")) >= 800 or interior_newlines >= 2:
@@ -13952,8 +13985,9 @@ class _ScrollingComposerTui:
                 self.events.append(("key", key))
                 if key == "\x1b[I":
                     # Focus-in: a focus event, never text.
-                    self.ghost_focused = True
-                    self.draft_cursor = True
+                    if not self.native_cursor:
+                        self.ghost_focused = True
+                        self.draft_cursor = True
                     continue
                 if self.dialog:
                     # The dialog owns the keyboard.
@@ -13963,6 +13997,8 @@ class _ScrollingComposerTui:
                         self.clear_keys_into_dialog += 1
                     elif key == "Escape" and not self.dialog_sticky:
                         self.dialog = False
+                    elif key == "BSpace" or "-l" in cmd:
+                        self.typed_into_dialog += 1
                     continue
                 if key == "Enter":
                     if self.on_enter is not None:
@@ -13981,6 +14017,19 @@ class _ScrollingComposerTui:
                     self.draft = self.draft[: len(self.draft) - len(rows[-1])] if rows else ""
                 elif key == "C-u" and not self.ignore_clear:
                     self._delete_row_backwards()
+                elif key == "BSpace" and not self.ignore_clear:
+                    self.draft = self.draft[:-1]
+                elif "-l" in cmd and not self.ignore_typing:
+                    # Typed text replaces a ghost and is appended to a draft;
+                    # it is never dim, and the redraw shows the draft as is.
+                    if self.dim_survives_typing and self.dim_draft and self.draft:
+                        if self._dim_upto is None:
+                            self._dim_upto = len(self.draft)
+                    else:
+                        self.dim_draft = False
+                    self.draft += key
+                if self._dim_upto is not None:
+                    self._dim_upto = min(self._dim_upto, len(self.draft))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     def key_presses(self) -> list[str]:
@@ -14008,6 +14057,7 @@ def _fast_delivery_9026(monkeypatch: pytest.MonkeyPatch) -> None:
         ("_COMPOSER_CLEAR_SETTLE_S", 0.01),
         ("_PRE_SUBMIT_REVALIDATE_TIMEOUT_S", 0.3),
         ("_FAILED_SUBMIT_CLEANUP_TIMEOUT_S", 0.3),
+        ("_GHOST_PROBE_SETTLE_TIMEOUT_S", 0.05),
     ):
         if hasattr(claude_native_bridge, name):
             monkeypatch.setattr(claude_native_bridge, name, value)
@@ -14627,15 +14677,16 @@ def test_a_dim_still_present_draft_is_never_reported_accepted(
 
 
 @pytest.mark.usefixtures("_fast_delivery_9026")
-def test_an_unfocused_ghost_is_resolved_by_focus_in_not_by_clear_keys(
+def test_an_unfocused_ghost_is_dispelled_by_a_probe_not_by_clear_keys(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """
     The default state of a detached pane (focus-events on) is unfocused.
 
     Measured on 2.1.280 with omnigent's tmux options and no client: the ghost
-    is all dim. A focus-in event turns it into the verified focused rendering,
-    so delivery proceeds with no C-u probing a box that holds no draft.
+    is all dim. The clear never judges dim text: one typed character proves
+    the draft empty (it shows alone), ``BSpace`` removes it, and delivery
+    proceeds with no C-u and a single Enter.
     """
     tui = _ScrollingComposerTui()
     tui.ghost = 'Try "refactor <filepath>"'
@@ -14645,8 +14696,7 @@ def test_an_unfocused_ghost_is_resolved_by_focus_in_not_by_clear_keys(
     inject_user_message(bridge_dir, content="fresh message")
 
     assert tui.submitted == ["fresh message"]
-    assert "\x1b[I" in tui.key_presses()
-    assert "C-u" not in tui.key_presses()
+    assert tui.key_presses() == [claude_native_bridge._GHOST_PROBE_CHAR, "BSpace", "Enter"]
 
 
 @pytest.mark.usefixtures("_fast_delivery_9026")
@@ -15099,3 +15149,430 @@ def test_a_verifiably_undelivered_attempt_does_not_absorb_the_retrys_hook(
     inject_user_message(bridge_dir, content=content)
 
     assert tui.submitted == [content]
+
+
+# -- Prompt suggestion under the native cursor (live c29b refusal, after #19) --
+
+# The live pane that refused a follow-up (80x24, ``capture-pane -e``, verbatim;
+# rules spelled as ``"─" * 80``): Claude Code's post-turn prompt suggestion in
+# the empty box, all dim with no caret. Its account had ``tengu_native_cursor``
+# on, so no focus-in or key ever drew the focused rendering, and the clear sent
+# 32 C-u (which cannot delete a placeholder) before refusing to paste.
+_LIVE_C29B_PANE = (
+    "\n"
+    "  \x1b[1mTest evidence:\x1b[0m\x1b[39m\x1b[49m confirmed all 5 new/updated tests fail"
+    " on pre-fix code, then\n"
+    "  pass after the fix. Full file: 158 passed, serial, no regressions\n"
+    "  (warm/resumed-session path untouched).\n"
+    "\n"
+    "  \x1b[1mGates:\x1b[0m\x1b[39m\x1b[49m \x1b[38;5;153mruff format\x1b[39m/\x1b[38;5;153mruff"
+    " check\x1b[39m clean; \x1b[38;5;153mpyrefly\x1b[39m scoped to the file shows the same\n"
+    "  8 pre-existing \x1b[38;5;153mmissing-import\x1b[39m errors before and after (environment"
+    " artifact,\n"
+    "  verified via stash/unstash — no new type errors); test-quality lint hooks\n"
+    "  clean.\n"
+    "\n"
+    "  \x1b[1mUncertain/couldn't run:\x1b[0m\x1b[39m\x1b[49m this repo/branch has no"
+    " \x1b[38;5;153mscripts/ci-local.sh\x1b[39m, so\n"
+    "  \x1b[38;5;153mci-remote\x1b[39m refuses outright (\x1b[38;5;153mno scripts/ci-local.sh in"
+    " <worktree>\x1b[39m) — the full\n"
+    "  VM105 backend gate and a true vs-base-branch full-suite diff could not be run.\n"
+    "  \x1b[38;5;153mdev.lint.custom_lint\x1b[39m's embedded node test fails on a missing"
+    " \x1b[38;5;153mweb/\x1b[39m pnpm\n"
+    "  install, unrelated to this change. Didn't touch the live"
+    " \x1b[38;5;153momnigent-port-v018\x1b[39m\n"
+    "  install.\n"
+    "\n"
+    "\x1b[38;5;246m✻\x1b[39m \x1b[38;5;246mCooked for 8m 50s · done 3:11 PM\x1b[39m\n"
+    "\n"
+    "\x1b[38;5;244m" + "─" * 80 + "\n"
+    "\x1b[39m❯\xa0\x1b[2mopen the codex_executor.py replay bug as a follow-up task\n"
+    "\x1b[0m\x1b[38;5;244m\x1b[49m" + "─" * 80 + "\n"
+    "\n"
+    "\x1b[39m  \x1b[38;5;220m⏵⏵ auto mode on\x1b[38;5;246m (shift+tab to cycle)\n"
+    "\n"
+)
+
+
+class _LiveC29bTui(_ScrollingComposerTui):
+    """The fake composer, drawing its empty box exactly as the live c29b pane did."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.native_cursor = True
+
+    def render(self, *, styled: bool = False) -> str:
+        """
+        Render the pane; an empty box is the live capture, verbatim.
+
+        :param styled: Whether to keep SGR escapes (``capture-pane -e``).
+        :returns: Pane text.
+        """
+        if self.draft or self.dialog or self._hidden_captures_left > 0:
+            return super().render(styled=styled)
+        if styled:
+            return _LIVE_C29B_PANE
+        return claude_native_bridge._strip_capture_escapes(_LIVE_C29B_PANE)
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_live_native_cursor_suggestion_does_not_block_a_follow_up(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The live c29b pane delivers its follow-up with one Enter and no C-u.
+
+    The suggestion is all dim with no caret and never changes, whatever is
+    sent. One typed character replaces it and shows alone, which proves the
+    draft empty; ``BSpace`` removes it and the paste proceeds.
+    """
+    tui = _LiveC29bTui()
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    styled = tui.render(styled=True)
+    assert claude_native_bridge._composer_is_empty(tui.render()) is False
+    assert claude_native_bridge._composer_ghost_signature(styled) == "unfocused"
+
+    inject_user_message(bridge_dir, content="please look at the replay bug next")
+
+    assert tui.submitted == ["please look at the replay bug next"]
+    assert tui.key_presses() == [claude_native_bridge._GHOST_PROBE_CHAR, "BSpace", "Enter"]
+
+
+@pytest.mark.parametrize("native_cursor", [False, True], ids=["drawn-caret", "native-cursor"])
+@pytest.mark.parametrize("focused", [True, False], ids=["focused", "unfocused"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_prompt_suggestion_never_blocks_delivery_and_gets_one_enter(
+    focused: bool, native_cursor: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Every rendering of a suggestion delivers once, with no C-u.
+
+    Only the focused rendering of a drawn caret is read as empty on sight
+    (no probe); every all-dim box is probed.
+    """
+    tui = _ScrollingComposerTui()
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    tui.ghost_focused = focused
+    tui.native_cursor = native_cursor
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+    probed = [claude_native_bridge._GHOST_PROBE_CHAR, "BSpace"]
+    expected = ["Enter"] if focused and not native_cursor else [*probed, "Enter"]
+    assert tui.key_presses() == expected
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dialog_opening_before_the_probe_gets_no_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The probe character is typed only on a fresh frame with no dialog.
+
+    The dialog opens right after the clear's styled read, so the frame the
+    probe was decided on is stale; the dialog gets no character, no C-u and
+    no Enter, and nothing is pasted.
+    """
+    tui = _ScrollingComposerTui()
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    tui.native_cursor = True
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_run = tui.run
+
+    def _dialog_on_styled_read(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = real_run(cmd, **kwargs)
+        if "capture-pane" in cmd and "-e" in cmd:
+            tui.dialog = True
+        return result
+
+    monkeypatch.setattr("subprocess.run", _dialog_on_styled_read)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.typed_into_dialog == 0
+    assert tui.clear_keys_into_dialog == 0
+    assert tui.enter_into_dialog == 0
+    assert claude_native_bridge._GHOST_PROBE_CHAR not in tui.key_presses()
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dialog_opening_after_the_probe_gets_no_backspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    ``BSpace`` is decided on a fresh frame too, after the probe has landed.
+
+    The dialog opens as the probe character lands. The probe still shows alone
+    in the box under it, but the deletion would answer the dialog, so it is
+    not sent; delivery fails closed with nothing pasted or submitted.
+    """
+    tui = _ScrollingComposerTui()
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    tui.native_cursor = True
+    tui.dialog_sticky = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    real_run = tui.run
+
+    def _dialog_after_the_probe(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        result = real_run(cmd, **kwargs)
+        if (
+            "send-keys" in cmd
+            and "-l" in cmd
+            and cmd[-1] == claude_native_bridge._GHOST_PROBE_CHAR
+        ):
+            tui.dialog = True
+        return result
+
+    monkeypatch.setattr("subprocess.run", _dialog_after_the_probe)
+
+    with pytest.raises(RuntimeError, match="not delivered"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert "BSpace" not in tui.key_presses()
+    assert tui.typed_into_dialog == 0
+    assert tui.clear_keys_into_dialog == 0
+    assert tui.enter_into_dialog == 0
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert tui.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("stale", "expect_probe_first"),
+    [("stale dim draft text\n", False), ("stale dim draft", True), ("y" * 300, False)],
+    ids=["one-row-then-empty-row", "one-row", "multi-row"],
+)
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_dim_real_draft_under_the_native_cursor_is_cleared_not_called_empty(
+    stale: str, expect_probe_first: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    An all-dim real draft looks exactly like a native-cursor suggestion.
+
+    The probe is appended to it instead of replacing it, so the box never
+    holds the probe alone and is never called empty: the draft (probe
+    included) is cleared with C-u. As on the real CLI, the suggestion is then
+    redrawn, all dim again; one more probe proves that box empty, and only the
+    new message is submitted, with one Enter. A box the probe could not prove
+    (more than one row, or a blank draft row) is cleared with C-u without a probe.
+    """
+    tui = _ScrollingComposerTui(draft=stale)
+    tui.dim_draft = True
+    tui.native_cursor = True
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._composer_ghost_signature(tui.render(styled=True)) == "unfocused"
+
+    inject_user_message(bridge_dir, content="fresh message")
+
+    assert tui.submitted == ["fresh message"]
+    assert tui.pasted_onto == [""]
+    probe = claude_native_bridge._GHOST_PROBE_CHAR
+    first_paste = next(i for i, (kind, _) in enumerate(tui.events) if kind == "paste-buffer")
+    before_paste = [value for kind, value in tui.events[:first_paste] if kind == "key"]
+    clears = [i for i, key in enumerate(before_paste) if key == "C-u"]
+    assert clears, "a real draft is cleared with C-u"
+    assert before_paste[clears[-1] + 1 :] == [probe, "BSpace"], before_paste
+    # Only a one-row box with room is probed before the clear; there the probe
+    # joins the draft. A taller box, or one with a blank row, could hide a
+    # draft the probe would not touch: it goes straight to C-u.
+    assert before_paste[: clears[0]] == ([probe] if expect_probe_first else [])
+    assert tui.key_presses().count("Enter") == 1
+
+
+@pytest.mark.parametrize("visible_rows", [1, 2], ids=["one-row-box", "two-row-box"])
+@pytest.mark.parametrize("full_rows", [3, 5], ids=["three-full-rows", "five-full-rows"])
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_scrolled_dim_draft_in_a_short_box_is_never_called_empty(
+    visible_rows: int, full_rows: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A probe shown alone in a short box does not prove the draft empty.
+
+    The box is a viewport scrolled to the draft's end (a person attached with
+    a small terminal). The dim draft's last row is full, so the probe wraps
+    onto a row of its own and, in a one-row box, shows alone with the draft
+    scrolled out above it. Deleting it shows the dim draft again, which looks
+    like a suggestion. Taken as empty, the message was pasted onto the stale
+    draft. The draft must be cleared first, so a paste only ever lands on an
+    empty box. In a one-row box the pasted draft itself cannot be confirmed
+    (the paste's trailing newline leaves its last row blank, as on 2.1.280),
+    so delivery is refused there with no Enter; in a two-row box only the new
+    message is submitted, with one Enter.
+    """
+    width = _ScrollingComposerTui.width
+    stale = ("stale draft head " + "y" * width * full_rows)[: width * full_rows]
+    tui = _ScrollingComposerTui(draft=stale)
+    tui.visible_rows = visible_rows
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+    assert claude_native_bridge._composer_ghost_signature(tui.render(styled=True)) == "unfocused"
+    assert "stale draft head" not in tui.render(), "precondition: the draft's head is hidden"
+
+    if visible_rows == 1:
+        with pytest.raises(RuntimeError, match="could not be confirmed"):
+            inject_user_message(bridge_dir, content="fresh message")
+        assert tui.submitted == []
+        assert "Enter" not in tui.key_presses()
+    else:
+        inject_user_message(bridge_dir, content="fresh message")
+        assert tui.submitted == ["fresh message"]
+        assert tui.key_presses().count("Enter") == 1
+    assert tui.pasted_onto[:1] == [""], "the paste landed on the stale draft"
+    first_paste = next(i for i, (kind, _) in enumerate(tui.events) if kind == "paste-buffer")
+    before_paste = [value for kind, value in tui.events[:first_paste] if kind == "key"]
+    clears = [i for i, key in enumerate(before_paste) if key == "C-u"]
+    assert clears, before_paste
+    assert "BSpace" not in before_paste[: clears[0]], "the probe never proved this box empty"
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_scrolled_dim_draft_that_cannot_be_cleared_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A short box whose dim draft survives C-u refuses the paste, never submits.
+
+    The probe shows alone in the one-row box (the draft scrolled above it),
+    which proves nothing; C-u cannot clear the box, so nothing is pasted and
+    no Enter is pressed — as before the probe existed.
+    """
+    width = _ScrollingComposerTui.width
+    tui = _ScrollingComposerTui(draft=("stale draft head " + "y" * width * 2)[: width * 2])
+    tui.visible_rows = 1
+    tui.dim_draft = True
+    tui.dim_survives_typing = True
+    tui.native_cursor = True
+    tui.ignore_clear = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be cleared"):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "BSpace" not in tui.key_presses()
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+def test_the_probe_needs_room_on_a_single_dim_row() -> None:
+    """
+    Only a one-row box whose row leaves room for the probe can prove emptiness.
+
+    The row is measured in terminal cells (wide characters count twice), and a
+    blank draft row below it makes the box two rows.
+    """
+    single_row_box = claude_native_bridge._single_row_box
+    assert single_row_box(_styled_composer_9026("\x1b[2mopen the replay bug")) == (21, 80)
+    assert single_row_box(_styled_composer_9026("\x1b[2m" + "修" * 30)) == (62, 80)
+    assert single_row_box(_styled_composer_9026("\x1b[2mdraft", "")) is None
+    assert single_row_box(_styled_composer_9026("\x1b[2mdraft", "\x1b[2mmore")) is None
+    assert single_row_box("") is None
+    assert claude_native_bridge._cell_width("❯\xa0修正a\u0301") == 7
+
+
+def test_the_probe_proves_an_empty_draft_only_when_it_shows_alone() -> None:
+    """
+    Only a one-row box holding just the probe, as real text, proves emptiness.
+
+    A dim probe, extra text, or a blank draft row (a draft of the probe plus
+    empty lines) is draft content.
+    """
+    holds_only = claude_native_bridge._composer_holds_only
+    assert holds_only(_styled_composer_9026("x"), "x")
+    assert holds_only(_styled_composer_9026("x\x1b[7m \x1b[0m"), "x")
+    assert not holds_only(_styled_composer_9026("\x1b[2mx\x1b[0m"), "x")
+    assert not holds_only(_styled_composer_9026("ax"), "x")
+    assert not holds_only(_styled_composer_9026("x", "more draft"), "x")
+    assert not holds_only(_styled_composer_9026("x", ""), "x")
+    assert not holds_only(_styled_composer_9026("\x1b[2mopen the replay bug"), "x")
+    assert not holds_only("", "x")
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_a_suggestion_matching_the_message_never_confirms_a_swallowed_paste_natively(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Under the native cursor, suggestion text still never counts as the draft.
+
+    The probe proves the box empty and the paste is swallowed; the suggestion
+    that returns repeats the message's words, but it is dim, so no Enter.
+    """
+    content = "open the codex_executor.py replay bug as a follow-up task"
+    tui = _ScrollingComposerTui()
+    tui.ghost = content
+    tui.native_cursor = True
+    tui.drop_paste = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with pytest.raises(RuntimeError, match="could not be confirmed"):
+        inject_user_message(bridge_dir, content=content)
+
+    assert "Enter" not in tui.key_presses()
+    assert tui.submitted == []
+
+
+@pytest.mark.usefixtures("_fast_delivery_9026")
+def test_an_uncleared_box_logs_its_styled_frames_capped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """
+    A box that cannot be cleared refuses the paste and logs what it showed.
+
+    Typed characters never reach the draft here (the fake drops them), so the
+    probe cannot prove anything and C-u cannot delete the suggestion. Each
+    frame — the first read, each probe, the last read and the frame after a
+    focus-in — is described at INFO by its shape only (rows, counts, dim
+    styling, signature), never its text; the styled rows, which can hold the
+    person's draft, go to DEBUG only, each capped.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_FOCUS_IN_SETTLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(claude_native_bridge, "_GHOST_PROBE_SETTLE_TIMEOUT_S", 0.05)
+    tui = _ScrollingComposerTui(transcript="y" * 5000)
+    tui.ghost = "open the codex_executor.py replay bug as a follow-up task"
+    tui.native_cursor = True
+    tui.ignore_typing = True
+    bridge_dir = _install_tui_9026(tmp_path, monkeypatch, tui)
+
+    with (
+        caplog.at_level("DEBUG", logger="omnigent.harnesses.claude_native.bridge"),
+        pytest.raises(RuntimeError, match="could not be cleared"),
+    ):
+        inject_user_message(bridge_dir, content="fresh message")
+
+    assert "paste-buffer" not in [kind for kind, _ in tui.events]
+    assert "Enter" not in tui.key_presses()
+    labels = ["first", "probe 1", "probe 2", "last", "after focus-in"]
+    shapes = [r for r in caplog.records if "uncleared input box" in r.getMessage()]
+    shapes = [r for r in shapes if r.levelno >= logging.INFO]
+    assert [r.args[0] for r in shapes if isinstance(r.args, tuple)] == labels
+    for record in shapes:
+        assert record.levelname == "INFO"
+        assert "1 rows, 49 visible chars (49 dim), closed" in record.getMessage()
+    styled = [r for r in caplog.records if "frame (styled)" in r.getMessage()]
+    assert [r.args[0] for r in styled if isinstance(r.args, tuple)] == labels
+    cap = claude_native_bridge._CLEAR_FAILURE_LOG_FRAME_CHARS
+    for record in styled:
+        assert record.levelname == "DEBUG"
+        assert isinstance(record.args, tuple)
+        region = record.args[-1]
+        assert isinstance(region, str)
+        assert len(region) <= cap + 1
+        assert "\x1b[2mopen the codex_executor.py" in region, "the styled composer row is kept"
+    assert "\x1b[I" in tui.key_presses()
+    for record in caplog.records:
+        if record.levelno >= logging.INFO:
+            message = record.getMessage()
+            assert "codex_executor" not in message, "no draft or suggestion text above DEBUG"
+            assert "fresh message" not in message
+            assert "\x1b[" not in message
+    warning = next(r for r in caplog.records if "not verified empty" in r.getMessage())
+    assert "2 probes" in warning.getMessage()
