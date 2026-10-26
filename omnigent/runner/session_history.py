@@ -17,6 +17,7 @@ from omnigent.runner.app_support import (
     _SpecEntry,
 )
 from omnigent.runner.native import _unwrap_resolved_spec
+from omnigent.runner.synthetic_markers import CANCELLATION_MARKER_TEXT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -366,14 +367,6 @@ def build_session_history(
             ]
 
     _CANCELLATION_TOOL_OUTPUT = "[Cancelled — tool execution was interrupted.]"
-    _CANCELLATION_MARKER_TEXT = (
-        "[System: interrupted]\n"
-        "The user interrupted and abandoned their previous request (the user "
-        "message immediately before this one). Do not resume or act on that "
-        "interrupted request unless the user asks for it again; treat the next "
-        "user message as the current instruction. The preceding assistant "
-        "message may be incomplete."
-    )
 
     def _append_cancellation_items(conv_id: str) -> None:
         history = _session_histories.get(conv_id, [])
@@ -416,7 +409,7 @@ def build_session_history(
             "content": [
                 {
                     "type": "input_text",
-                    "text": _CANCELLATION_MARKER_TEXT,
+                    "text": CANCELLATION_MARKER_TEXT,
                 }
             ],
         }

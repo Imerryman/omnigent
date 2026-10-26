@@ -301,6 +301,18 @@ _DIALOG_FOOTER_RE = re.compile(
 )
 # Lines scanned for a dialog when no box rule anchors the region.
 _DIALOG_SCAN_TAIL_LINES = 15
+# A selection dialog Claude Code stacks ABOVE a still-rendered composer (e.g.
+# 2.1.280's "Teach auto mode about your environment?", opened as a turn ends)
+# takes the keyboard: a paste lands in the dialog, not the input box. It is
+# framed by a rule above and the composer's opening rule below, lists numbered
+# options behind the ``❯`` selector, and its last row is the footer naming
+# Escape as the way out.
+_STACKED_DIALOG_FOOTER_RE = re.compile(
+    r"enter to \w+\s*·\s*esc to (cancel|exit)\s*$", re.IGNORECASE
+)
+_STACKED_DIALOG_OPTION_RE = re.compile(r"^\s*" + re.escape("❯") + r"\s*\d+\.")
+# Taller framed regions are transcript, not a dialog.
+_STACKED_DIALOG_MAX_LINES = 14
 _CLAUDE_READY_POLL_INTERVAL_S = 0.15
 _CLAUDE_LIVENESS_POLL_INTERVAL_S = 1.0
 _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit Enter
@@ -310,7 +322,7 @@ _PASTE_SETTLE_S = 0.1  # let the TUI commit a paste before the separate submit E
 # still consuming the paste gets folded in as a newline instead of
 # submitting — the draft then sits unsent. Polling for the draft makes
 # the handoff deterministic where the old fixed sleep raced it.
-_PASTE_COMMIT_TIMEOUT_S = 5.0
+_PASTE_COMMIT_TIMEOUT_S = 20.0
 # After the submit Enter, how long to keep checking that the draft
 # actually left the input box (re-sending Enter while it hasn't)
 # before failing loud. Sized to out-wait a transiently unresponsive
@@ -354,6 +366,87 @@ _PASTED_PLACEHOLDER_PREFIX = "[Pasted text"
 # whether the draft is rendered in the input box. Short enough to fit
 # on the prompt row of a default 80-column detached pane.
 _DRAFT_NEEDLE_MAX_CHARS = 24
+# How many non-whitespace characters from the END of the message make the
+# second draft marker. Claude Code keeps the cursor (the end of the draft) in
+# view, so a 450-799 char draft that wraps past the ~7 composer rows of an 80x24
+# pane — too short to collapse into a ``[Pasted text …]`` placeholder — shows
+# its tail while its head is scrolled out of the box (omnigent-ai/omnigent#9026).
+_DRAFT_TAIL_NEEDLE_MAX_CHARS = 24
+# Clearing a leftover draft before a paste. In Claude Code 2.1.280 ``C-u``
+# deletes one rendered row backwards (joining the row above once the cursor's
+# row is empty), is a no-op on an empty box, and — unlike Escape or Ctrl+C —
+# never interrupts a running turn or opens the rewind dialog. Ctrl+A/Ctrl+K
+# emptied only the cursor's row, so a multi-row draft survived and the next
+# paste was appended to it. Presses go in bursts, re-reading the box between
+# them, up to a ceiling far above any draft Claude leaves uncollapsed.
+# Bursts stay small so each is decided on a fresh read of the box: a dialog that
+# opens mid-clear stops the presses after at most one burst.
+_COMPOSER_CLEAR_KEYS_PER_BURST = 4
+_COMPOSER_CLEAR_MAX_KEYS = 256
+# Spacing between bursts, so the TUI repaints before the box is judged again.
+_COMPOSER_CLEAR_SETTLE_S = 0.25
+# How long the box may stay non-empty (or unreadable) before the paste is
+# abandoned undelivered.
+_COMPOSER_CLEAR_TIMEOUT_S = 10.0
+# How long the confirmed draft may read as unreadable (a torn capture) right
+# before the submit Enter before delivery is abandoned undelivered.
+_PRE_SUBMIT_REVALIDATE_TIMEOUT_S = 2.0
+# How long an all-dim box may take to redraw after a focus-in event before it
+# is treated as unresolved (draft content / unknown, never empty). This bounds
+# the redraw WAIT only; each capture inside it has tmux's own subprocess timeout.
+_FOCUS_IN_SETTLE_TIMEOUT_S = 1.0
+# Dispelling an all-dim box before a paste (see :func:`_probe_ghost_candidate`).
+# Measured on 2.1.280 with ``tengu_native_cursor`` on (as for logged-in
+# accounts; ``CLAUDE_CODE_NATIVE_CURSOR=1`` reproduces it): the box draws no
+# caret cell at all, so a prompt suggestion stays all-dim through focus-in,
+# ``C-u`` and redraws. Typing one character replaces the suggestion with that
+# character as real text; ``BSpace`` then empties the draft (the suggestion is
+# redrawn). A letter is inert in an empty composer — unlike ``/``, ``!``, ``#``,
+# ``?`` or ``@``, which open modes or menus there.
+_GHOST_PROBE_CHAR = "x"
+# How long the probe character (and then its deletion) may take to render.
+_GHOST_PROBE_SETTLE_TIMEOUT_S = 1.0
+# Probes per clear; a box the probe cannot settle falls back to ``C-u``. Once
+# ``C-u`` has hit a draft a probe exposed, one more probe is allowed: Claude Code
+# redraws its suggestion when the draft is gone, all-dim again under the native
+# cursor, and only a probe can tell it from what is left of the draft.
+_GHOST_PROBE_MAX_ATTEMPTS = 2
+# Free cells the all-dim row must leave before the box's right edge for a probe
+# shown alone to prove the box empty. The composer is a viewport scrolled to the
+# draft's END (its ``❯`` glyph leads the first VISIBLE row, which need not be the
+# draft's first), so in a one-row box a probe appended to a hidden draft whose
+# last row is full wraps onto a row of its own and shows alone. With room on
+# that row it lands beside the draft's text instead. 2.1.280 wraps two cells
+# short of the pane edge; the rest is slack for the probe's word wrapping.
+# A row without that room (a phone-width pane, where a suggestion fills the
+# row) is still probed when the terminal's cursor sits on the draft's first
+# cell: see :func:`_cursor_at_draft_start`.
+_GHOST_PROBE_ROW_SLACK_CELLS = 6
+# For that cursor rule the box must be showing the WHOLE draft, so no row can
+# be scrolled out of it. Measured on 2.1.280 (80 columns): the box grows with
+# the draft up to a cap of 3 rows in a 12-row pane, 7 in 24, 15 in 40. So in a
+# pane of at least this many rows, a box of at most this many rows is uncapped
+# — a draft with more rows would be showing more.
+_GHOST_PROBE_CURSOR_MIN_PANE_ROWS = 12
+_GHOST_PROBE_CURSOR_MAX_BOX_ROWS = 2
+# Size cap per styled frame logged (at DEBUG) when the box could not be cleared.
+_CLEAR_FAILURE_LOG_FRAME_CHARS = 1500
+# Pane rows logged (at DEBUG) per frame: the composer box, its footer and a
+# stacked dialog's rows above it.
+_CLEAR_FAILURE_LOG_FRAME_LINES = 16
+# How long a failed submit's cleanup waits through unreadable captures to
+# positively identify the stale draft before giving up (without a key).
+_FAILED_SUBMIT_CLEANUP_TIMEOUT_S = 5.0
+# The submit ledger (see :func:`_user_prompt_reached_claude_since`): every
+# submit Enter the bridge pressed, so a delayed UserPromptSubmit record of an
+# earlier identical prompt pays off that prompt's claim instead of confirming
+# a later one. Claims older than the window are taken as settled; the file is
+# compacted past the line cap.
+_SUBMIT_LEDGER_FILE = "submit_ledger.jsonl"
+_SUBMIT_LEDGER_WINDOW_S = 120.0
+_SUBMIT_LEDGER_MAX_LINES = 512
+# Bound on the composer capture logged at DEBUG when a draft is not confirmed.
+_DRAFT_FAILURE_LOG_TAIL_CHARS = 600
 # Mode footer Claude Code renders below its input box, keyed by
 # ``--permission-mode`` value. There is no non-interactive mode command, so
 # a live switch cycles with shift+tab and reads this footer to know where it
@@ -449,6 +542,13 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
+# Titles that render INSIDE a bordered confirm/permission dialog box (the
+# switch/effort confirmation and every tool-permission prompt). Positive
+# overlay evidence requires one of these on a box-chrome row (see
+# :func:`_submit_popped_surface`), not merely somewhere in the pane — a title
+# echoed in the transcript, or a torn capture that just omits the composer, is
+# not proof a dialog replaced it.
+_BOXED_DIALOG_HINTS = (*_CONFIRM_DIALOG_HINTS, "Do you want to ", "Yes, and don't ask again")
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -2748,6 +2848,12 @@ def augment_claude_args(
     _write_json_file(settings_path, hook_settings)
     args.extend(
         [
+            # Omnigent worker panes load ONLY the bridge relay (see
+            # build_mcp_config); strict mode prevents Claude from merging the
+            # user-scope ~/.claude.json MCP fleet (serena, postgres, playwright,
+            # glitchtip, code-agents) into every pane -> was ~1GB/pane -> OOM.
+            # Only affects omnigent-spawned panes; hand-launched claude is untouched.
+            "--strict-mcp-config",
             "--mcp-config",
             json.dumps(mcp_config, separators=(",", ":")),
             "--settings",
@@ -3707,6 +3813,287 @@ def read_hook_events_from_offset(
     )
 
 
+# U+FEFF that :func:`_escape_slash_command_text` puts before a leading slash.
+_SLASH_ESCAPE_RE = re.compile("^(\\s*)\ufeff(?=/)")
+
+
+def _canonical_prompt(text: str) -> str:
+    r"""
+    Canonicalize a prompt for correlation, undoing only measured transport changes.
+
+    Measured on Claude Code 2.1.280 with a blocking ``UserPromptSubmit`` hook
+    (pasted text vs. the recorded ``prompt``): CR and CRLF arrive as LF; a tab
+    as four spaces (fixed — ``"ab\tc"`` -> ``"ab    c"``, not to a tab stop);
+    ESC/BEL and the other control characters the paste payload drops never
+    arrive (:func:`_paste_payload_bytes`); trailing whitespace is not
+    transported reliably — an uncollapsed draft is trimmed (``"hello world
+    "`` -> ``"hello world"``, the bridge's appended newline included) while a
+    collapsed ``[Pasted text …]`` paste keeps it (``"a\nb\nc\n"`` ->
+    ``"a\nb\nc\n\n"``); and the U+FEFF slash-command escape may be consumed.
+    Exactly those are undone: line endings, tabs, dropped controls, trailing
+    whitespace, and U+FEFF only at the slash-escape position. Leading and
+    interior whitespace is kept verbatim — it arrives verbatim — so prompts
+    that differ only in where a space or newline falls stay different.
+
+    :param text: Sent text or a recorded ``prompt``.
+    :returns: The canonical form, e.g. ``"ab    c"`` for ``"ab\tc\n"``.
+    """
+    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\t", "    ")
+    text = "".join(ch for ch in text if ch == "\n" or ord(ch) >= 0x20)
+    return _SLASH_ESCAPE_RE.sub(r"\1", text, count=1).rstrip()
+
+
+def _same_prompt(sent: str, recorded: object) -> bool:
+    """
+    Report whether a ``UserPromptSubmit`` ``prompt`` field is the text we sent.
+
+    :param sent: The text pasted into the composer.
+    :param recorded: The record's ``prompt`` field (anything; non-strings never
+        match).
+    :returns: ``True`` when both have the same non-empty canonical form
+        (:func:`_canonical_prompt`).
+    """
+    if not isinstance(recorded, str):
+        return False
+    canonical = _canonical_prompt(sent)
+    return bool(canonical) and canonical == _canonical_prompt(recorded)
+
+
+def _prompt_key(text: str) -> str:
+    """
+    Digest a prompt's canonical form, so the ledger never stores message text.
+
+    :param text: Sent text or a recorded ``prompt``.
+    :returns: Hex SHA-256 of :func:`_canonical_prompt`.
+    """
+    return hashlib.sha256(_canonical_prompt(text).encode("utf-8")).hexdigest()
+
+
+class _SubmitClaim(NamedTuple):
+    """One submit Enter the bridge pressed, owed at most one ``UserPromptSubmit`` record."""
+
+    claim_id: str
+    # Active Claude session, snapshotted before the Enter.
+    session_id: str
+    # :func:`_prompt_key` of the submitted text.
+    prompt_key: str
+    # ``hooks.jsonl`` record count taken before the Enter.
+    hooks_cursor: int
+    # ``time.time()`` taken before the Enter.
+    submitted_after: float
+
+
+def _append_submit_ledger(bridge_dir: Path, entry: _JsonObject) -> None:
+    """
+    Append one entry to the submit ledger; best effort, compacted when long.
+
+    Callers hold the bridge's injection lock, so appends never interleave.
+
+    :param bridge_dir: Bridge directory path.
+    :param entry: ``{"claim": {...}}`` or ``{"void": "<claim_id>"}``.
+    :returns: None. An I/O error is logged; the ledger then simply knows less.
+    """
+    path = bridge_dir / _SUBMIT_LEDGER_FILE
+    try:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(entry, separators=(",", ":")) + "\n")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if len(lines) > _SUBMIT_LEDGER_MAX_LINES:
+            keep = lines[-(_SUBMIT_LEDGER_MAX_LINES // 2) :]
+            path.write_text("\n".join(keep) + "\n", encoding="utf-8")
+    except OSError:
+        _logger.warning("claude-native: could not update the submit ledger", exc_info=True)
+
+
+def _new_submit_claim(
+    bridge_dir: Path, *, prompt: str, hooks_cursor: int, submitted_after: float
+) -> _SubmitClaim | None:
+    """
+    Record that a submit Enter is about to be pressed for *prompt*.
+
+    :param bridge_dir: Bridge directory path.
+    :param prompt: The text in the composer.
+    :param hooks_cursor: ``hooks.jsonl`` record count taken before the Enter.
+    :param submitted_after: ``time.time()`` taken before the Enter.
+    :returns: The claim, or ``None`` when no session is pinned yet or the
+        prompt is empty — the hook signal is then off for this submit.
+    """
+    session_id = read_claude_session_id(bridge_dir)
+    if session_id is None or not _canonical_prompt(prompt):
+        return None
+    claim = _SubmitClaim(
+        claim_id=secrets.token_hex(8),
+        session_id=session_id,
+        prompt_key=_prompt_key(prompt),
+        hooks_cursor=hooks_cursor,
+        submitted_after=submitted_after,
+    )
+    _append_submit_ledger(bridge_dir, {"claim": claim._asdict()})
+    return claim
+
+
+def _void_submit_claim(bridge_dir: Path, claim: _SubmitClaim | None) -> None:
+    """
+    Mark a claim as owed no record: its submit verifiably never happened.
+
+    Used when the draft was positively found and cleared after the submit
+    window, or when Claude Code rejected the message as an unknown command
+    (which fires no ``UserPromptSubmit``). Otherwise the claim would absorb
+    the record of the caller's retry of the same message.
+
+    :param bridge_dir: Bridge directory path.
+    :param claim: The claim, or ``None`` (nothing to do).
+    :returns: None.
+    """
+    if claim is not None:
+        _append_submit_ledger(bridge_dir, {"void": claim.claim_id})
+
+
+def _read_submit_claims(bridge_dir: Path) -> list[_SubmitClaim]:
+    """
+    Read the ledger's claims, oldest first, without the voided ones.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: Claims in the order their Enters were pressed; empty when the
+        ledger is missing or unreadable.
+    """
+    try:
+        lines = (bridge_dir / _SUBMIT_LEDGER_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    claims: list[_SubmitClaim] = []
+    voided: set[str] = set()
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if isinstance(entry.get("void"), str):
+            voided.add(entry["void"])
+            continue
+        raw = entry.get("claim")
+        if not isinstance(raw, dict):
+            continue
+        try:
+            claims.append(
+                _SubmitClaim(
+                    claim_id=str(raw["claim_id"]),
+                    session_id=str(raw["session_id"]),
+                    prompt_key=str(raw["prompt_key"]),
+                    hooks_cursor=int(raw["hooks_cursor"]),
+                    submitted_after=float(raw["submitted_after"]),
+                )
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+    return [claim for claim in claims if claim.claim_id not in voided]
+
+
+def _user_prompt_reached_claude_since(bridge_dir: Path, claim: _SubmitClaim) -> bool:
+    """
+    Return whether Claude Code recorded the prompt THIS claim's Enter submitted.
+
+    ``UserPromptSubmit`` is registered in :func:`_claude_hook_settings` as the
+    symmetric counterpart to ``Stop``: Claude Code runs it "when a new user
+    prompt reaches Claude (web-UI message via tmux send-keys, or direct
+    keystrokes into the embedded terminal)". It is written by a hook
+    subprocess appending to ``hooks.jsonl``, not by anything drawn in the pane,
+    so no amount of assistant output can fabricate it.
+
+    A record is evidence only once correlated with this submit: a
+    parent-process record (no ``agent_id``, no ``subagents/`` transcript) of the
+    claim's session whose ``prompt`` is the submitted text
+    (:func:`_canonical_prompt`), appended after the claim's cursor and written
+    (``recorded_at``) strictly after its Enter. A record missing any of those
+    never counts.
+
+    Time and position still cannot tell this prompt's record from an EARLIER
+    identical prompt's delayed one (its hook may write during this Enter), so
+    records are accounted for, not merely matched: every Enter the bridge
+    pressed is a claim in the submit ledger, owed at most one record. Reading
+    the hook log in order, each correlated record (deduplicated by
+    ``prompt_id``) pays off the OLDEST outstanding claim for that session and
+    prompt it could belong to; this claim is confirmed only by a record that
+    pays IT. An earlier identical delivery confirmed by the pane before its
+    hook arrived therefore absorbs its own late record. Claims older than
+    :data:`_SUBMIT_LEDGER_WINDOW_S` are taken as settled (a hook never lags
+    that long), and a claim whose submit verifiably never happened is voided
+    (:func:`_void_submit_claim`). Without a ledger (missing, unwritable, or
+    lost with the bridge directory) only this claim is owed, which is the
+    time/position/prompt/session check alone.
+
+    :param bridge_dir: Bridge directory path.
+    :param claim: The claim recorded for this submit's Enter.
+    :returns: ``True`` once a correlated record has paid off this claim.
+    """
+    owed = [
+        earlier
+        for earlier in _read_submit_claims(bridge_dir)
+        if earlier.claim_id != claim.claim_id
+        and earlier.session_id == claim.session_id
+        and earlier.prompt_key == claim.prompt_key
+        and earlier.submitted_after < claim.submitted_after
+        and claim.submitted_after - earlier.submitted_after <= _SUBMIT_LEDGER_WINDOW_S
+    ]
+    owed.append(claim)
+    start = min(entry.hooks_cursor for entry in owed)
+    paid: set[str] = set()
+    seen_prompt_ids: set[str] = set()
+    path = bridge_dir / _HOOKS_FILE
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for index, line in enumerate(handle, start=1):
+                if index <= start:
+                    continue
+                try:
+                    envelope = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload = envelope.get("payload") if isinstance(envelope, dict) else None
+                if not isinstance(payload, dict):
+                    continue
+                if payload.get("hook_event_name") != "UserPromptSubmit":
+                    continue
+                transcript_path = payload.get("transcript_path")
+                if isinstance(transcript_path, str) and "/subagents/" in transcript_path:
+                    continue
+                if payload.get("agent_id"):
+                    continue
+                recorded_at = envelope.get("recorded_at")
+                prompt = payload.get("prompt")
+                if (
+                    not isinstance(recorded_at, int | float)
+                    or payload.get("session_id") != claim.session_id
+                    or not isinstance(prompt, str)
+                    or _prompt_key(prompt) != claim.prompt_key
+                    or not _canonical_prompt(prompt)
+                ):
+                    continue
+                prompt_id = payload.get("prompt_id")
+                if isinstance(prompt_id, str) and prompt_id:
+                    if prompt_id in seen_prompt_ids:
+                        continue
+                    seen_prompt_ids.add(prompt_id)
+                for entry in owed:
+                    if (
+                        entry.claim_id not in paid
+                        and index > entry.hooks_cursor
+                        and recorded_at > entry.submitted_after
+                    ):
+                        paid.add(entry.claim_id)
+                        break
+                if claim.claim_id in paid:
+                    return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        _logger.debug("Could not read hook records for submit verification", exc_info=True)
+        return False
+    return False
+
+
 def stop_hook_seen_since(bridge_dir: Path, start_event_count: int) -> bool:
     """
     Return whether Claude reported a stop event after a hook cursor.
@@ -4098,6 +4485,26 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+def advertised_tmux_socket_gone(bridge_dir: Path) -> bool:
+    """
+    Whether the tmux socket advertised for this bridge no longer exists.
+
+    Closing a terminal kills its tmux server and removes the private dir the
+    socket lives in, so a missing socket is positive evidence the pane is gone.
+    An unadvertised or unreadable target is not evidence either way and reads
+    as ``False``.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: ``True`` only when ``tmux.json`` names a socket that is missing.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    if not isinstance(socket_path, str) or not socket_path:
+        return False
+    return not Path(socket_path).exists()
+
+
 @delivery_diagnostics.trace_delivery(
     session_id_reader=read_active_session_id, cancelled_error=ClaudeInjectionCancelled
 )
@@ -4189,6 +4596,7 @@ def inject_user_message(
     # ``/model``, ``/fork``, skills, etc.) pass through unchanged.
     injected_text = _escape_unsupported_slash_command(content)
     needle = _submit_needle(content)
+    tail_needle = _submit_tail_needle(content)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # A leading ``/name`` that is neither allowed nor known-dropped passes
@@ -4207,7 +4615,14 @@ def inject_user_message(
         rejection_baseline = _count_unknown_command_rejections(
             _capture_pane(socket_path, tmux_target), rejection_needle
         )
-    _paste_and_submit(bridge_dir, socket_path, tmux_target, text=injected_text, needle=needle)
+    claim = _paste_and_submit(
+        bridge_dir,
+        socket_path,
+        tmux_target,
+        text=injected_text,
+        needle=needle,
+        tail_needle=tail_needle,
+    )
     if rejection_needle is None:
         return
     if not _unknown_command_rejection_appeared(
@@ -4219,8 +4634,10 @@ def inject_user_message(
         # No rejection: Claude Code accepted the command (a real skill or
         # custom command) and the turn is underway.
         return
-    # Claude Code dropped the message. Re-deliver it escaped so the text
-    # reaches the model as a regular user message instead of vanishing.
+    # Claude Code dropped the message — no UserPromptSubmit fires for it, so its
+    # claim owes nothing. Re-deliver it escaped so the text reaches the model
+    # as a regular user message instead of vanishing.
+    _void_submit_claim(bridge_dir, claim)
     _logger.info(
         "claude-native: Claude Code rejected unknown command /%s; "
         "re-delivering the message escaped as plain text",
@@ -4232,6 +4649,7 @@ def inject_user_message(
         tmux_target,
         text=_escape_slash_command_text(content),
         needle=needle,
+        tail_needle=tail_needle,
     )
 
 
@@ -4242,7 +4660,8 @@ def _paste_and_submit(
     *,
     text: str,
     needle: str,
-) -> None:
+    tail_needle: str = "",
+) -> _SubmitClaim | None:
     r"""
     Deliver *text* into Claude's input box as one paste plus a verified Enter.
 
@@ -4252,13 +4671,26 @@ def _paste_and_submit(
     visibly commit, submit, and verify the draft left the box — re-sending
     Enter while it verifiably hasn't.
 
+    Enter is pressed only once the CURRENT draft has been positively
+    identified in the live composer: the leftover-draft clear is verified
+    empty before the paste (see :func:`_clear_composer_draft`), so whatever
+    text then matches the head or tail needle is this paste. A draft that is
+    never confirmed, or that verifiably sits unaccepted after the submit, is
+    cleared again before raising, so a retry cannot be merged with it.
+
     :param bridge_dir: Bridge directory path (hosts the paste temp file).
     :param socket_path: Absolute path to the tmux socket.
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param text: Exact text to paste (already escaped as needed).
-    :param needle: Draft marker from :func:`_submit_needle`; empty skips
-        draft-visibility verification (blind submit).
-    :returns: None.
+    :param needle: Draft marker from :func:`_submit_needle`. With an empty
+        *tail_needle* too, the draft can only be confirmed as a collapsed
+        paste placeholder; otherwise delivery fails before Enter.
+    :param tail_needle: Draft marker from :func:`_submit_tail_needle`,
+        matched alongside *needle* so a draft whose head scrolled out of the
+        box still confirms. Empty disables it.
+    :returns: The submit ledger claim of the accepted Enter (``None`` when no
+        session was pinned), so a caller that learns the submit was dropped
+        can void it.
     :raises ClaudeUserPromptPending: If a question or permission prompt is
         pending before the submit Enter; the message was not sent.
     :raises RuntimeError: If a ``tmux`` invocation fails, if the draft
@@ -4272,10 +4704,180 @@ def _paste_and_submit(
             "Answer the pending Claude question or permission request before sending a message."
         )
     delivery_diagnostics.set_stage("pasting")
-    # Clear stale text first: raw controls can otherwise become pasted text.
-    # CSI-u sends Ctrl+A/Ctrl+K literally so Claude handles them as keys.
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[97;5u")
-    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[107;5u")
+    _paste_draft(bridge_dir, socket_path, tmux_target, text=text)
+    # Wait until the TUI has visibly committed the paste into its input
+    # box before submitting. Claude Code coalesces rapid stdin bursts
+    # into a paste; an Enter that arrives while it is still consuming
+    # the paste becomes a newline inside the draft instead of a submit,
+    # and the message sits unsent. A fixed sleep raced this (lost under
+    # load / large payloads); polling is deterministic.
+    delivery_diagnostics.set_stage("waiting_for_draft")
+    draft_seen = False
+    repasted = False
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    paste_wait_started = time.monotonic()
+    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
+        # Dialogs first: a draft visible UNDER a stacked dialog is no license to
+        # press Enter — the dialog owns the keyboard and Enter answers it.
+        if _stacked_dialog_headline(pane) is not None:
+            # A dialog opened above the composer after the pre-paste restore
+            # (they appear as a turn ends) and swallowed the paste. Dismiss it
+            # through the same verified-Escape path and paste once more; a
+            # dialog that will not go away is named now instead of costing
+            # the full commit timeout.
+            if not repasted:
+                _restore_occupied_input(socket_path, tmux_target, bridge_dir=bridge_dir)
+            headline = _stacked_dialog_headline(_capture_pane(socket_path, tmux_target))
+            if headline is not None:
+                delivery_diagnostics.record_details(stacked_dialog=True)
+                raise ClaudeTerminalDialog(
+                    f"Claude Code is waiting for an answer in its terminal ({headline}). "
+                    "The message was not delivered."
+                )
+            if not repasted:
+                _paste_draft(bridge_dir, socket_path, tmux_target, text=text)
+                repasted = True
+                delivery_diagnostics.record_details(repasted=True)
+                deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+                continue
+        elif _draft_confirmed(socket_path, tmux_target, pane, needle, tail_needle) is True:
+            draft_seen = True
+            break
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    delivery_diagnostics.record_draft(
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        draft_seen=draft_seen,
+        start=paste_wait_started,
+        polls=polls,
+        empty_captures=empty_captures,
+    )
+    delivery_diagnostics.record_details(tail_needle_available=bool(tail_needle))
+    # Fail BEFORE the submit Enter, never after. The draft was never confirmed
+    # in the box (e.g. an unidentifiable draft whose needle is empty), so its
+    # delivery cannot be verified — and pressing Enter first would submit, and
+    # so possibly execute, the very message this then reports as undelivered.
+    if not draft_seen:
+        _log_unconfirmed_draft(
+            pane,
+            needle=needle,
+            tail_needle=tail_needle,
+            waited_s=time.monotonic() - paste_wait_started,
+            polls=polls,
+        )
+        # Whatever did land stays in the box otherwise, and the next paste is
+        # appended to it — a retry then submits both as one turn.
+        _discard_failed_draft(socket_path, tmux_target)
+        raise RuntimeError(
+            "Claude Code's pasted draft could not be confirmed in the input box. "
+            "The message was not delivered."
+        )
+    time.sleep(_PASTE_SETTLE_S)
+    delivery_diagnostics.set_stage("checking_pending_prompt")
+    if has_pending_user_prompt(bridge_dir):
+        raise ClaudeUserPromptPending(
+            "Claude is waiting for an explicit answer; message not sent."
+        )
+    # Baseline for the delivery signal, captured STRICTLY BEFORE the keystroke:
+    # only a ``UserPromptSubmit`` record appended after this count can be this
+    # submit's. Reading it after the Enter races the hook both ways — a fast
+    # record lands before the baseline and is missed, and a late record from a
+    # previous prompt is counted as ours. It is taken BEFORE the re-validation
+    # below so that nothing — not even this file scan — sits between the last
+    # read of the box and the keystroke.
+    hooks_cursor = count_hook_events(bridge_dir)
+    # The ledger claim for this Enter, also written before the re-validation
+    # (file I/O stays out of the gap before the keystroke). Its session is
+    # snapshotted now, not read back during verification.
+    claim = _new_submit_claim(
+        bridge_dir, prompt=text, hooks_cursor=hooks_cursor, submitted_after=time.time()
+    )
+    # Re-validate right before the keystroke: a dialog can open (they appear as
+    # a turn ends) during the settle and the pending-prompt check above, which
+    # only reads question/permission prompts and passes a stacked dialog
+    # because the composer is still drawn under it. This is the LAST read of
+    # the pane before Enter.
+    delivery_diagnostics.set_stage("revalidating_draft")
+    try:
+        _revalidate_draft_before_enter(
+            socket_path, tmux_target, needle=needle, tail_needle=tail_needle
+        )
+    except BaseException:
+        _void_submit_claim(bridge_dir, claim)  # no Enter was pressed
+        raise
+    delivery_diagnostics.set_stage("submitting")
+    # Wall clock, like the hook's own ``recorded_at``: this prompt's record is
+    # written after this instant. Kept before the keystroke — nothing proves a
+    # genuine hook cannot write before ``send-keys`` returns.
+    if claim is not None:
+        claim = claim._replace(submitted_after=time.time())
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery_diagnostics.record_details(submit_sent=True)
+    # Verify the submit took: a successful Enter clears the input box.
+    # If the draft is still sitting there the Enter was swallowed into
+    # the paste burst as a newline — re-send it (the retry lands well
+    # after the burst, so it submits). Each Enter only fires while the
+    # draft is verifiably still present, so a retry can never hit an
+    # empty prompt or a permission dialog of the started turn.
+    delivery_diagnostics.set_stage("verifying_submit")
+    try:
+        accepted = _verify_submit_accepted(
+            socket_path,
+            tmux_target,
+            needle=needle,
+            tail_needle=tail_needle,
+            what="submitted message",
+            bridge_dir=bridge_dir,
+            hooks_cursor=hooks_cursor,
+            ghost_aware=True,
+            submit_claim=claim,
+        )
+    except ClaudeUserPromptPending as exc:
+        # The Enter already went out, so the prompt may belong to this message's own turn.
+        raise RuntimeError(
+            "Claude is waiting for an explicit answer after the message was submitted; "
+            "it may already have been delivered."
+        ) from exc
+    if accepted:
+        return claim
+    if _discard_unaccepted_draft(socket_path, tmux_target, needle=needle, tail_needle=tail_needle):
+        # The draft was positively found and cleared: this Enter submitted
+        # nothing, so its claim must not absorb a retry's record.
+        _void_submit_claim(bridge_dir, claim)
+    raise RuntimeError(
+        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
+        "(submission could not be confirmed). The message was not delivered."
+    )
+
+
+def _paste_draft(bridge_dir: Path, socket_path: str, tmux_target: str, *, text: str) -> None:
+    """
+    Clear the input box and bracketed-paste *text* into it (no submit).
+
+    :param bridge_dir: Bridge directory path (hosts the paste temp file).
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param text: Exact text to paste (already escaped as needed).
+    :returns: None.
+    :raises RuntimeError: If a ``tmux`` invocation fails, or if the input box
+        could not be verified empty first — nothing was pasted then.
+    """
+    # A leftover draft (the person's, or one an earlier failed delivery left)
+    # would otherwise ride along: the paste is appended to it and the submit
+    # sends both as one turn. Pasting only onto a verifiably empty box is also
+    # what makes any needle match afterwards prove it is THIS paste.
+    if not _clear_composer_draft(socket_path, tmux_target):
+        raise RuntimeError(
+            "Claude Code's input box could not be cleared of an earlier draft before "
+            "pasting. The message was not delivered."
+        )
     # Trailing newline absorbs a trailing "\" so it can't escape the submit Enter.
     # Delivered through a tmux buffer, NOT ``send-keys`` argv: tmux caps one
     # client→server command at ~16KB, so per-byte hex argv blew up with
@@ -4304,80 +4906,6 @@ def _paste_and_submit(
     finally:
         with contextlib.suppress(OSError):
             os.unlink(paste_path)
-    # Wait until the TUI has visibly committed the paste into its input
-    # box before submitting. Claude Code coalesces rapid stdin bursts
-    # into a paste; an Enter that arrives while it is still consuming
-    # the paste becomes a newline inside the draft instead of a submit,
-    # and the message sits unsent. A fixed sleep raced this (lost under
-    # load / large payloads); polling is deterministic. Best-effort:
-    # when the draft never becomes identifiable (e.g. whitespace-only
-    # first line, custom statusline containing the glyph), fall through
-    # after the timeout and submit blind, matching the old behavior.
-    delivery_diagnostics.set_stage("waiting_for_draft")
-    draft_seen = False
-    pane = ""
-    polls = 0
-    empty_captures = 0
-    paste_wait_started = time.monotonic()
-    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
-    while time.monotonic() < deadline:
-        pane = _capture_pane(socket_path, tmux_target)
-        polls += 1
-        empty_captures += not pane.strip()
-        if _draft_in_input_box(pane, needle):
-            draft_seen = True
-            break
-        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    delivery_diagnostics.record_draft(
-        pane=pane,
-        needle=needle,
-        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
-        draft_seen=draft_seen,
-        start=paste_wait_started,
-        polls=polls,
-        empty_captures=empty_captures,
-    )
-    time.sleep(_PASTE_SETTLE_S)
-    delivery_diagnostics.set_stage("checking_pending_prompt")
-    if has_pending_user_prompt(bridge_dir):
-        raise ClaudeUserPromptPending(
-            "Claude is waiting for an explicit answer; message not sent."
-        )
-    delivery_diagnostics.set_stage("submitting")
-    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
-    delivery_diagnostics.record_details(submit_sent=True)
-    if not draft_seen:
-        delivery_diagnostics.record_details(verification="unverified")
-        # The draft was never observed, so its absence proves nothing —
-        # verification would trivially "pass". Submit blind as before.
-        return
-    # Verify the submit took: a successful Enter clears the input box.
-    # If the draft is still sitting there the Enter was swallowed into
-    # the paste burst as a newline — re-send it (the retry lands well
-    # after the burst, so it submits). Each Enter only fires while the
-    # draft is verifiably still present, so a retry can never hit an
-    # empty prompt or a permission dialog of the started turn.
-    delivery_diagnostics.set_stage("verifying_submit")
-    try:
-        accepted = _verify_submit_accepted(
-            socket_path,
-            tmux_target,
-            needle=needle,
-            what="submitted message",
-            bridge_dir=bridge_dir,
-        )
-    except ClaudeUserPromptPending as exc:
-        # The Enter already went out, so the prompt may belong to this message's own turn.
-        raise RuntimeError(
-            "Claude is waiting for an explicit answer after the message was submitted; "
-            "it may already have been delivered."
-        ) from exc
-    if accepted:
-        return
-    raise RuntimeError(
-        f"Claude Code did not accept the submitted message within {_SUBMIT_VERIFY_TIMEOUT_S}s "
-        "(the draft is still in the input box). The message was not delivered."
-    )
 
 
 def _verify_submit_accepted(
@@ -4387,6 +4915,10 @@ def _verify_submit_accepted(
     needle: str,
     what: str,
     bridge_dir: Path | None = None,
+    hooks_cursor: int | None = None,
+    tail_needle: str = "",
+    ghost_aware: bool = False,
+    submit_claim: _SubmitClaim | None = None,
 ) -> bool:
     """
     Wait for a submitted draft to leave the input box, re-sending Enter.
@@ -4405,7 +4937,26 @@ def _verify_submit_accepted(
     :param tmux_target: tmux pane target string, e.g. ``"main"``.
     :param needle: Draft marker from :func:`_submit_needle`.
     :param what: Label for log lines, e.g. ``"submitted message"``.
-    :param bridge_dir: Bridge whose pending questions protect submit retries.
+    :param bridge_dir: Bridge whose pending questions protect submit retries and
+        whose hook records carry Claude Code's own delivery confirmation (see
+        :func:`_submit_reached_claude`). Without one, an ambiguous pane can only
+        be resolved by boxed chrome or by waiting the window out.
+    :param hooks_cursor: ``hooks.jsonl`` record count the caller captured
+        STRICTLY BEFORE the submit keystroke, from :func:`count_hook_events`.
+        Taking it here instead would race the keystroke in both directions — a
+        fast hook would land before the baseline and be missed, and a late hook
+        from a previous prompt would be counted as this submit's. ``None``
+        disables the signal rather than guessing.
+    :param tail_needle: Draft marker from :func:`_submit_tail_needle`. A draft
+        whose head is scrolled out of the box is still present while its tail
+        shows; reading the head alone would call it accepted.
+    :param ghost_aware: Read a plain-text match against the styled capture
+        (:func:`_draft_confirmed`), so a dim suggestion that repeats the
+        message after a successful submit counts as the draft gone, not as
+        the draft still there to re-Enter.
+    :param submit_claim: The submit ledger claim recorded for the (first)
+        Enter, which a ``UserPromptSubmit`` record must pay off to count (see
+        :func:`_submit_reached_claude`); ``None`` disables that signal.
     :returns: ``True`` when the draft left the input box (accepted),
         ``False`` when it is still there after the full window.
     """
@@ -4416,11 +4967,68 @@ def _verify_submit_accepted(
     retries = 0
     polls = 0
     pane = ""
+    last_draft_present: bool | None = None
     while time.monotonic() - start < _SUBMIT_VERIFY_TIMEOUT_S:
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
         pane = _capture_pane(socket_path, tmux_target)
         polls += 1
-        if not _draft_in_input_box(pane, needle):
+        draft_present = (
+            _draft_confirmed(socket_path, tmux_target, pane, needle, tail_needle)
+            if ghost_aware
+            else _draft_in_input_box(pane, needle, tail_needle)
+        )
+        last_draft_present = draft_present
+        if draft_present is None:
+            # ``_draft_in_input_box`` returns None whenever it cannot read the
+            # composer, which has two very different meanings for a submit:
+            #  - a confirm dialog or tool-permission prompt now sits where the
+            #    composer was. That surface only appears once the submit popped
+            #    it, so the draft is gone and the submit landed — count it
+            #    accepted (see inject_slash_command: "the dialog replacing the
+            #    composer counts, since submission pops it"). A permission
+            #    prompt is included: its default answer approves the tool, so an
+            #    Enter must never be sent into it, and treating it as ambiguous
+            #    instead failed a delivered turn after the full window.
+            #    ``_submit_popped_surface`` requires the composer to be gone (a
+            #    live composer with the draft is vetoed by the tri-state ``True``
+            #    case above) and matches only boxed dialog chrome.
+            #  - a torn or not-yet-rendered capture. Its absence proves
+            #    nothing, so keep waiting without re-sending Enter rather than
+            #    mistaking the ambiguity for acceptance.
+            #  - Claude's question/selection surface, which draws NO box chrome,
+            #    so the scan above cannot see it. A turn that immediately asks a
+            #    question landed just as surely as one that pops a permission
+            #    box, and failing to say so burned the whole window and then
+            #    raised "the message was not delivered" on a delivered turn.
+            #    Nothing about how that surface LOOKS is consulted, though: its
+            #    chrome is plain text an assistant can print, and a false accept
+            #    is worse than this bug because it drops a message in silence.
+            #    The landing is read from Claude Code itself instead — its
+            #    ``UserPromptSubmit`` hook, which fires when a prompt reaches it
+            #    and therefore before any question that prompt raises.
+            popped = _submit_popped_surface(pane)
+            if popped or _submit_reached_claude(bridge_dir, hooks_cursor, claim=submit_claim):
+                delivery_diagnostics.record_verification(
+                    draft_still_present=False,
+                    pane=pane,
+                    needle=needle,
+                    prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+                    start=start,
+                    retries=retries,
+                    polls=polls,
+                )
+                delivery_diagnostics.record_details(
+                    verification="popped_surface" if popped else "prompt_hook_recorded"
+                )
+                if warned:
+                    _logger.info(
+                        "claude-native: %s accepted after %.1fs of an unresponsive TUI",
+                        what,
+                        time.monotonic() - start,
+                    )
+                return True
+            continue
+        if draft_present is False:
             delivery_diagnostics.record_verification(
                 draft_still_present=False,
                 pane=pane,
@@ -4449,13 +5057,26 @@ def _verify_submit_accepted(
             )
         if now - last_enter >= retry_interval:
             _raise_if_user_prompt_pending(bridge_dir, pane)
+            # Decide the retry on a fresh frame, read AFTER the pending-prompt
+            # check: a dialog that opened since ``pane`` was captured owns the
+            # keyboard and a retry Enter would answer it.
+            fresh = _capture_pane(socket_path, tmux_target)
+            if _stacked_dialog_headline(fresh) is not None:
+                continue
+            still_there = (
+                _draft_confirmed(socket_path, tmux_target, fresh, needle, tail_needle)
+                if ghost_aware
+                else _draft_in_input_box(fresh, needle, tail_needle)
+            )
+            if still_there is not True:
+                continue
             _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
             retries += 1
             delivery_diagnostics.record_details(retries=retries)
             last_enter = now
             retry_interval = min(retry_interval * 2, _SUBMIT_RETRY_MAX_INTERVAL_S)
     delivery_diagnostics.record_verification(
-        draft_still_present=True,
+        draft_still_present=last_draft_present is True,
         pane=pane,
         needle=needle,
         prompt_glyph=_CLAUDE_PROMPT_GLYPH,
@@ -4463,6 +5084,10 @@ def _verify_submit_accepted(
         retries=retries,
         polls=polls,
     )
+    if last_draft_present is None:
+        # The window closed on an unreadable composer with no delivery record
+        # from Claude Code: neither "still present" nor "absent" is known.
+        delivery_diagnostics.record_details(verification="inconclusive_capture")
     return False
 
 
@@ -4700,6 +5325,12 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    # Captured before the keystroke, for the same reason as in
+    # :func:`inject_user_message`.
+    hooks_cursor = count_hook_events(bridge_dir)
+    claim = _new_submit_claim(
+        bridge_dir, prompt=command, hooks_cursor=hooks_cursor, submitted_after=time.time()
+    )
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
@@ -4710,6 +5341,8 @@ def inject_slash_command(
             needle=needle,
             what="slash command",
             bridge_dir=bridge_dir,
+            hooks_cursor=hooks_cursor,
+            submit_claim=claim,
         ):
             raise RuntimeError(
                 f"Claude Code did not accept the slash command within "
@@ -5395,12 +6028,37 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
         back whole.
     :returns: The pane's visible text, or ``""`` if capture failed.
     """
+    return _tmux_capture(socket_path, tmux_target, *(["-J"] if join_wrapped else []))
+
+
+def _capture_pane_styled(socket_path: str, tmux_target: str) -> str:
+    """
+    Capture the visible pane with its SGR styling (``capture-pane -e``).
+
+    Used only to tell a dim placeholder from real draft text (see
+    :func:`_composer_ghost_signature`); never raises, like
+    :func:`_capture_pane`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: The pane's visible text with escapes, or ``""`` on failure.
+    """
+    return _tmux_capture(socket_path, tmux_target, "-e")
+
+
+def _tmux_capture(socket_path: str, tmux_target: str, *flags: str) -> str:
+    """
+    Run ``tmux capture-pane -p`` with extra *flags*; ``""`` on any failure.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param flags: Extra ``capture-pane`` flags, e.g. ``"-J"``.
+    :returns: The captured text, or ``""``.
+    """
     import subprocess
 
     _check_injection_cancelled()
-    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p"]
-    if join_wrapped:
-        args.append("-J")
+    args = ["tmux", "-S", socket_path, "capture-pane", "-t", tmux_target, "-p", *flags]
     try:
         proc = subprocess.run(
             args,
@@ -5412,6 +6070,79 @@ def _capture_pane(socket_path: str, tmux_target: str, *, join_wrapped: bool = Fa
     except (subprocess.SubprocessError, OSError):
         return ""
     return proc.stdout if proc.returncode == 0 else ""
+
+
+class _PaneCursor(NamedTuple):
+    """Where the pane's terminal cursor is drawn, with the pane's height."""
+
+    # Cells from the pane's left edge and rows from its top.
+    x: int
+    y: int
+    pane_height: int
+
+
+def _capture_pane_with_cursor(
+    socket_path: str, tmux_target: str, *, styled: bool = False
+) -> tuple[str, _PaneCursor | None]:
+    """
+    Capture the visible pane and read its terminal cursor in one command sequence.
+
+    Claude Code with its native cursor (``tengu_native_cursor``, see
+    :data:`_GHOST_PROBE_CHAR`) moves the terminal's own cursor to its caret,
+    so tmux knows where the caret is even though no caret cell is drawn:
+    ``#{cursor_x}``/``#{cursor_y}`` count cells from the pane's top-left (the
+    row is the capture's line index), and ``#{cursor_flag}`` says whether the
+    cursor is shown at all. Measured on 2.1.280: in an empty box the cursor
+    sits on the placeholder's first cell. Both are served by one
+    ``display-message ; capture-pane`` sequence, back to back, so the cursor
+    describes the frame it comes with. The answer is the first line of the
+    output; only exactly four integers with the cursor shown count
+    (``display-message`` prints its errors there too). Never raises, like
+    :func:`_capture_pane`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param styled: Keep SGR escapes (``capture-pane -e``).
+    :returns: The frame (``""`` when the capture failed) and the cursor with
+        the pane's height, or ``None`` when the cursor is hidden or unreadable.
+    """
+    import subprocess
+
+    _check_injection_cancelled()
+    args = [
+        "tmux",
+        "-S",
+        socket_path,
+        "display-message",
+        "-p",
+        "-t",
+        tmux_target,
+        "#{cursor_x} #{cursor_y} #{cursor_flag} #{pane_height}",
+        ";",
+        "capture-pane",
+        "-t",
+        tmux_target,
+        "-p",
+        *(["-e"] if styled else []),
+    ]
+    try:
+        proc = subprocess.run(
+            args,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_SEND_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return "", None
+    if proc.returncode != 0:
+        return "", None
+    answer, _, frame = proc.stdout.partition("\n")
+    fields = answer.split()
+    if len(fields) != 4 or not all(f.isdigit() for f in fields):
+        return frame, None
+    x, y, shown, height = (int(f) for f in fields)
+    return frame, _PaneCursor(x, y, height) if shown == 1 else None
 
 
 class _ClaudePaneState(NamedTuple):
@@ -5804,6 +6535,12 @@ def _occupying_surface(pane: str) -> str | None:
     row = _composer_row(pane)
     if row is None:
         return _OVERLAY_SURFACE
+    # A dialog stacked above the composer owns the keyboard even though the
+    # box is rendered; its footer names Escape as the non-committal way out
+    # (for the auto-mode setup prompt, Escape is "Not now").
+    headline = _stacked_dialog_headline(pane)
+    if headline is not None:
+        return f"a dialog above the input box ({headline})"
     if row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return None
     return "shell mode"
@@ -5847,6 +6584,104 @@ def _composer_row(pane: str) -> str | None:
         if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
             return row
     return None
+
+
+def _submit_reached_claude(
+    bridge_dir: Path | None,
+    hooks_cursor: int | None,
+    *,
+    claim: _SubmitClaim | None = None,
+) -> bool:
+    """
+    Report whether Claude Code itself recorded the prompt this submit sent.
+
+    This is the ONLY positive acceptance signal for an unreadable pane besides
+    boxed chrome, and it is deliberately the only one: it is the single piece of
+    evidence here that pane text cannot produce. ``UserPromptSubmit`` is written
+    to ``hooks.jsonl`` by a hook subprocess Claude Code executes, out-of-band
+    from anything drawn in the terminal (see
+    :func:`_user_prompt_reached_claude_since`).
+
+    An earlier revision also accepted "a permission hook is parked on a verdict
+    right now, and the pane shows a selection surface". That was unsound with no
+    adversary in sight: when Claude is already parked on a QUESTION from a
+    previous prompt, a draft sent into that surface is swallowed — genuinely not
+    delivered — while the marker is fresh and the surface is on screen, so a
+    dropped message was reported as delivered. The marker only ever proved that
+    Claude is waiting, never that THIS submit is why. It is gone; nothing
+    replaced it, because the target case does not need it: the message lands, so
+    ``UserPromptSubmit`` fires, so *delivered* is true on its own.
+
+    :param bridge_dir: Bridge directory, or ``None`` when the caller has none —
+        there is no out-of-band channel then, so this is ``False``.
+    :param hooks_cursor: ``hooks.jsonl`` record count captured strictly BEFORE
+        the submit keystroke, or ``None`` when the caller did not capture one.
+        Without a baseline taken before the keystroke this signal is unsound in
+        both directions (a previous prompt's record would count as ours, and a
+        fast record would be missed), so ``None`` is ``False`` rather than a
+        guess.
+    :param claim: The submit ledger claim recorded for this Enter (its prompt,
+        pre-Enter session snapshot, cursor and time); ``None`` disables the
+        signal — an uncorrelatable record is never evidence.
+    :returns: ``True`` when a correlated parent-process ``UserPromptSubmit``
+        record paid off this claim (see
+        :func:`_user_prompt_reached_claude_since`).
+    """
+    if bridge_dir is None or hooks_cursor is None or claim is None:
+        return False
+    return _user_prompt_reached_claude_since(bridge_dir, claim)
+
+
+def _submit_popped_surface(pane: str) -> bool:
+    """
+    Return whether a submit popped a boxed dialog/permission over the composer.
+
+    A submitted turn can immediately replace the composer with the
+    switch/effort confirmation or a tool-permission prompt; that surface
+    appearing is proof the draft left the box. This is what a submit-
+    verification loop treats as acceptance (and it must NOT press Enter into
+    such a surface — its default answer commits something unasked-for).
+
+    The genuine "draft still present" veto is enforced by the composer region,
+    not by scanning the whole pane for the draft text:
+
+    - A live composer row means the active bottom region IS the input box, so
+      this returns not-popped; its draft is then handled by the tri-state
+      :func:`_draft_in_input_box` (``True`` -> the caller keeps retrying, never
+      accepting). A whole-pane needle scan was wrong here: the submitted text
+      also appears *inside* a permission box (the command being approved) and in
+      transcript echoes of the just-sent message, so it vetoed real, successful
+      submits that popped a permission surface.
+
+    Only past that gate is the surface's own chrome consulted — the boxed
+    confirm/permission title on a vertical-rule (``│``) row. The interactive
+    ``/model`` picker footer is deliberately NOT detected: its footer is plain
+    text a prose how-to can forge, upstream drives model switching through the
+    non-interactive ``/model <id>`` command rather than the picker, and box
+    chrome is far harder to fake.
+
+    The unboxed question/selection surface is NOT accepted here either, for the
+    same reason: its chrome is plain text too. A submit that pops one is
+    accepted on :func:`_submit_reached_claude` instead — evidence Claude Code
+    produced off-screen — never on how that surface looks.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when a recognized boxed surface has replaced the composer.
+    """
+    # A live composer means the active region is the input box — not a popped
+    # overlay — and its draft (if any) is vetoed by the tri-state in the caller.
+    if _composer_row(pane) is not None:
+        return False
+    # Boxed confirm dialog / tool-permission prompt: title on a bordered row.
+    for raw in pane.splitlines():
+        stripped = raw.strip()
+        if (
+            stripped[:1]
+            and stripped[0] in _VERTICAL_RULE_GLYPHS
+            and any(hint in stripped for hint in _BOXED_DIALOG_HINTS)
+        ):
+            return True
+    return False
 
 
 def _claude_prompt_rendered(pane: str) -> bool:
@@ -5985,32 +6820,1194 @@ def _submit_needle(content: str) -> str:
     return ""
 
 
-def _draft_in_input_box(pane: str, needle: str) -> bool:
-    """
-    Return whether the pasted draft is visible in Claude's input box.
+def _submit_tail_needle(content: str) -> str:
+    r"""
+    Derive a marker from the END of *content* to spot a scrolled draft.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
+    Claude Code keeps the end of a long draft in view and scrolls its head
+    out of the box (omnigent-ai/omnigent#9026), so the head needle from
+    :func:`_submit_needle` can be off-screen while this one shows. The marker
+    is whitespace-folded — line breaks and wrap points vanish, matching how
+    :func:`_draft_in_input_box` folds the composer — and keeps the last
+    :data:`_DRAFT_TAIL_NEEDLE_MAX_CHARS` characters. Control characters the
+    paste payload drops (:func:`_paste_payload_bytes`) are skipped; a tab or
+    DEL, which the TUI renders its own way, ends the marker once it has
+    started (trailing whitespace, tabs included, is never part of it).
+
+    :param content: Raw user text, e.g. ``"fix the bug\nin foo.py"``.
+    :returns: The folded marker, e.g. ``"theauthflow"`` for
+        ``"…fix the auth flow"`` (whole content when shorter). Empty when no
+        visible character follows the last tab/DEL.
+    """
+    normalized = content.replace("\r\n", "\n").replace("\r", "\n")
+    kept: list[str] = []
+    for ch in reversed(normalized):
+        if len(kept) >= _DRAFT_TAIL_NEEDLE_MAX_CHARS or (kept and ch in "\t\x7f"):
+            break
+        if ch.isspace() or ord(ch) < 0x20 or ch == "\x7f":
+            continue
+        kept.append(ch)
+    return "".join(reversed(kept))
+
+
+def _composer_span(lines: list[str]) -> tuple[int, int] | None:
+    """
+    Locate the live composer within a pane's non-blank lines.
+
+    :param lines: The pane's non-blank lines, in order.
+    :returns: ``(start, end)`` — the index of the ``❯`` row under the opening
+        rule and the index of the closing rule (``len(lines)`` when it is
+        below the pane) — or ``None`` when no such row exists.
+    """
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    # The composer is always the last framed box at the bottom of the pane.
+    # Check the last rule first; fall back to the second-to-last rule when
+    # the last rule's row is the footer (e.g. a continuation-line composer
+    # where the row after the closing rule is the footer, not the composer).
+    candidates: list[int] = []
+    if rules:
+        candidates.append(rules[-1] + 1)
+    if len(rules) >= 2:
+        candidates.append(rules[-2] + 1)
+    for start in candidates:
+        if start >= len(lines) or not lines[start].strip().startswith(_CLAUDE_PROMPT_GLYPH):
+            continue
+        return start, next((i for i in rules if i > start), len(lines))
+    return None
+
+
+def _live_composer_body(pane: str) -> tuple[str, bool] | None:
+    """
+    Return the text inside the live chat composer and whether it is closed.
+
+    Only the framed box counts — never scrollback, transcript echoes or an
+    overlay — so a needle matched against this body proves the text is in
+    the box Enter would submit.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :param needle: Marker from :func:`_submit_needle`, e.g.
-        ``"fix the bug"``. Empty means the draft can't be identified;
-        only the paste placeholder is then considered.
-    :returns: ``True`` when the draft is still sitting in the input box.
+    :returns: ``(body, closed)``: the draft text after the ``❯`` glyph across
+        all of the box's rows, and whether the box's closing rule is on
+        screen (without it, more draft may be below the pane). ``None`` when
+        no chat composer is rendered.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
-        return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
-    if _PASTED_PLACEHOLDER_PREFIX in tail:
+    # Only the absence of a rendered composer makes the draft's state
+    # unknowable here. A confirm dialog / model picker / permission prompt that
+    # replaced the composer already trips this (no composer row renders), and
+    # anchoring on the composer this way is what keeps ordinary text — a pasted
+    # ``"Explain Switch model?"`` draft, or a hint echoed in the transcript —
+    # from being read as an active dialog while the composer is plainly up. A
+    # bare whole-pane substring check returned None for such a draft, so the
+    # verifier then called the still-present, unsent draft delivered.
+    if not _claude_prompt_rendered(pane):
+        return None
+    lines = [line for line in pane.splitlines() if line.strip()]
+    span = _composer_span(lines)
+    if span is None:
+        return None
+    start, end = span
+    row = lines[start].strip()
+    body = "\n".join([row.removeprefix(_CLAUDE_PROMPT_GLYPH), *lines[start + 1 : end]])
+    return body, end < len(lines)
+
+
+def _draft_in_input_box(pane: str, needle: str, tail_needle: str = "") -> bool | None:
+    """Locate the draft in the framed composer, including continuation rows.
+
+    The draft counts as present when the box shows a collapsed-paste
+    placeholder, the head *needle*, or the *tail_needle* — the tail is what
+    remains visible once a long draft scrolls its head out of the box.
+
+    Return None when the capture cannot establish whether the draft remains.
+    """
+    composer = _live_composer_body(pane)
+    if composer is None:
+        return None
+    body, closed = composer
+    if _PASTED_PLACEHOLDER_PREFIX in body:
         return True
-    return bool(needle) and needle in tail
+    # Folding whitespace also handles terminal wrapping within the needle.
+    folded_body = "".join(body.split())
+    for marker in (needle, tail_needle):
+        folded = "".join(marker.split())
+        if folded and folded in folded_body:
+            return True
+    # A closing rule after the composer rows means the draft is definitively
+    # absent (not ambiguous). Without one, the rest may be below the pane.
+    return False if closed else None
+
+
+def _composer_is_empty(pane: str) -> bool | None:
+    """
+    Report whether the live chat composer is structurally empty.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when the framed box is fully on screen and holds no
+        text after the ``❯`` glyph, ``False`` when it holds any, ``None`` when
+        no chat composer is readable or its closing rule is off-screen.
+    """
+    composer = _live_composer_body(pane)
+    if composer is None or not composer[1]:
+        return None
+    return not composer[0].split()
+
+
+# One escape sequence in a ``capture-pane -e`` line: a CSI (SGR when it ends in
+# ``m``) or an OSC such as a hyperlink.
+_CAPTURE_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")
+
+
+def _styled_cells(line: str) -> list[tuple[str, bool, bool]]:
+    """
+    Split one ``capture-pane -e`` line into ``(char, dim, inverse)`` cells.
+
+    :param line: A captured line with SGR escapes, e.g.
+        ``"❯ \x1b[7mT\x1b[27m\x1b[2mry…"``.
+    :returns: One tuple per printed character.
+    """
+    cells: list[tuple[str, bool, bool]] = []
+    dim = inverse = False
+    pos = 0
+    for match in _CAPTURE_ESCAPE_RE.finditer(line):
+        cells.extend((ch, dim, inverse) for ch in line[pos : match.start()])
+        pos = match.end()
+        seq = match.group()
+        if not (seq.startswith("\x1b[") and seq.endswith("m")):
+            continue
+        params = seq[2:-1].split(";")
+        idx = 0
+        while idx < len(params):
+            code = params[idx].split(":")[0]
+            if code in ("", "0"):
+                dim = inverse = False
+            elif code == "2":
+                dim = True
+            elif code == "22":
+                dim = False
+            elif code == "7":
+                inverse = True
+            elif code == "27":
+                inverse = False
+            elif code in ("38", "48", "58") and ":" not in params[idx]:
+                mode = params[idx + 1] if idx + 1 < len(params) else ""
+                idx += 2 if mode == "5" else 4 if mode == "2" else 0
+            idx += 1
+    cells.extend((ch, dim, inverse) for ch in line[pos:])
+    return cells
+
+
+class _StyledComposer(NamedTuple):
+    """The live chat composer read from a ``capture-pane -e`` capture."""
+
+    # ``(char, dim, inverse)`` for every cell after the ``❯`` glyph, rows
+    # joined by an unstyled ``"\n"`` cell.
+    cells: list[tuple[str, bool, bool]]
+    # Whether the box's closing rule is on screen.
+    closed: bool
+
+
+def _strip_capture_escapes(styled_pane: str) -> str:
+    """
+    Drop the escape sequences from a ``capture-pane -e`` capture.
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :returns: The plain text, as :func:`_capture_pane` would have read it.
+    """
+    return _CAPTURE_ESCAPE_RE.sub("", styled_pane)
+
+
+def _styled_composer(styled_pane: str) -> _StyledComposer | None:
+    """
+    Locate the live chat composer in a styled capture, keeping cell styles.
+
+    Located exactly as :func:`_live_composer_body` locates it in plain text.
+
+    :param styled_pane: Pane captured with SGR escapes
+        (:func:`_capture_pane_styled`).
+    :returns: The composer's cells and whether it is closed, or ``None`` when
+        no chat composer is rendered.
+    """
+    rows = [
+        cells
+        for cells in map(_styled_cells, styled_pane.splitlines())
+        if "".join(ch for ch, _, _ in cells).strip()
+    ]
+    plain = ["".join(ch for ch, _, _ in cells) for cells in rows]
+    if not _claude_prompt_rendered("\n".join(plain)):
+        return None
+    span = _composer_span(plain)
+    if span is None:
+        return None
+    start, end = span
+    glyph_at = plain[start].index(_CLAUDE_PROMPT_GLYPH)
+    cells = list(rows[start][glyph_at + 1 :])
+    for row in rows[start + 1 : end]:
+        cells.append(("\n", False, False))
+        cells.extend(row)
+    return _StyledComposer(cells, end < len(plain))
+
+
+def _ghost_signature(composer: _StyledComposer) -> str | None:
+    """
+    Classify a composer whose only text may be Claude Code's ghost placeholder.
+
+    Claude Code 2.1.280 draws a placeholder — a prompt suggestion, the
+    ``Try "…"`` hint — only while the draft is EMPTY, in one of exactly two
+    ways (both captured live): ``"focused"``, an inverse-video first cell
+    (the caret, at position 0 of an empty draft) followed by dim text;
+    ``"unfocused"``, all-dim text with no caret cell. Typed and pasted text is
+    never dim, focused or not, and a collapsed ``[Pasted text …]`` badge is
+    real draft content in any styling.
+
+    Only ``"focused"`` is evidence of an empty box. ``"unfocused"`` is a
+    candidate: all-dim text without a caret is also what a dimmed real draft
+    would look like (scrolled, it can even look unchanged after ``C-u``), so
+    callers resolve it — with a focus-in event (:func:`_resolved_styled_capture`)
+    or, before a paste, a typed probe (:func:`_probe_ghost_candidate`) — and
+    fail closed while it stays unresolved. With Claude Code's native cursor
+    (``tengu_native_cursor``) no caret cell is ever drawn, so a placeholder
+    is ``"unfocused"`` whatever the focus.
+
+    :param composer: The styled composer.
+    :returns: ``"focused"`` or ``"unfocused"`` for a matching closed box,
+        else ``None`` (draft content, or not a fully visible box).
+    """
+    if not composer.closed:
+        return None
+    text = "".join(ch for ch, _, _ in composer.cells)
+    if _PASTED_PLACEHOLDER_PREFIX in text:
+        return None
+    visible = [idx for idx, (ch, _, _) in enumerate(composer.cells) if not ch.isspace()]
+    if len(visible) < 2:
+        return None
+    first = composer.cells[visible[0]]
+    rest = [composer.cells[idx] for idx in visible[1:]]
+    if not all(dim and not inverse for _, dim, inverse in rest):
+        return None
+    # Any other inverse cell is a real cursor somewhere in real text.
+    if any(inverse for idx, (_, _, inverse) in enumerate(composer.cells) if idx != visible[0]):
+        return None
+    if first[2] and not first[1]:
+        return "focused"
+    if first[1] and not first[2]:
+        return "unfocused"
+    return None
+
+
+def _composer_ghost_signature(styled_pane: str) -> str | None:
+    """
+    Classify a styled capture's composer as a ghost placeholder, if it is one.
+
+    :param styled_pane: Pane captured with SGR escapes
+        (:func:`_capture_pane_styled`).
+    :returns: See :func:`_ghost_signature`; ``None`` when no box is readable.
+    """
+    composer = _styled_composer(styled_pane)
+    return None if composer is None else _ghost_signature(composer)
+
+
+def _draft_in_styled_input_box(
+    styled_pane: str, needle: str, tail_needle: str = ""
+) -> bool | None:
+    """
+    Locate the draft in a styled capture, ignoring ghost placeholder text.
+
+    Like :func:`_draft_in_input_box`, but dim cells never count toward a
+    needle match — Claude Code never dims draft text, so a dim suggestion
+    that repeats the message's words cannot confirm it. Only the focused ghost
+    rendering reads as an empty box; all-dim text the box cannot classify
+    (an unresolved ``"unfocused"`` candidate, or dim text beside a caret) is
+    unknowable, never "draft absent" — a verifier would otherwise call a
+    still-present draft accepted.
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :param needle: Head marker from :func:`_submit_needle`.
+    :param tail_needle: Tail marker from :func:`_submit_tail_needle`.
+    :returns: ``True`` when real draft text matches (or a collapsed-paste
+        badge shows), ``False`` when the closed box holds no match and no
+        unclassifiable dim text, ``None`` otherwise.
+    """
+    composer = _styled_composer(styled_pane)
+    if composer is None:
+        return None
+    signature = _ghost_signature(composer)
+    if signature == "unfocused":
+        return None
+    if signature is None:
+        real = "".join(ch for ch, dim, _ in composer.cells if not dim)
+        if _PASTED_PLACEHOLDER_PREFIX in real:
+            return True
+        folded_body = "".join(real.split())
+        for marker in (needle, tail_needle):
+            folded = "".join(marker.split())
+            if folded and folded in folded_body:
+                return True
+        if any(dim and not ch.isspace() for ch, dim, _ in composer.cells):
+            return None
+    return False if composer.closed else None
+
+
+def _send_focus_in(socket_path: str, tmux_target: str) -> None:
+    """
+    Tell Claude Code its terminal has focus (a focus-in event, ``ESC [ I``).
+
+    Measured on 2.1.280 with omnigent's tmux options (``focus-events on``):
+    a pane with no attached client is UNFOCUSED by default, so its ghost
+    placeholder renders all-dim. The focus-in event is not text — it inserts
+    nothing and leaves a draft untouched — and makes the box draw its caret:
+    a ghost then takes the verified focused rendering, while real text shows
+    the caret where the cursor is. Best effort: a tmux error leaves the box
+    unresolved, which every caller treats as unknown.
+
+    Side effect on an attached human: Claude Code then believes its terminal
+    is focused until that client's next real focus change, which only affects
+    how the caret and the placeholder are drawn — no input is consumed.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: None.
+    """
+    try:
+        _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, "\x1b[I")
+    except ClaudeInjectionCancelled:
+        raise
+    except RuntimeError as exc:
+        _logger.warning("claude-native: could not send a focus-in event: %s", exc)
+
+
+def _resolved_styled_capture(socket_path: str, tmux_target: str) -> str:
+    """
+    Take a styled capture, resolving an all-dim box with a focus-in event.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: A styled capture. When the first read is an ``"unfocused"``
+        candidate (and no dialog is up), a focus-in is sent and the box is
+        re-read until it draws something else, for at most
+        :data:`_FOCUS_IN_SETTLE_TIMEOUT_S` of redraw wait — plus the time of
+        the captures themselves, each bounded by tmux's own subprocess
+        timeout (:data:`_TMUX_SEND_TIMEOUT_S`). A box still all-dim after that
+        is returned as is.
+    """
+    styled = _capture_pane_styled(socket_path, tmux_target)
+    if _composer_ghost_signature(styled) != "unfocused" or (
+        _stacked_dialog_headline(_strip_capture_escapes(styled)) is not None
+    ):
+        return styled
+    # Re-check on a fresh frame immediately before sending: the event goes to
+    # whatever owns the keyboard, and a dialog may have opened since.
+    if _stacked_dialog_headline(_capture_pane(socket_path, tmux_target)) is not None:
+        return styled
+    _send_focus_in(socket_path, tmux_target)
+    deadline = time.monotonic() + _FOCUS_IN_SETTLE_TIMEOUT_S
+    while True:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        styled = _capture_pane_styled(socket_path, tmux_target)
+        if _composer_ghost_signature(styled) != "unfocused" or time.monotonic() >= deadline:
+            return styled
+
+
+def _draft_confirmed(
+    socket_path: str, tmux_target: str, pane: str, needle: str, tail_needle: str = ""
+) -> bool | None:
+    """
+    Decide whether the current draft is in the live composer, ghost-aware.
+
+    A plain-text match (:func:`_draft_in_input_box`) is only a candidate: the
+    same words can be Claude's dim prompt suggestion in an EMPTY box. So a
+    match is re-read from a styled capture (:func:`_draft_in_styled_input_box`)
+    and must hold there too, with no stacked dialog over the box.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param pane: Plain capture just taken by the caller.
+    :param needle: Head marker from :func:`_submit_needle`.
+    :param tail_needle: Tail marker from :func:`_submit_tail_needle`.
+    :returns: ``True`` only when real draft text matched in both captures;
+        ``False`` when the draft is verifiably absent (a ghost included);
+        ``None`` when unknowable — including a failed styled capture, which
+        never confirms.
+    """
+    plain = _draft_in_input_box(pane, needle, tail_needle)
+    if plain is not True:
+        return plain
+    styled = _resolved_styled_capture(socket_path, tmux_target)
+    if _stacked_dialog_headline(_strip_capture_escapes(styled)) is not None:
+        return None
+    return _draft_in_styled_input_box(styled, needle, tail_needle)
+
+
+def _revalidate_draft_before_enter(
+    socket_path: str, tmux_target: str, *, needle: str, tail_needle: str
+) -> None:
+    """
+    Re-confirm the draft immediately before the submit Enter.
+
+    Waits through unreadable captures for up to
+    :data:`_PRE_SUBMIT_REVALIDATE_TIMEOUT_S`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param needle: Head marker from :func:`_submit_needle`.
+    :param tail_needle: Tail marker from :func:`_submit_tail_needle`.
+    :returns: None once the draft is positively in the box and no dialog is up.
+    :raises ClaudeTerminalDialog: If a stacked dialog now owns the keyboard;
+        nothing was sent (keys would answer it, so the draft is left for the
+        next delivery's verified clear).
+    :raises RuntimeError: If the draft is no longer positively identified;
+        it is discarded (when identifiable) and nothing was sent.
+    """
+    deadline = time.monotonic() + _PRE_SUBMIT_REVALIDATE_TIMEOUT_S
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        headline = _stacked_dialog_headline(pane)
+        if headline is not None:
+            delivery_diagnostics.record_details(stacked_dialog=True)
+            raise ClaudeTerminalDialog(
+                f"Claude Code opened a dialog in its terminal ({headline}) before the "
+                "message was submitted. The message was not delivered."
+            )
+        confirmed = _draft_confirmed(socket_path, tmux_target, pane, needle, tail_needle)
+        if confirmed is True:
+            return
+        if confirmed is False or time.monotonic() >= deadline:
+            _log_unconfirmed_draft(
+                pane,
+                needle=needle,
+                tail_needle=tail_needle,
+                waited_s=_PRE_SUBMIT_REVALIDATE_TIMEOUT_S,
+                polls=0,
+            )
+            _discard_failed_draft(socket_path, tmux_target)
+            raise RuntimeError(
+                "Claude Code's pasted draft could not be confirmed in the input box. "
+                "The message was not delivered."
+            )
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _discard_unaccepted_draft(
+    socket_path: str, tmux_target: str, *, needle: str, tail_needle: str
+) -> bool:
+    """
+    After a failed submit verification, clear the draft once it is identified.
+
+    A single capture is not enough: a torn one skipped the cleanup and left
+    the stale draft for the next delivery to be merged with. This waits
+    through unreadable captures and dialogs for up to
+    :data:`_FAILED_SUBMIT_CLEANUP_TIMEOUT_S`, and sends keys only once the
+    draft is positively in the box (an absent draft needs nothing).
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param needle: Head marker from :func:`_submit_needle`.
+    :param tail_needle: Tail marker from :func:`_submit_tail_needle`.
+    :returns: ``True`` only when the draft was positively identified and the
+        box then verified empty — proof the submit never happened. Never
+        raises a tmux error (see :func:`_discard_failed_draft`).
+    """
+    deadline = time.monotonic() + _FAILED_SUBMIT_CLEANUP_TIMEOUT_S
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        if _stacked_dialog_headline(pane) is None:
+            present = _draft_confirmed(socket_path, tmux_target, pane, needle, tail_needle)
+            if present is True:
+                return _discard_failed_draft(socket_path, tmux_target)
+            if present is False:
+                return False
+        if time.monotonic() >= deadline:
+            _logger.warning(
+                "claude-native: the unaccepted draft could not be identified for cleanup "
+                "within %.0fs; it may still be in the input box",
+                _FAILED_SUBMIT_CLEANUP_TIMEOUT_S,
+            )
+            return False
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _cell_width(text: str) -> int:
+    """
+    Count the terminal cells *text* occupies.
+
+    :param text: Rendered text, e.g. ``"❯ fix it"`` or ``"修正"``.
+    :returns: Cells used: two per wide (East Asian ``W``/``F``) character, none
+        per combining mark, one per other character.
+    """
+    return sum(
+        0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+        for ch in text
+    )
+
+
+class _ComposerBox(NamedTuple):
+    """The live composer's rows between its rules, located in a capture."""
+
+    # Index of the ``❯`` row among the capture's lines (the pane's rows).
+    first_row: int
+    # The box's rows, escapes stripped, the ``❯`` row first.
+    rows: tuple[str, ...]
+    # Width of the closing rule, in cells.
+    width: int
+
+
+def _composer_box(styled_pane: str) -> _ComposerBox | None:
+    """
+    Locate the live composer's rows and its width in a capture.
+
+    :param styled_pane: Pane captured with SGR escapes (plain text works too).
+    :returns: The last ``❯`` row drawn directly under a box rule, every row
+        below it up to the closing rule, and that rule's width; ``None`` when
+        no ``❯`` row sits under a rule or no closing rule follows it.
+    """
+    lines = _strip_capture_escapes(styled_pane).splitlines()
+    starts = [
+        idx
+        for idx in range(1, len(lines))
+        if _is_box_rule(lines[idx - 1]) and lines[idx].strip().startswith(_CLAUDE_PROMPT_GLYPH)
+    ]
+    if not starts:
+        return None
+    first = starts[-1]
+    end = next((idx for idx in range(first + 1, len(lines)) if _is_box_rule(lines[idx])), None)
+    if end is None:
+        return None
+    return _ComposerBox(first, tuple(lines[first:end]), _cell_width(lines[end].rstrip()))
+
+
+def _single_row_box(styled_pane: str) -> tuple[int, int] | None:
+    """
+    Measure the live composer when it is exactly one row.
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :returns: ``(row_cells, box_cells)`` — the cells the ``❯`` row uses (glyph
+        and indent included, trailing blanks not) and the width of its closing
+        rule — when the ``❯`` row sits directly between the box's opening and
+        closing rules; else ``None``. A blank draft row is a row: it keeps the
+        closing rule off the ``❯`` row.
+    """
+    box = _composer_box(styled_pane)
+    if box is None or len(box.rows) != 1:
+        return None
+    return _cell_width(box.rows[0].rstrip()), box.width
+
+
+def _cursor_at_draft_start(styled_pane: str, cursor: _PaneCursor | None) -> bool:
+    """
+    Report whether the terminal cursor sits on the box's first draft cell.
+
+    That cell is the one right after the ``❯`` glyph and its one spacing cell
+    on the box's first row, and it must hold a non-space character. A probe
+    typed there is INSERTED before that character, on the caret's own row,
+    so — provided the box is showing the whole draft, which
+    :func:`_probe_can_prove` requires of it — it can never show alone beside
+    a draft: on a real draft it lands beside the draft's text, and only an
+    empty box, whose placeholder it replaces, shows it alone. The box then needs no
+    free cells on the row and may be taller than one row. A blank caret row
+    (a draft starting with a newline, the caret at its start) or leading
+    spaces (the caret after them, where the probe could push the first
+    character onto the next row) are not probed: there the probe could sit
+    on a row of its own. Claude Code's native cursor parks the terminal
+    cursor exactly on that cell in an empty box
+    (:func:`_capture_pane_with_cursor`).
+
+    :param styled_pane: Pane captured with SGR escapes (plain text works too).
+    :param cursor: The cursor read with that frame, or ``None``.
+    :returns: ``True`` only when a composer box is located, the cell after
+        the glyph's spacing holds a non-space character, and *cursor* is that
+        cell.
+    """
+    if cursor is None:
+        return False
+    box = _composer_box(styled_pane)
+    if box is None:
+        return False
+    row = box.rows[0]
+    after_glyph = row.index(_CLAUDE_PROMPT_GLYPH) + len(_CLAUDE_PROMPT_GLYPH)
+    first_cell = after_glyph + 1
+    if len(row) <= first_cell or not row[after_glyph].isspace() or row[first_cell].isspace():
+        return False
+    return (cursor.x, cursor.y) == (_cell_width(row[:first_cell]), box.first_row)
+
+
+def _probe_can_prove(styled_pane: str, cursor: _PaneCursor | None = None) -> bool:
+    """
+    Report whether a probe shown alone in this all-dim box would prove it empty.
+
+    The box is a viewport scrolled to the draft's end. A one-row box
+    (:func:`_single_row_box`) whose row leaves
+    :data:`_GHOST_PROBE_ROW_SLACK_CELLS` free keeps a probe appended to a
+    hidden draft on the draft's own last row, beside its text. A taller box,
+    a blank draft row or a full row can hide a draft the probe would not
+    touch — unless the terminal cursor is on the draft's first cell
+    (:func:`_cursor_at_draft_start`) of a box showing the whole draft, where
+    the probe is inserted ahead of any draft text and so never shows alone
+    beside a draft. A phone-width pane, whose suggestion fills its row, is
+    proven that way. Anything else is cleared with ``C-u`` instead.
+
+    The cursor rule also needs the box to be showing the whole draft, so that
+    no draft row is scrolled out of it: a pane of at least
+    :data:`_GHOST_PROBE_CURSOR_MIN_PANE_ROWS` rows and a box of at most
+    :data:`_GHOST_PROBE_CURSOR_MAX_BOX_ROWS` rows (measured: such a box is
+    below the TUI's cap, so a draft with more rows would be showing more).
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :param cursor: The terminal cursor read with the frame
+        (:func:`_capture_pane_with_cursor`); ``None`` when unknown.
+    :returns: ``True`` for an ``"unfocused"`` box that a probe can prove.
+    """
+    if _composer_ghost_signature(styled_pane) != "unfocused":
+        return False
+    box = _single_row_box(styled_pane)
+    if box is not None and box[0] + _GHOST_PROBE_ROW_SLACK_CELLS <= box[1]:
+        return True
+    whole = _composer_box(styled_pane)
+    if (
+        cursor is None
+        or whole is None
+        or cursor.pane_height < _GHOST_PROBE_CURSOR_MIN_PANE_ROWS
+        or len(whole.rows) > _GHOST_PROBE_CURSOR_MAX_BOX_ROWS
+    ):
+        return False
+    return _cursor_at_draft_start(styled_pane, cursor)
+
+
+def _composer_holds_only(styled_pane: str, char: str) -> bool:
+    """
+    Report whether the live composer shows just the single *char*, on one row.
+
+    This is what the box shows, not proof of the whole draft: the box is a
+    viewport scrolled to the draft's end, and a one-row box can hide draft rows
+    above the one it shows. :func:`_probe_ghost_candidate` decides when it
+    proves an empty draft.
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :param char: The one character expected, e.g. ``"x"``.
+    :returns: ``True`` only when the box is fully on screen, its sole visible
+        cell is *char* drawn as real (non-dim) text, and the ``❯`` row is its
+        only row (:func:`_single_row_box`).
+    """
+    composer = _styled_composer(styled_pane)
+    if composer is None or not composer.closed:
+        return False
+    visible = [(ch, dim) for ch, dim, _ in composer.cells if not ch.isspace()]
+    if visible != [(char, False)]:
+        return False
+    # Blank rows are skipped when the box is located, so a probe typed above
+    # empty draft lines would otherwise read as the probe alone.
+    return _single_row_box(styled_pane) is not None
+
+
+def _await_styled_frame(
+    socket_path: str, tmux_target: str, accept: Callable[[str], bool]
+) -> tuple[bool, str, _PaneCursor | None]:
+    """
+    Re-read the pane until *accept* holds, for :data:`_GHOST_PROBE_SETTLE_TIMEOUT_S`.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param accept: Predicate over a styled capture.
+    :returns: Whether a frame was accepted, the last styled frame read, and
+        the cursor read with it (:func:`_capture_pane_with_cursor`).
+    """
+    deadline = time.monotonic() + _GHOST_PROBE_SETTLE_TIMEOUT_S
+    while True:
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+        styled, cursor = _capture_pane_with_cursor(socket_path, tmux_target, styled=True)
+        if accept(styled):
+            return True, styled, cursor
+        if time.monotonic() >= deadline:
+            return False, styled, cursor
+
+
+def _probe_before_caret(
+    styled_pane: str, cursor: _PaneCursor | None, probe_x: int, folded_before: str
+) -> bool:
+    """
+    Report positive evidence that the probe is the cell right before the caret.
+
+    Screen coordinates alone do not identify the probe once the viewport has
+    scrolled (a draft's own ``x`` on another row can sit at the same cell), so
+    the box must also still show exactly what it showed before the probe,
+    with the probe inserted ahead of it: the composer's text, whitespace
+    folded, is the probe followed by *folded_before*. A short viewport that
+    wrapped a full row's last character away fails this and keeps the probe;
+    that is the price of never deleting a character of the draft (a draft
+    that repeats its own head after an ``x``, with the caret moved there in
+    the probe's few milliseconds, is the one shape this cannot tell apart).
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :param cursor: The cursor read with that frame, or ``None``.
+    :param probe_x: The cell the probe was typed at.
+    :param folded_before: The composer's text before the probe, whitespace
+        folded (see :func:`_probe_ghost_candidate`).
+    :returns: ``True`` only when a composer box is located, no dialog is
+        stacked above it, the caret is on the box's first row one cell past
+        *probe_x*, that cell holds :data:`_GHOST_PROBE_CHAR` drawn as real
+        (non-dim) text, and the text that follows it is what was there. A
+        torn frame, a dialog, a caret moved elsewhere, a scrolled box, or a
+        probe already gone all fail.
+    """
+    if cursor is None or _stacked_dialog_headline(_strip_capture_escapes(styled_pane)) is not None:
+        return False
+    box = _composer_box(styled_pane)
+    if box is None or (cursor.x, cursor.y) != (probe_x + 1, box.first_row):
+        return False
+    composer = _styled_composer(styled_pane)
+    if composer is None:
+        return False
+    folded = "".join("".join(ch for ch, _, _ in composer.cells).split())
+    if folded != _GHOST_PROBE_CHAR + folded_before:
+        return False
+    lines = styled_pane.splitlines()
+    if box.first_row >= len(lines):
+        return False
+    col = 0
+    for ch, dim, _ in _styled_cells(lines[box.first_row]):
+        if col == probe_x:
+            return ch == _GHOST_PROBE_CHAR and not dim
+        col += _cell_width(ch)
+    return False
+
+
+class _ProbeResult(NamedTuple):
+    """What :func:`_probe_ghost_candidate` found."""
+
+    # ``True``: the box was proven to hold no draft and is empty again.
+    # ``False``: the box now holds draft content the caller must clear.
+    # ``None``: unresolved (no key sent, or the box never settled).
+    outcome: bool | None
+    # The last styled frame read after the probe (``""`` when no key was sent).
+    frame: str
+    # The clear must be given up: the probe got in on the cursor alone and
+    # found a draft with the caret at its start, the pane changed size under
+    # it, or the box never settled, so no later frame of this box can be
+    # trusted to be empty. The probe itself has been removed again where it
+    # was verifiably the cell before the caret.
+    refuse: bool = False
+
+
+def _probe_ghost_candidate(socket_path: str, tmux_target: str) -> _ProbeResult:
+    """
+    Prove that an all-dim box holds no draft, by typing over its placeholder.
+
+    Typed text replaces a prompt suggestion, but is inserted into a real draft.
+    So one :data:`_GHOST_PROBE_CHAR` shown alone (:func:`_composer_holds_only`)
+    means the draft held nothing else — provided no draft can hide outside the
+    box. The box is a viewport scrolled to the draft's end, so the probe is
+    only typed into a box it can prove (:func:`_probe_can_prove`): one row
+    with room for the probe, or the terminal cursor on the draft's first cell,
+    so a probe typed into a draft lands beside its text and never shows alone.
+    The box must also keep its width (a resize re-wraps the draft). ``BSpace``
+    then removes the probe, decided on a frame that still shows the box
+    holding just the probe under no dialog; the box must come back bare or
+    with the same placeholder text it showed before (Claude Code redraws its
+    suggestion; the paste replaces it). Nothing about the dim text itself is
+    judged, so a dim real draft cannot pass: the probe joins it, and the
+    caller clears both with ``C-u``.
+
+    When only the cursor allows the probe, more is at stake, and once the
+    probe is typed anything short of proof gives the clear up
+    (:attr:`_ProbeResult.refuse`) rather than leaving the box to ``C-u``: a
+    draft with the caret at its start is not cleared by ``C-u`` (it kills
+    backwards), and a pane that changes height under the probe can show the
+    probe alone above a draft's blank first row, then that blank row — which
+    reads as an empty box, as it would after ``C-u`` removed only the probe.
+    So the pane's height must hold on the frame that shows the probe alone,
+    on the one before ``BSpace`` and on the one after; the caret must sit
+    right after the probe shown alone, and back on the draft's first cell
+    once the placeholder is back (deleting a draft character that sat alone
+    on a wrapped row leaves the caret at the end of the row before it
+    instead, measured on 2.1.280); after ``BSpace`` the placeholder must come
+    back, never a bare box; and a box that never settles (torn frames) is
+    given up too. Giving up, the probe is removed
+    again with one ``BSpace`` only on positive evidence that it is the cell
+    right before the caret with the box otherwise as it was
+    (:func:`_probe_before_caret`), waited for briefly, and never once a
+    ``BSpace`` has gone out; a caret moved elsewhere, a dialog, or an
+    unreadable box leaves the probe in the draft, where the person can see
+    it, rather than risk deleting a character of theirs.
+
+    Each key is decided on a fresh frame with no stacked dialog (keys typed
+    into one would answer it), read together with the cursor it is judged by.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: See :class:`_ProbeResult`. The outcome is ``None`` when no key
+        was sent (the fresh frame is not a box a probe can prove, or a dialog
+        is up), the probe never rendered, a dialog opened before ``BSpace``,
+        or the box never came back as it was.
+    :raises RuntimeError: If a ``tmux send-keys`` invocation fails.
+    """
+    styled_before, cursor_before = _capture_pane_with_cursor(socket_path, tmux_target, styled=True)
+    composer_before = _styled_composer(styled_before)
+    box_before = _composer_box(styled_before)
+    if (
+        composer_before is None
+        or box_before is None
+        or not _probe_can_prove(styled_before, cursor_before)
+    ):
+        return _ProbeResult(None, "")
+    # Whether the cursor, not the row's room, is what lets the probe prove
+    # anything: then where it lands is re-decided with the frame it lands on.
+    by_cursor = not _probe_can_prove(styled_before)
+    folded_before = "".join("".join(ch for ch, _, _ in composer_before.cells).split())
+    fresh, cursor = _capture_pane_with_cursor(socket_path, tmux_target)
+    if _composer_is_empty(fresh) is not False or _stacked_dialog_headline(fresh) is not None:
+        return _ProbeResult(None, "")
+    if by_cursor and (
+        cursor is None
+        or cursor_before is None
+        or cursor.pane_height != cursor_before.pane_height
+        or not _cursor_at_draft_start(fresh, cursor)
+    ):
+        return _ProbeResult(None, "")
+
+    def _height_held(cursor: _PaneCursor | None) -> bool:
+        return not by_cursor or (
+            cursor is not None
+            and cursor_before is not None
+            and cursor.pane_height == cursor_before.pane_height
+        )
+
+    probe_x = cursor.x if cursor is not None else None
+
+    def _caret_at(
+        cursor: _PaneCursor | None, x: int | None, offset: int, box: _ComposerBox | None
+    ) -> bool:
+        # The caret is *offset* cells past *x* on the box's first row.
+        return (
+            cursor is not None
+            and x is not None
+            and box is not None
+            and (cursor.x, cursor.y) == (x + offset, box.first_row)
+        )
+
+    def _give_up(frame: str, *, cleanup: bool = True) -> _ProbeResult:
+        # Remove the probe only where it verifiably is (``_probe_before_caret``),
+        # and only if no BSpace went out already: a delayed one would make a
+        # second delete a character of the person's.
+        if cleanup:
+            _, styled, cursor = _await_styled_frame(
+                socket_path, tmux_target, lambda styled: _composer_box(styled) is not None
+            )
+            if probe_x is not None and _probe_before_caret(styled, cursor, probe_x, folded_before):
+                _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BSpace")
+        return _ProbeResult(False, frame, refuse=True)
+
+    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _GHOST_PROBE_CHAR)
+
+    def _probe_landed(styled: str) -> bool:
+        if _composer_holds_only(styled, _GHOST_PROBE_CHAR):
+            return True
+        # Beside other text, the probe shows as real text in a changed box. A
+        # box that is all dim, bare, or merely redrawn has not shown it yet.
+        composer = _styled_composer(styled)
+        if composer is None or not any(
+            not dim and not ch.isspace() for ch, dim, _ in composer.cells
+        ):
+            return False
+        folded = "".join("".join(ch for ch, _, _ in composer.cells).split())
+        return folded != folded_before
+
+    landed, frame, cursor = _await_styled_frame(socket_path, tmux_target, _probe_landed)
+    if not landed:
+        return _give_up(frame) if by_cursor else _ProbeResult(None, frame)
+    if not _composer_holds_only(frame, _GHOST_PROBE_CHAR):
+        # A real draft (the probe beside its text). At the caret's start, C-u
+        # would not clear it.
+        return _give_up(frame) if by_cursor else _ProbeResult(False, frame)
+    box_after = _composer_box(frame)
+    if box_after is None or box_after.width != box_before.width or not _height_held(cursor):
+        # The pane was resized under the probe: a re-wrapped draft could be
+        # scrolled out of the box, or a shorter box show the probe alone above
+        # a draft's blank first row. Draft content until cleared.
+        return _give_up(frame) if by_cursor else _ProbeResult(False, frame)
+    if by_cursor and not _caret_at(cursor, probe_x, 1, box_after):
+        # The probe shows alone but the caret is not right after it on the
+        # box's first row: a box scrolled elsewhere (End pressed) can show a
+        # lone character of the draft's own instead.
+        return _give_up(frame)
+    # The BSpace needs the same positive evidence on the frame it lands on: a
+    # readable box still holding just the probe, with no dialog above it. A
+    # torn frame proves nothing about who owns the keyboard.
+    styled, cursor = _capture_pane_with_cursor(socket_path, tmux_target, styled=True)
+    if _stacked_dialog_headline(_strip_capture_escapes(styled)) is not None or not (
+        _composer_holds_only(styled, _GHOST_PROBE_CHAR)
+    ):
+        return _give_up(frame) if by_cursor else _ProbeResult(None, frame)
+    if not _height_held(cursor):
+        return _give_up(frame)
+    _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BSpace")
+
+    def _probe_gone(styled: str) -> bool:
+        # The draft was exactly the probe, so once it is deleted the box is
+        # bare or shows the same placeholder again (in either styling: neither
+        # signature admits the probe). Anything else stays unresolved. By the
+        # cursor alone, only the placeholder counts: a bare row could be a
+        # draft's blank first row with the rest scrolled out of a shrunk box.
+        if not by_cursor and _composer_is_empty(_strip_capture_escapes(styled)) is True:
+            return True
+        composer = _styled_composer(styled)
+        if composer is None or _ghost_signature(composer) is None:
+            return False
+        return "".join("".join(ch for ch, _, _ in composer.cells).split()) == folded_before
+
+    gone, after, cursor = _await_styled_frame(socket_path, tmux_target, _probe_gone)
+    if by_cursor and not (
+        gone and _height_held(cursor) and _caret_at(cursor, probe_x, 0, _composer_box(after))
+    ):
+        # Measured on 2.1.280: deleting the probe puts the caret back on the
+        # placeholder's first cell. Deleting a draft character that sat alone
+        # on a wrapped row leaves the caret at the END of the row before it
+        # (col 78 of an 80-column pane), so a repeated dim row there cannot
+        # pass as the placeholder come back.
+        return _give_up(after, cleanup=False)
+    return _ProbeResult(True if gone else None, after)
+
+
+def _composer_frame_summary(styled_pane: str) -> str:
+    """
+    Describe a styled frame's composer without any of its text.
+
+    :param styled_pane: Pane captured with SGR escapes.
+    :returns: E.g. ``"1 rows, 49 visible chars (49 dim), closed, ghost
+        signature unfocused"``, or ``"no input box"``.
+    """
+    composer = _styled_composer(styled_pane)
+    if composer is None:
+        return "no input box"
+    rows = 1 + sum(ch == "\n" for ch, _, _ in composer.cells)
+    dims = [dim for ch, dim, _ in composer.cells if not ch.isspace()]
+    return (
+        f"{rows} rows, {len(dims)} visible chars ({sum(dims)} dim), "
+        f"{'closed' if composer.closed else 'open-ended'}, "
+        f"ghost signature {_ghost_signature(composer)}"
+    )
+
+
+def _log_uncleared_composer(
+    socket_path: str, tmux_target: str, frames: list[tuple[str, str]]
+) -> None:
+    """
+    Log the frames of a box that could not be cleared.
+
+    The final frame is read here; when it is an all-dim box with no dialog,
+    a focus-in event is sent and the redrawn frame logged too, so the log
+    shows whether the TUI draws a caret at all. Each frame's shape goes to
+    INFO (:func:`_composer_frame_summary`: counts and styling, no text); its
+    styled rows, which can hold the person's draft, go to DEBUG only, capped
+    at :data:`_CLEAR_FAILURE_LOG_FRAME_LINES` rows and
+    :data:`_CLEAR_FAILURE_LOG_FRAME_CHARS` characters.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :param frames: ``(label, styled capture)`` pairs read during the clear.
+    :returns: None.
+    """
+    last = _capture_pane_styled(socket_path, tmux_target)
+    frames = [*frames, ("last", last)]
+    if _composer_ghost_signature(last) == "unfocused" and (
+        _stacked_dialog_headline(_capture_pane(socket_path, tmux_target)) is None
+    ):
+        _send_focus_in(socket_path, tmux_target)
+        _, after, _ = _await_styled_frame(
+            socket_path,
+            tmux_target,
+            lambda styled: _composer_ghost_signature(styled) != "unfocused",
+        )
+        frames.append(("after focus-in", after))
+    for label, styled in frames:
+        _logger.info(
+            "claude-native: uncleared input box, %s frame: %s",
+            label,
+            _composer_frame_summary(styled),
+        )
+        region = "\n".join(styled.rstrip("\n").splitlines()[-_CLEAR_FAILURE_LOG_FRAME_LINES:])
+        if len(region) > _CLEAR_FAILURE_LOG_FRAME_CHARS:
+            region = "…" + region[-_CLEAR_FAILURE_LOG_FRAME_CHARS:]
+        _logger.debug("claude-native: uncleared input box, %s frame (styled): %r", label, region)
+
+
+def _clear_composer_draft(socket_path: str, tmux_target: str) -> bool:
+    """
+    Empty Claude Code's whole input box and verify it is empty.
+
+    ``C-u`` goes in small bursts (see :data:`_COMPOSER_CLEAR_KEYS_PER_BURST`),
+    each decided on a fresh read: only while the live chat composer verifiably
+    holds text and no dialog stacked above it owns the keyboard. The box is
+    re-read between bursts until it is structurally empty. An already-empty
+    box gets no keystroke at all.
+
+    A ghost placeholder counts as empty in its focused rendering (see
+    :func:`_ghost_signature`). An all-dim box — an unfocused placeholder, the
+    only rendering a native-cursor TUI ever draws, or a dimmed real draft —
+    is never judged by its looks. It counts as empty only once a probe
+    (:func:`_probe_ghost_candidate`) proves no draft was there, and is only
+    probed where a probe can prove that (:func:`_probe_can_prove`: one row
+    with room, or the terminal cursor on the draft's first cell); a taller or
+    full box otherwise may hide a scrolled draft and is cleared with ``C-u``.
+    A draft the probe exposes is cleared with ``C-u`` too, after
+    which one more probe may prove the redrawn suggestion (at most
+    :data:`_GHOST_PROBE_MAX_ATTEMPTS` + 1 probes per clear) — unless the
+    probe got in on the cursor alone, where a draft found, or a pane resized
+    under the probe, ends the clear at once (:attr:`_ProbeResult.refuse`).
+    Anything else is cleared like any draft, and the paste abandoned if it
+    never goes. Every key is decided on a frame read immediately before it,
+    so a dialog that opened meanwhile gets none.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: ``True`` once the box was seen empty; ``False`` when it could
+        not be shown empty within :data:`_COMPOSER_CLEAR_TIMEOUT_S` or
+        :data:`_COMPOSER_CLEAR_MAX_KEYS` presses (the frames read are then
+        logged, see :func:`_log_uncleared_composer`). Callers must then not
+        paste or submit.
+    :raises RuntimeError: If a ``tmux send-keys`` invocation fails.
+    """
+    start = time.monotonic()
+    sent = 0
+    probes = 0
+    probe_limit = _GHOST_PROBE_MAX_ATTEMPTS
+    # C-u presses sent when a probe exposed a draft, until one more probe is
+    # allowed for the suggestion redrawn once that draft is gone (only once).
+    draft_found_at: int | None = None
+    reprobe_allowed = True
+    last_burst: float | None = None
+    frames: list[tuple[str, str]] = []
+    while True:
+        pane = _capture_pane(socket_path, tmux_target)
+        empty = _composer_is_empty(pane)
+        now = time.monotonic()
+        settled = last_burst is None or now - last_burst >= _COMPOSER_CLEAR_SETTLE_S
+        if draft_found_at is not None and sent > draft_found_at:
+            probe_limit = probes + 1
+            draft_found_at = None
+        if empty is False and _stacked_dialog_headline(pane) is None:
+            styled, cursor = _capture_pane_with_cursor(socket_path, tmux_target, styled=True)
+            if not frames:
+                frames.append(("first", styled))
+            signature = _composer_ghost_signature(styled)
+            if signature == "focused":
+                empty = True
+            elif (
+                signature == "unfocused"
+                and settled
+                and probes < probe_limit
+                and _probe_can_prove(styled, cursor)
+            ):
+                probes += 1
+                outcome, frame, refuse = _probe_ghost_candidate(socket_path, tmux_target)
+                if frame:
+                    frames.append((f"probe {probes}", frame))
+                if outcome is True:
+                    return True
+                if refuse:
+                    # Found on the cursor alone: a draft with the caret at its
+                    # start, which C-u does not clear, or a pane resized under
+                    # the probe, after which a bare row may be a draft's blank
+                    # first row. No later frame of this box is proof of
+                    # emptiness, so the paste is refused here.
+                    _logger.warning(
+                        "claude-native: input box holds a draft with the caret at its start, "
+                        "or was resized under the probe, after %d C-u presses and %d probes; "
+                        "it cannot be verified empty from here",
+                        sent,
+                        probes,
+                    )
+                    _log_uncleared_composer(socket_path, tmux_target, frames)
+                    return False
+                if outcome is False:
+                    # Draft content (the probe joined it, or the pane was
+                    # resized under it): clear it with C-u, and probe no more
+                    # before that.
+                    probe_limit = probes
+                    if reprobe_allowed:
+                        draft_found_at = sent
+                        reprobe_allowed = False
+                # Whatever the probe left is draft text now; re-read the box.
+                continue
+        if empty:
+            return True
+        if now - start >= _COMPOSER_CLEAR_TIMEOUT_S or (
+            sent >= _COMPOSER_CLEAR_MAX_KEYS and settled
+        ):
+            _logger.warning(
+                "claude-native: input box not verified empty after %.1fs, %d C-u presses "
+                "and %d probes (composer %s)",
+                now - start,
+                sent,
+                probes,
+                "unreadable" if empty is None else "still holds text",
+            )
+            _log_uncleared_composer(socket_path, tmux_target, frames)
+            return False
+        if empty is False and settled and sent < _COMPOSER_CLEAR_MAX_KEYS:
+            # Re-read right before the burst: the keys must land on the frame
+            # they were decided on, not on a dialog that opened since.
+            fresh = _capture_pane(socket_path, tmux_target)
+            if _composer_is_empty(fresh) is False and _stacked_dialog_headline(fresh) is None:
+                _run_tmux(
+                    socket_path,
+                    "send-keys",
+                    "-t",
+                    tmux_target,
+                    *(["C-u"] * _COMPOSER_CLEAR_KEYS_PER_BURST),
+                )
+                sent += _COMPOSER_CLEAR_KEYS_PER_BURST
+                last_burst = now
+        time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+
+
+def _discard_failed_draft(socket_path: str, tmux_target: str) -> bool:
+    """
+    Clear an undelivered draft on a failure path, without masking that failure.
+
+    :param socket_path: Absolute path to the tmux socket.
+    :param tmux_target: tmux pane target string, e.g. ``"main"``.
+    :returns: Whether the box was verified empty afterwards. A tmux error is
+        logged, not raised, so the caller's own "not delivered" error still
+        surfaces; cancellation still propagates.
+    """
+    try:
+        cleared = _clear_composer_draft(socket_path, tmux_target)
+    except ClaudeInjectionCancelled:
+        raise
+    except RuntimeError as exc:
+        _logger.warning("claude-native: could not clear the undelivered draft: %s", exc)
+        return False
+    if not cleared:
+        _logger.warning("claude-native: the undelivered draft may still be in the input box")
+    return cleared
+
+
+def _log_unconfirmed_draft(
+    pane: str, *, needle: str, tail_needle: str, waited_s: float, polls: int
+) -> None:
+    """
+    Log why a pasted draft was not confirmed, keeping message text out of WARNING.
+
+    :param pane: The last capture taken while waiting for the draft.
+    :param needle: Head marker tried, from :func:`_submit_needle`.
+    :param tail_needle: Tail marker tried, from :func:`_submit_tail_needle`.
+    :param waited_s: Seconds spent waiting.
+    :param polls: Captures taken.
+    :returns: None.
+    """
+    composer = _live_composer_body(pane)
+    _logger.warning(
+        "claude-native: pasted draft not confirmed in the input box after %.1fs "
+        "(%d polls; head needle %d chars, tail needle %d chars; composer %s)",
+        waited_s,
+        polls,
+        len(needle),
+        len(tail_needle),
+        "unreadable" if composer is None else "closed" if composer[1] else "open-ended",
+    )
+    _logger.debug(
+        "claude-native: unconfirmed draft needles head=%r tail=%r; capture tail:\n%s",
+        needle,
+        tail_needle,
+        pane.rstrip()[-_DRAFT_FAILURE_LOG_TAIL_CHARS:],
+    )
 
 
 def _format_terminal_failure_tail(pane: str) -> str:
@@ -6070,6 +8067,57 @@ def _terminal_dialog_headline(pane: str) -> str | None:
         line.strip().lstrip("│ ").startswith(_CLAUDE_PROMPT_GLYPH) for line in region
     )
     if not has_selector and "press enter" not in footer.lower():
+        return None
+    return " ".join(region[0].strip().strip("│").split())[:120]
+
+
+def _stacked_dialog_headline(pane: str) -> str | None:
+    """
+    Name a selection dialog stacked above a live composer, or ``None``.
+
+    :func:`_terminal_dialog_headline` covers dialogs drawn *instead of* the
+    input box. Some open *above* it while the composer stays rendered — the
+    "Teach auto mode about your environment?" prompt Claude Code 2.1.280
+    shows as a turn ends — yet still own the keyboard, so a pasted message
+    is swallowed by the dialog and the composer stays empty. Every structural
+    check still passes (the composer row is there), which is why delivery
+    used to wait out the paste-commit timeout instead of seeing the dialog.
+
+    The read is structural and deliberately narrow, because the answer draws
+    an Escape: the region between the composer's opening rule and the rule
+    above it must be short (:data:`_STACKED_DIALOG_MAX_LINES`), hold a
+    numbered ``❯ 1.`` option row, and END with an "Enter to … · Esc to
+    cancel/exit" footer directly on the composer's rule. Transcript text
+    echoing such a dialog never ends flush against the composer frame with
+    a numbered selector inside one short framed region.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The dialog's first line, e.g.
+        ``"Teach auto mode about your environment?"``, or ``None``.
+    """
+    if not pane.strip():
+        return None
+    lines = [line for line in pane.splitlines() if line.strip()]
+    rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
+    opening = next(
+        (
+            r
+            for r in (rules[-2:] if len(rules) >= 2 else rules)
+            if r + 1 < len(lines) and lines[r + 1].strip().startswith(_CLAUDE_PROMPT_GLYPH)
+        ),
+        None,
+    )
+    if opening is None:
+        return None
+    above = [r for r in rules if r < opening]
+    if not above:
+        return None
+    region = lines[above[-1] + 1 : opening]
+    if not region or len(region) > _STACKED_DIALOG_MAX_LINES:
+        return None
+    if not _STACKED_DIALOG_FOOTER_RE.search(region[-1].strip()):
+        return None
+    if not any(_STACKED_DIALOG_OPTION_RE.match(line) for line in region):
         return None
     return " ".join(region[0].strip().strip("│").split())[:120]
 

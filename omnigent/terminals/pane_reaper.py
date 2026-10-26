@@ -8,22 +8,55 @@ panes have no idle reaper, so on a shared/multi-conversation runner memory grows
 without bound as idle conversations accumulate, independent of how many are
 actually active (#1349).
 
-This reaps a single native pane only when it is genuinely unused. "Busy" is the
-disjunction of three signals (any one spares the pane):
+This reaps a single native pane only when it is genuinely unused. "Busy" is a
+disjunction of signals wired by ``create_runner_app``, evaluated in this order
+(the first that fires spares the pane; cheap in-process checks run before any
+that shell out to tmux or read ``/proc``):
 
-  * an in-flight runner turn (``has_active_turn``), OR
-  * the pane's PTY watcher currently reports ``running`` — i.e. the vendor CLI is
-    working autonomously *between* runner turns (native turns clear the runner's
-    ``_active_turns`` right after the prompt is pasted, so this is the load-bearing
-    signal for a long autonomous turn), OR
-  * a human recently drove an attached viewer — a keypress on a tmux client, or
-    any event on the web attach bridge. An idle attached viewer alone does not
-    count, else a tab left open overnight pins the pane (and its MCP fleet).
+  1. an in-flight runner turn (``_active_turns`` / ``has_active_turn``), OR
+  2. the session's last recorded status is ``running`` (not consulted for codex,
+     whose local status goes stale) — fed both by the in-runner pane watcher and,
+     since #8058, by forwarder ``external_session_status`` edges. Native turns
+     clear ``_active_turns`` right after the prompt is pasted, so this is the
+     load-bearing signal for a long autonomous turn, OR
+  3. a fresh approval-wait marker (a pane parked on a permission prompt), OR
+  4. the harness stream made progress recently
+     (:mod:`omnigent.terminals.pane_progress`; stamped once per new byte by the
+     qwen forwarder), OR
+  5. a human recently drove an attached viewer (#8320) — a keypress on a regular
+     tmux client (``client_activity``), or any event on the web attach bridge.
+     An attached viewer that is merely *present* does NOT count, else a tab left
+     open overnight pins the pane (and its MCP fleet) until the host OOMs, OR
+  6. codex only: the AUTHORITATIVE server status is ``running``/``waiting``.
+     Any other confirmed status is a final idle verdict that skips signals 7 and
+     8 (an idle codex TUI can spin its terminal title forever, which tmux counts
+     as window activity). A failed status check is *unknown*, OR
+  7. the pane's tmux window emitted output recently, OR
+  8. the pane's own process subtree has descendants averaging >= 5% of a core
+     across two scans (:mod:`omnigent.terminals.pane_cpu`).
 
-A pane idle on all three for longer than the window is reaped, with a **second
-busy re-check immediately before teardown** to close the select→reap race. The
-tmux client probe is a blocking ``subprocess`` call, so it runs off the event
-loop via ``asyncio.to_thread``.
+Signal 8 exists because every other one is *output-shaped*: they all ask "did
+something appear recently?". A worker blocked inside one long silent child
+process (``mypy .``, a migration, a full test run) produces nothing to see and
+was being reaped while perfectly healthy. It measures the pane's process tree,
+never tmux clients, so an attached-but-idle viewer cannot satisfy it either.
+
+Recency windows: signals 4 and 7 use ``resolve_pane_output_busy_window_s``
+(``OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S``, default 120s); signal 5 always uses the
+fixed :data:`PANE_OUTPUT_BUSY_WINDOW_S`, so widening the knob cannot extend how
+long an idle viewer is honoured. Signals 4 and 8 fail safe to busy (logged) if
+their evidence-gathering raises.
+
+The predicate is tri-state: busy, idle, or unknown (``None``). An unknown scan
+leaves the pane's last-confirmed-busy time untouched and never reaps, so a
+transient status-check failure neither costs a full idle window nor tears down a
+pane whose liveness could not be confirmed.
+
+A pane idle on every signal for longer than the idle window (20 min by default)
+is reaped, with a **second busy re-check immediately before teardown** to close
+the select→reap race. The tmux probes are blocking ``subprocess`` calls and the
+CPU probe reads ``/proc``, so they run off the event loop via
+``asyncio.to_thread``.
 
 Teardown is **pane-scoped** (``reap`` closes only the one native terminal, not
 the conversation's other terminals), leaving the session's primary OSEnv +
@@ -48,8 +81,11 @@ _logger = logging.getLogger(__name__)
 # recently counts as busy. tmux's own clocks are evidence independent of the
 # harness status pipeline, whose silent stall must not get a live, producing
 # terminal reaped. Two reaper scan intervals, so activity between scans re-arms
-# the idle clock.
+# the idle clock. For the output-shaped signals this is the DEFAULT, which
+# ``resolve_pane_output_busy_window_s`` lets the env override; the viewer-input
+# signal always uses this fixed value.
 PANE_OUTPUT_BUSY_WINDOW_S = 120.0
+_OUTPUT_BUSY_WINDOW_ENV = "OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S"
 
 # Native CLI panes are keyed (conversation_id, <harness short name>, "main") in
 # the terminal registry. These short names match the ``terminal_name`` the
@@ -76,9 +112,13 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
     }
 )
 
-# Default idle window before an unused native pane is reaped. Mirrors
-# ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
-_DEFAULT_IDLE_TIMEOUT_S = 60 * 60
+# Default idle window before an unused native pane is reaped. Shortened from
+# the 1-hour HarnessProcessManager default to 20 min for the swapless dev box:
+# a 60-min window let bursty fan-out pile ~1GB/tree resident to OOM. The
+# OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S env var still overrides, but env
+# propagation across the zygote spawn paths proved unreliable, so the safe
+# window lives in code.
+_DEFAULT_IDLE_TIMEOUT_S = 20 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
@@ -90,7 +130,7 @@ class PaneRef(NamedTuple):
     :param terminal_id: Resource id of the native terminal, e.g.
         ``terminal_resource_id("claude", "main")`` — used for pane-scoped close.
     :param terminal_name: Harness short-name, e.g. ``"claude"``.
-    :param socket_path: tmux socket for the attached-client probe.
+    :param socket_path: tmux socket for the viewer-input, output and pane-pid probes.
     """
 
     conversation_id: str
@@ -103,10 +143,10 @@ def resolve_native_pane_idle_timeout_s() -> float:
     """Resolve the native-pane idle window in seconds.
 
     Honors :envvar:`OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S` (``0`` disables pane
-    reaping); otherwise the 1-hour default. An unparseable or negative value
-    logs a warning and falls back to the default rather than failing the runner
-    at boot — an env typo shouldn't take the runner down or (worse) make the
-    reaper act on a bogus window.
+    reaping); otherwise the 20-minute default (:data:`_DEFAULT_IDLE_TIMEOUT_S`).
+    An unparseable or negative value logs a warning and falls back to the
+    default rather than failing the runner at boot — an env typo shouldn't take
+    the runner down or (worse) make the reaper act on a bogus window.
     """
     raw = os.environ.get(_IDLE_TIMEOUT_ENV)
     if not raw:
@@ -132,14 +172,61 @@ def resolve_native_pane_idle_timeout_s() -> float:
     return value
 
 
+def resolve_pane_output_busy_window_s() -> float:
+    """Resolve the pane "recent progress" window in seconds.
+
+    Honors :envvar:`OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S`; otherwise
+    :data:`PANE_OUTPUT_BUSY_WINDOW_S`. Same shape and same failure policy as
+    :func:`resolve_native_pane_idle_timeout_s` — an unparseable or negative value
+    logs and falls back to the default rather than letting an env typo widen or
+    (worse) collapse the window the busy predicate trusts.
+
+    This window governs the OUTPUT-shaped "did something happen recently?"
+    signals of the busy predicate: the tmux output clock and the harness
+    stream-progress ledger (:mod:`omnigent.terminals.pane_progress`). It does
+    NOT govern the viewer-input signal, which stays on the fixed
+    :data:`PANE_OUTPUT_BUSY_WINDOW_S` so a widened knob cannot let an idle
+    attached viewer pin a pane for longer. Unlike the idle timeout, ``0`` is
+    not special-cased here — it simply means "only progress in the last zero
+    seconds counts", which disables these two signals without touching the rest.
+    """
+    raw = os.environ.get(_OUTPUT_BUSY_WINDOW_ENV)
+    if not raw:
+        return PANE_OUTPUT_BUSY_WINDOW_S
+    try:
+        value = float(raw)
+    except ValueError:
+        _logger.warning(
+            "%s=%r is not a number; using default %ss",
+            _OUTPUT_BUSY_WINDOW_ENV,
+            raw,
+            PANE_OUTPUT_BUSY_WINDOW_S,
+        )
+        return PANE_OUTPUT_BUSY_WINDOW_S
+    if value < 0:
+        _logger.warning(
+            "%s=%r is negative; using default %ss",
+            _OUTPUT_BUSY_WINDOW_ENV,
+            raw,
+            PANE_OUTPUT_BUSY_WINDOW_S,
+        )
+        return PANE_OUTPUT_BUSY_WINDOW_S
+    return value
+
+
 class NativePaneReaper:
     """Background task that reaps idle, unattended native terminal panes.
 
     :param list_native_panes: Returns the currently-live native panes (already
         role-confirmed by the caller) as :class:`PaneRef` values.
-    :param is_busy: ``async`` predicate — ``True`` if the pane has an in-flight
-        turn, is reporting ``running``, or has an attached tmux client. Async so
-        the (blocking) tmux probe runs off the event loop.
+    :param is_busy: ``async`` tri-state predicate — ``True`` if any liveness
+        signal in the module docstring's chain fires (in-flight turn,
+        ``running`` status, approval wait, stream progress, recent viewer
+        *input*, codex server status, tmux output, descendant CPU); ``False``
+        when idle; ``None`` when liveness cannot be confirmed (a failed codex
+        status check). An unknown scan neither re-arms the idle clock nor
+        reaps. An attached viewer without recent input is not busy. Async so
+        the blocking tmux and ``/proc`` probes run off the event loop.
     :param reap: ``async`` pane-scoped teardown — closes only this one native
         terminal, leaving the session resumable.
     :param idle_timeout_s: Idle window before reaping. ``None`` resolves the env
@@ -151,7 +238,7 @@ class NativePaneReaper:
         self,
         *,
         list_native_panes: Callable[[], list[PaneRef]],
-        is_busy: Callable[[PaneRef], Awaitable[bool]],
+        is_busy: Callable[[PaneRef], Awaitable[bool | None]],
         reap: Callable[[PaneRef], Awaitable[None]],
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
@@ -190,14 +277,23 @@ class NativePaneReaper:
             self._task = None
         self._started = False
 
-    def _classify(self, now: float, panes: list[PaneRef], busy_convs: set[str]) -> list[PaneRef]:
+    def _classify(
+        self,
+        now: float,
+        panes: list[PaneRef],
+        busy_convs: set[str],
+        unknown_convs: frozenset[str] | set[str] = frozenset(),
+    ) -> list[PaneRef]:
         """Pure idle-clock decision: which panes are reapable right now.
 
-        Given the set of conversation ids observed busy this scan, maintain the
+        Given the conversation ids observed busy this scan, maintain the
         per-conversation idle clock and return the panes idle for at least
         ``idle_timeout_s``. A busy pane re-arms its clock; a newly-observed idle
-        pane gets one full window of grace before it is eligible. No I/O, so it is
-        unit-testable with an injected ``now`` and ``busy_convs``.
+        pane gets one full window of grace before it is eligible. A pane whose
+        liveness was unknown this scan (``unknown_convs``) keeps its clock as is
+        and is never reapable on that scan, so one failed probe neither costs a
+        full idle window nor triggers a teardown. No I/O, so it is unit-testable
+        with an injected ``now`` and ``busy_convs``.
         """
         live: set[str] = set()
         reapable: list[PaneRef] = []
@@ -206,6 +302,8 @@ class NativePaneReaper:
             live.add(conv)
             if conv in busy_convs:
                 self._last_busy_at[conv] = now
+                continue
+            if conv in unknown_convs:
                 continue
             last = self._last_busy_at.get(conv)
             if last is None:
@@ -235,12 +333,23 @@ class NativePaneReaper:
     async def _scan_once(self) -> None:
         panes = self._list_native_panes()
         now = time.monotonic()
-        busy_convs = {p.conversation_id for p in panes if await self._is_busy(p)}
-        for pane in self._classify(now, panes, busy_convs):
+        busy_convs: set[str] = set()
+        unknown_convs: set[str] = set()
+        for p in panes:
+            verdict = await self._is_busy(p)
+            if verdict is None:
+                unknown_convs.add(p.conversation_id)
+            elif verdict:
+                busy_convs.add(p.conversation_id)
+        for pane in self._classify(now, panes, busy_convs, unknown_convs):
             # Re-check immediately before teardown: selection happened above with
             # possibly-stale signals, and a turn / client / autonomous run may
-            # have started since (the select→reap race). Re-arm and skip if so.
-            if await self._is_busy(pane):
+            # have started since (the select→reap race). Re-arm and skip if so;
+            # skip without re-arming if liveness can no longer be confirmed.
+            recheck = await self._is_busy(pane)
+            if recheck is None:
+                continue
+            if recheck:
                 self._last_busy_at[pane.conversation_id] = time.monotonic()
                 continue
             _logger.info(
