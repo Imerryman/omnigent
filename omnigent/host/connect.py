@@ -908,8 +908,6 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # anyway, and HARNESS_* is the namespace where harness CREDENTIALS
         # live. tests/host/test_connect.py pins this set exactly, so adding
         # or removing an entry here fails the suite until reviewed.
-        "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
-        "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_HARNESS_SHUTDOWN_TIMEOUT_S",
         "OMNIGENT_HARNESS_HARD_EXIT_TIMEOUT_S",
         "OMNIGENT_SUBAGENT_LAUNCH_TIMEOUT_S",
