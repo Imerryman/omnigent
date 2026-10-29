@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Callable
 from pathlib import Path
 
 import httpx
@@ -44,6 +45,7 @@ from omnigent.harnesses.qwen_native.forwarder import (
     _write_state,
     clear_qwen_bridge_state,
 )
+from omnigent.terminals import pane_progress
 
 _AGENT = "qwen-native-ui"
 
@@ -915,3 +917,375 @@ async def test_supervise_restarts_then_propagates_cancel(
 
     assert calls["n"] == 2
     assert sleeps == [1.0]  # initial backoff before the one restart
+
+
+# ---------------------------------------------------------------------------
+# Pane-reaper liveness wiring (issue #1349).
+#
+# The forwarder's stream cursor is the reaper's only token-level evidence that a
+# qwen pane is alive. Two cursors are involved and they must NOT be conflated:
+# ``state.offset`` is the DELIVERY cursor and only advances once the mirror POST
+# succeeds, while the liveness cursor tracks how far the FILE has been read. If
+# liveness were stamped off the delivery cursor, a permanently-failing POST would
+# re-stamp the same bytes on every poll and a dead pane would never be reapable.
+# ---------------------------------------------------------------------------
+
+
+async def _run_forward_loop(
+    bridge: Path,
+    *,
+    until: Callable[[], bool],
+    max_waits: int = 400,
+) -> None:
+    """Drive the real forward loop until *until* holds (bounded), then stop it."""
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(max_waits):
+            if until():
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_forward_loop_records_stream_progress_for_the_pane_reaper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real loop populates the real ledger the pane reaper reads.
+
+    Asserted against ``pane_progress`` itself rather than a stubbed
+    ``note_stream_progress``, so a refactor that severs the wiring fails here
+    instead of passing silently.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    posted: list[str] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        posted.append(item.response_id)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    pane_progress.reset_stream_progress()
+    assert pane_progress.stream_progress_age_s("conv") is None
+
+    await _run_forward_loop(bridge, until=lambda: bool(posted))
+
+    assert posted == ["qwen:u1"]
+    assert pane_progress.stream_progress_age_s("conv") is not None
+    pane_progress.reset_stream_progress()
+
+
+async def test_failed_delivery_stamps_progress_once_then_stops(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression guard: a retry loop over unchanged bytes must let a pane age out.
+
+    ``state.offset`` never advances while delivery fails, so the loop re-reads the
+    same bytes forever. Stamping liveness off that condition renewed the pane's
+    lease on every poll and made a dead pane immortal — worse than the
+    reaped-while-healthy bug the stream signal was added to fix.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    stamps: list[str] = []
+    attempts: list[int] = []
+    monkeypatch.setattr(fwd, "note_stream_progress", lambda sid: stamps.append(sid))
+
+    async def _delivery_fails(*_args: object, **_kwargs: object) -> None:
+        attempts.append(1)
+        raise RuntimeError("mirror endpoint down")
+
+    monkeypatch.setattr(fwd, "_deliver_forward_actions", _delivery_fails)
+
+    # Run until the loop has retried the SAME bytes several times. Driving off
+    # the retry count rather than a wall-clock settle keeps this deterministic:
+    # each failed poll logs a traceback, so the retry cadence is not the poll
+    # interval.
+    await _run_forward_loop(bridge, until=lambda: len(attempts) >= 4, max_waits=2000)
+
+    # The loop really did keep retrying the same bytes...
+    assert len(attempts) >= 4
+    # ...and stamped liveness exactly ONCE for them, so the pane ages out.
+    assert stamps == ["conv"]
+    # The delivery cursor is still parked, which is what made the bug possible.
+    assert _read_state(bridge).offset == 0
+
+
+async def test_growing_file_keeps_stamping_while_delivery_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A live generation with a broken mirror must still be spared.
+
+    The distinction is once per NEW BYTE, not once per delivery attempt: qwen
+    still producing tokens is alive even when the mirror endpoint is down.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events = events_file_path(bridge)
+    events.write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    stamps: list[str] = []
+    monkeypatch.setattr(fwd, "note_stream_progress", lambda sid: stamps.append(sid))
+
+    async def _delivery_fails(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("mirror endpoint down")
+
+    monkeypatch.setattr(fwd, "_deliver_forward_actions", _delivery_fails)
+
+    task = asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.001,
+        )
+    )
+    try:
+        for _ in range(400):
+            if stamps:
+                break
+            await asyncio.sleep(0.005)
+        assert stamps == ["conv"]
+        # qwen keeps generating even though every POST keeps failing.
+        with events.open("ab") as handle:
+            handle.write(_ev_bytes(_asst_ev("a1", [{"type": "text", "text": "still working"}])))
+        for _ in range(400):
+            if len(stamps) > 1:
+                break
+            await asyncio.sleep(0.005)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert stamps == ["conv", "conv"]
+
+
+# --- Stress cases for the liveness cursor -----------------------------------
+#
+# The two doors through which the immortal-pane bug could be reopened by a future
+# refactor. Both were judged acceptable by inspection in review; these pin them
+# so the property is enforced by tests rather than by reasoning. The shape that
+# must NEVER return is "stamps scale with POLLS"; what is correct is "stamps scale
+# with genuine file mutation, once per restart".
+
+
+def _spawn_forward_loop(bridge: Path) -> asyncio.Task[None]:
+    """Start the real forward loop against *bridge*, polling as fast as possible."""
+    return asyncio.create_task(
+        fwd.forward_qwen_events_to_session(
+            base_url="http://test",
+            headers={},
+            session_id="conv",
+            bridge_dir=bridge,
+            agent_name=_AGENT,
+            poll_interval_s=0.001,
+        )
+    )
+
+
+async def _stop_forward_loop(task: asyncio.Task[None]) -> None:
+    """Cancel the loop and confirm the clean-teardown contract."""
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def _wait_until(predicate: Callable[[], bool], *, max_waits: int = 600) -> None:
+    """Yield until *predicate* holds, bounded so a regression fails fast."""
+    for _ in range(max_waits):
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+
+
+def _count_polls(monkeypatch: pytest.MonkeyPatch) -> dict[str, int]:
+    """Count real reads of the event file, delegating to the real reader.
+
+    A counter, not a stub: the loop still gets genuine read results, so "how many
+    polls happened" can be asserted against "how many stamps happened".
+    """
+    polls = {"n": 0}
+    real_read = fwd._read_new_forward_events
+
+    def _counting_read(*args: object, **kwargs: object) -> object:
+        polls["n"] += 1
+        return real_read(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(fwd, "_read_new_forward_events", _counting_read)
+    return polls
+
+
+def _spy_on_stamps(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Record every liveness stamp while still writing the REAL ledger."""
+    stamps: list[str] = []
+
+    def _spy(session_id: str) -> None:
+        stamps.append(session_id)
+        pane_progress.note_stream_progress(session_id)
+
+    monkeypatch.setattr(fwd, "note_stream_progress", _spy)
+    return stamps
+
+
+async def test_truncate_rewrite_flap_stamps_per_mutation_not_per_poll(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncate/rewrite flap stamps once per file MUTATION, never once per poll.
+
+    ``_read_new_forward_events`` rewinds to 0 when ``size < offset`` (a bridge
+    relaunch truncating the event file), and the liveness cursor compares with
+    ``!=``, so a shrinking offset stamps. That is intentional — a relaunch IS
+    activity — but only if it is bounded to genuine file mutation rather than to
+    poll count; the latter is the immortal-pane bug wearing a different hat.
+
+    The unit is one file MUTATION, not one "relaunch cycle". A relaunch is two
+    mutations, because ``bridge.prepare_bridge_files`` truncates the events file
+    to EMPTY and qwen then appends to it — so the truncate stamps and the first
+    append stamps. Two stamps per relaunch, a fixed constant; the property that
+    matters is that no number of polls in between adds a third.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events = events_file_path(bridge)
+
+    def _write_events(count: int, tag: str) -> None:
+        events.write_bytes(
+            b"".join(_ev_bytes(_user_ev(f"{tag}{i}", "hello")) for i in range(count))
+        )
+
+    def _truncate_to_empty() -> None:
+        # Exactly what bridge.prepare_bridge_files does on a relaunch.
+        events.write_text("", encoding="utf-8")
+
+    _write_events(3, "a")
+
+    posted: list[str] = []
+
+    async def _fake_post(_client: object, *, session_id: str, item: object) -> None:
+        posted.append(item.response_id)  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(fwd, "_post_conversation_item", _fake_post)
+    polls = _count_polls(monkeypatch)
+    stamps = _spy_on_stamps(monkeypatch)
+    pane_progress.reset_stream_progress()
+
+    async def _settle(expected_stamps: int) -> None:
+        """Drive several more polls over unchanged content; nothing may stamp."""
+        target = polls["n"] + 5
+        await _wait_until(lambda: polls["n"] >= target)
+        assert polls["n"] >= target
+        assert len(stamps) == expected_stamps, "unchanged content stamped again"
+
+    task = _spawn_forward_loop(bridge)
+    try:
+        # The initial read of an unseen file is itself one mutation's worth.
+        await _wait_until(lambda: len(stamps) >= 1)
+        assert len(stamps) == 1
+        await _settle(1)
+
+        expected = 1
+        for cycle, (count, tag) in enumerate(((2, "b"), (4, "c")), start=1):
+            # Mutation 1 of the relaunch: truncate to empty.
+            _truncate_to_empty()
+            expected += 1
+            await _wait_until(lambda want=expected: len(stamps) >= want)
+            assert len(stamps) == expected, f"cycle {cycle} truncate stamped twice"
+            await _settle(expected)
+
+            # Mutation 2 of the relaunch: qwen writes into the fresh file.
+            _write_events(count, tag)
+            expected += 1
+            await _wait_until(lambda want=expected: len(stamps) >= want)
+            assert len(stamps) == expected, f"cycle {cycle} rewrite stamped twice"
+            await _settle(expected)
+    finally:
+        await _stop_forward_loop(task)
+
+    # One initial read + two relaunches x two mutations == five stamps, over many
+    # more polls than that. This ratio is the whole point of the test.
+    assert len(stamps) == 5
+    assert stamps == ["conv"] * 5
+    assert polls["n"] > len(stamps) * 4
+    # Delivery worked throughout, so every stamp tracked genuine file mutation,
+    # and the real ledger the pane reaper reads was populated.
+    assert posted
+    assert pane_progress.stream_progress_age_s("conv") is not None
+    pane_progress.reset_stream_progress()
+
+
+async def test_restart_with_undelivered_bytes_stamps_once_per_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart stamps ONCE for undelivered bytes, then nothing more.
+
+    The liveness cursor is in-memory and reseeds from the durable ``state.offset``
+    on every restart, so bytes that were read but never delivered are stamped
+    again by the new run. Review judged that acceptable because restarts back off
+    from 1s. The load-bearing half is the second assertion: after that one stamp,
+    repeated polls with no new file content must add NOTHING — otherwise a restart
+    loop becomes the old per-poll renewal by another route.
+
+    A restart is modelled as a fresh invocation of the loop, which is exactly what
+    both restart paths produce: a new in-memory cursor over the same durable state.
+    """
+    bridge = tmp_path / "bridge"
+    bridge.mkdir()
+    events_file_path(bridge).write_bytes(_ev_bytes(_user_ev("u1", "hello")))
+
+    async def _delivery_fails(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("mirror endpoint down")
+
+    monkeypatch.setattr(fwd, "_deliver_forward_actions", _delivery_fails)
+    polls = _count_polls(monkeypatch)
+    stamps = _spy_on_stamps(monkeypatch)
+    pane_progress.reset_stream_progress()
+
+    # Run 1: reads the bytes, stamps once, never delivers them.
+    first = _spawn_forward_loop(bridge)
+    try:
+        await _wait_until(lambda: len(stamps) >= 1)
+        assert len(stamps) == 1
+    finally:
+        await _stop_forward_loop(first)
+    # The delivery cursor never advanced, which is what makes the restart re-read
+    # the same bytes.
+    assert _read_state(bridge).offset == 0
+
+    # Run 2 == the restart. One stamp for the re-read bytes...
+    polls_before_restart = polls["n"]
+    second = _spawn_forward_loop(bridge)
+    try:
+        await _wait_until(lambda: len(stamps) >= 2)
+        assert len(stamps) == 2
+        # ...and then nothing, however long it keeps polling unchanged content.
+        settled = polls["n"] + 10
+        await _wait_until(lambda: polls["n"] >= settled)
+        assert polls["n"] >= settled
+        assert len(stamps) == 2, "the restart re-stamped per poll"
+    finally:
+        await _stop_forward_loop(second)
+
+    assert stamps == ["conv", "conv"]
+    # Bounded per restart, not per poll: the restart polled many times for its
+    # single stamp.
+    assert polls["n"] - polls_before_restart > 10
+    assert _read_state(bridge).offset == 0
+    pane_progress.reset_stream_progress()

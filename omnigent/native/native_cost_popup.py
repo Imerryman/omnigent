@@ -219,6 +219,50 @@ def _tmux_last_client_input_at(socket_path: str, tmux_target: str) -> float | No
     return newest
 
 
+def _tmux_pane_pid(socket_path: str, tmux_target: str) -> int | None:
+    """
+    Pid of the process tmux exec'd into *tmux_target*'s pane.
+
+    The entry point for process-level liveness evidence about a native pane: the
+    pane pid is the login shell, and its descendants are the vendor CLI plus
+    whatever that CLI is currently working on (see
+    :mod:`omnigent.terminals.pane_cpu`). Harness-agnostic, and kept beside the
+    other socket-scoped tmux probes so they share one invocation style and one
+    timeout.
+
+    :param socket_path: Absolute path to the tmux socket, e.g.
+        ``"/tmp/.../tmux.sock"``.
+    :param tmux_target: tmux target whose pane to inspect, e.g. ``"main"``.
+    :returns: The pane's pid, or ``None`` when ``tmux`` is missing, the pane is
+        gone (non-zero exit), or the output is not a single integer.
+    """
+    import subprocess
+
+    try:
+        proc = subprocess.run(
+            [
+                "tmux",
+                "-S",
+                socket_path,
+                "display-message",
+                "-p",
+                "-t",
+                tmux_target,
+                "#{pane_pid}",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=_TMUX_LIST_TIMEOUT_S,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    text = proc.stdout.strip()
+    return int(text) if text.isdigit() else None
+
+
 def launch_cost_popup(
     socket_path: str,
     tmux_target: str,

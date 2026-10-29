@@ -9,6 +9,7 @@ the pin so a short idle timeout can shut down.
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, Mock
@@ -625,7 +626,15 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "evidence", ["permission_prompt", "pane_output", "pane_input", "no_evidence"]
+    "evidence",
+    [
+        "permission_prompt",
+        "pane_output",
+        "pane_input",
+        "stream_progress",
+        "stale_stream_progress",
+        "no_evidence",
+    ],
 )
 async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     tmp_path: Path,
@@ -637,22 +646,34 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     The pane watcher publishes ``idle`` once the pane goes quiet, which a
     permission prompt does too. The pane reaper spares such a pane for the
     prompt marker or recent output and input; the watchdog must do the same.
+    Fork: the reaper also spares a pane whose harness stream progressed within
+    the output busy window, so the watchdog honours that stamp too (and ignores
+    one older than the window).
 
     :param tmp_path: Pytest temp dir for the approval-wait marker root.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
-        leaves the pane idle.
+        and ``"stale_stream_progress"`` leave the pane idle.
     :returns: None.
     """
     from omnigent.harnesses.claude_native import bridge
     from omnigent.runner.native import NativeLaunchContext
     from omnigent.runner.resource_registry import CLAUDE_NATIVE_TERMINAL_ROLE
     from omnigent.spec.types import AgentSpec, ExecutorSpec
-    from omnigent.terminals import TerminalRegistry
+    from omnigent.terminals import TerminalRegistry, pane_progress
+    from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
     from tests.runner.conftest import _runner_client, _spec_resolver_returning
     from tests.runner.helpers import make_test_terminal_instance
 
     conv_id = "conv_idle_edge_live_pane"
+    monkeypatch.delenv("OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S", raising=False)
+    monkeypatch.setattr(pane_progress, "_last_progress_at", {})
+    if evidence == "stream_progress":
+        pane_progress.note_stream_progress(conv_id)
+    elif evidence == "stale_stream_progress":
+        pane_progress.note_stream_progress(
+            conv_id, now=time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 5.0
+        )
     terminals = TerminalRegistry()
     instance = make_test_terminal_instance("claude", "main", tmp_path)
     monkeypatch.setattr(instance, "start_idle_watcher_thread", Mock())
@@ -704,4 +725,5 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             publish(conv_id, "running", None)
             publish(conv_id, "idle", None)
             assert app.state.native_pane_status[conv_id] == "idle"
-            assert app.state.has_active_work() is (evidence != "no_evidence")
+            idle = evidence in {"no_evidence", "stale_stream_progress"}
+            assert app.state.has_active_work() is (not idle)

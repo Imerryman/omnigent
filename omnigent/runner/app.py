@@ -1573,30 +1573,48 @@ def create_runner_app(
     _session_inboxes = _session_inboxes_ref
     _session_async_tasks: dict[str, dict[str, tuple[asyncio.Task[str], asyncio.Event]]] = {}
 
+    # Resolved once at app build: the knob is a deployment setting, not something
+    # to re-read from the environment on every pane on every scan. It governs the
+    # OUTPUT-shaped recency signals (screen output, harness stream progress) for
+    # both the pane reaper and the idle watchdog; viewer-input checks keep the
+    # fixed ``PANE_OUTPUT_BUSY_WINDOW_S`` so widening this knob can never stretch
+    # how long an idle attached viewer pins a pane.
+    from omnigent.terminals.pane_reaper import resolve_pane_output_busy_window_s
+
+    _pane_output_busy_window_s = resolve_pane_output_busy_window_s()
+
     def _native_pane_shows_live_work(terminals: Any, session_id: str, terminal_name: str) -> bool:
         """Whether a native pane shows the live work the pane reaper spares it for.
 
         A pane parked on a permission prompt is quiet and can read ``idle``, and a
         pane still redrawing output can too, so the status edge alone misses them.
-        Reads the same in-memory signals the reaper uses, not its tmux calls.
+        Reads the same in-memory signals the reaper uses, not its tmux calls:
+        approval wait, harness stream progress, recent viewer input, recent screen
+        output. The reaper's descendant-CPU proxy is deliberately absent: it costs
+        a tmux call plus ``/proc`` reads on this synchronous path, and its probe
+        keeps a per-conversation baseline that a second caller would skew.
 
         :param terminals: Terminal registry holding the pane instance.
         :param session_id: Session/conversation id, e.g. ``"conv_abc"``.
         :param terminal_name: Native harness terminal name, e.g. ``"claude"``.
-        :returns: ``True`` when a permission hook is parked or the pane shows recent
-            input or output.
+        :returns: ``True`` when a permission hook is parked, the harness stream
+            progressed recently, or the pane shows recent input or output.
         """
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
+        from omnigent.terminals.pane_progress import stream_progress_age_s
         from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
         if approval_wait_is_fresh(session_id):
+            return True
+        progress_age = stream_progress_age_s(session_id)
+        if progress_age is not None and progress_age < _pane_output_busy_window_s:
             return True
         instance = terminals.get(session_id, terminal_name, "main")
         if instance is None:
             return False
         if instance.client_interaction_within(PANE_OUTPUT_BUSY_WINDOW_S):
             return True
-        return instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S) is True
+        return instance.screen_changed_within(_pane_output_busy_window_s) is True
 
     def _has_active_work() -> bool:
         if _active_turns:
@@ -1801,6 +1819,23 @@ def create_runner_app(
             per_session_workspace=per_session_workspace,
         )
     app.state.session_resource_registry = resource_registry
+
+    def _clear_native_pane_liveness(session_id: str) -> None:
+        """Forget a session's native-pane liveness state (stream + CPU ledgers).
+
+        Called from session cleanup and from the reaper's own teardown. Both
+        ledgers are optional: the CPU probe only exists when the pane reaper was
+        wired (``resource_registry`` present), and neither is worth failing a
+        teardown over, so this never raises.
+        """
+        from omnigent.terminals.pane_progress import clear_stream_progress
+
+        with contextlib.suppress(Exception):
+            clear_stream_progress(session_id)
+        probe = getattr(app.state, "native_pane_cpu_probe", None)
+        if probe is not None:
+            with contextlib.suppress(Exception):
+                probe.forget(session_id)
 
     def _publish_terminal_activity(session_id: str, terminal_id: str) -> None:
         if process_manager is not None:
@@ -3676,6 +3711,13 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
+        # Drop the native-pane liveness ledgers for this session. Both are keyed
+        # on conversation id and were previously cleared only on the reaper's own
+        # teardown path, so a session that ended CLEANLY left residue behind
+        # (bounded and evictable, but still stale state a later same-id session
+        # could read). The forwarder that writes the stream ledger is cancelled
+        # just below, so clearing here cannot race a live writer.
+        _clear_native_pane_liveness(session_id)
         await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
@@ -8486,14 +8528,25 @@ def create_runner_app(
         from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
         from omnigent.native.native_cost_popup import (
             _tmux_last_client_input_at,
+            _tmux_pane_pid,
             _tmux_window_activity_at,
         )
         from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+        from omnigent.terminals.pane_cpu import PaneDescendantCpuProbe
+        from omnigent.terminals.pane_progress import stream_progress_age_s
         from omnigent.terminals.pane_reaper import (
             PANE_OUTPUT_BUSY_WINDOW_S,
             NativePaneReaper,
             PaneRef,
         )
+
+        # ``_pane_output_busy_window_s`` (resolved once above, shared with the
+        # idle watchdog) governs the reaper's OUTPUT-shaped recency signals.
+        # Holds one CPU baseline per conversation across scans so the busy
+        # predicate can derive a rate without ever sleeping inside itself. Kept
+        # on ``app.state`` (like ``native_pane_reaper``) so a test can swap in a
+        # probe with an injected clock instead of racing a real one.
+        app.state.native_pane_cpu_probe = PaneDescendantCpuProbe()
 
         def _native_panes_for_reaper() -> list[PaneRef]:
             panes: list[PaneRef] = []
@@ -8506,7 +8559,7 @@ def create_runner_app(
                     panes.append(PaneRef(conv_id, terminal_id, name, socket_path, instance))
             return panes
 
-        async def _server_confirms_turn_in_flight(conv_id: str) -> bool:
+        async def _server_confirms_turn_in_flight(conv_id: str) -> bool | None:
             """Whether the server still records the session's turn as in flight.
 
             Most native turns report their end to the server, which relays it here.
@@ -8515,8 +8568,13 @@ def create_runner_app(
 
             :param conv_id: Session/conversation id, e.g. ``"conv_abc123"``.
             :returns: ``False`` when the server reports the session settled, after
-                updating the runner's record to match; ``True`` otherwise,
-                including when the server cannot be asked.
+                updating the runner's record to match; ``True`` when it reports a
+                turn in flight (or a new turn made its reply stale); ``None`` when
+                the server cannot be asked or gives no usable status. Unknown is
+                not busy: the reaper neither reaps nor re-arms the idle clock on
+                it, so a burst of transient GET failures cannot keep an idle pane
+                resident for hours (a codex session once survived ~1.6h idle on
+                ReadError/ConnectTimeout re-arms).
             """
             epoch = _turn_bind_epoch.get(conv_id)
             try:
@@ -8524,10 +8582,12 @@ def create_runner_app(
                     f"/v1/sessions/{conv_id}", params=_SESSION_METADATA_PARAMS, timeout=10.0
                 )
                 body = resp.json() if resp.status_code == 200 else None
-            except Exception:  # noqa: BLE001 - any failure to ask the server keeps the pane
-                return True
+            except Exception:  # noqa: BLE001 - liveness unconfirmable: unknown, never reap
+                return None
             status = body.get("status") if isinstance(body, dict) else None
-            if not isinstance(status, str) or status in _IN_FLIGHT_SESSION_STATUSES:
+            if not isinstance(status, str):
+                return None
+            if status in _IN_FLIGHT_SESSION_STATUSES:
                 return True
             # A turn that started while the reply was in flight makes the reply stale.
             if (
@@ -8547,7 +8607,7 @@ def create_runner_app(
             resource_registry.note_external_session_status(conv_id, status)
             return False
 
-        async def _native_pane_is_busy(pane: PaneRef) -> bool:
+        async def _native_pane_is_busy(pane: PaneRef) -> bool | None:
             conv_id = pane.conversation_id
             if conv_id in _active_turns or (
                 process_manager is not None and process_manager.has_active_turn(conv_id)
@@ -8557,6 +8617,26 @@ def create_runner_app(
             # active turn, so every signal above reads idle. Reaping it kills the
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
+                return True
+            # Harness STREAM progress. The qwen forwarder tails qwen's
+            # stream-json output every 0.4s and stamps
+            # ``pane_progress.note_stream_progress`` on every new byte, so a
+            # long autonomous turn that has gone quiet on every signal above is
+            # still visibly producing tokens here. One dict lookup, no I/O, so
+            # it sits with the other free in-process checks, ahead of every
+            # signal that does any I/O. ``None`` means "never recorded" (not
+            # qwen, or no turn yet) and falls through rather than reading as
+            # idle.
+            try:
+                progress_age = stream_progress_age_s(conv_id)
+                if progress_age is not None and progress_age < _pane_output_busy_window_s:
+                    return True
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: stream-progress check failed for %s; "
+                    "treating pane as busy",
+                    conv_id,
+                )
                 return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a
@@ -8575,7 +8655,7 @@ def create_runner_app(
             # stalled forwarder once froze it and got a live session reaped). The
             # watcher's screen diff ignores title updates and identical repaints.
             screen_changed = (
-                instance.screen_changed_within(PANE_OUTPUT_BUSY_WINDOW_S)
+                instance.screen_changed_within(_pane_output_busy_window_s)
                 if instance is not None
                 else None
             )
@@ -8586,12 +8666,68 @@ def create_runner_app(
                 )
                 screen_changed = (
                     activity_at is not None
-                    and time.time() - activity_at < PANE_OUTPUT_BUSY_WINDOW_S
+                    and time.time() - activity_at < _pane_output_busy_window_s
                 )
             if screen_changed:
                 return True
+            # A ``running`` record with no other evidence: the server's verdict is
+            # final (busy, settled-idle, or unknown), so neither proxy below can
+            # override a confirmed-idle session or rescue an unconfirmable one.
             if _native_pane_status.get(conv_id) == "running":
                 return await _server_confirms_turn_in_flight(conv_id)
+            # Codex: the runner's record (relayed from the codex app-server, the
+            # one component that knows whether a turn is in flight) says no turn
+            # and the screen is still. Letting the descendant-CPU proxy below
+            # override that would make a codex pane with a runaway descendant (a
+            # wedged MCP server, a polling sidecar) immortal.
+            if pane.terminal_name == "codex":
+                return False
+            # CHILD-PROCESS liveness. Every signal above is output-shaped: they
+            # all answer "did something appear recently?". A worker blocked
+            # inside ONE long silent child -- ``mypy .``, ``alembic upgrade
+            # head``, a full pytest run -- emits nothing, reports no turn, and
+            # reads idle on all of them while being perfectly healthy. So ask
+            # the process table instead: does the pane's subtree contain a
+            # descendant actually burning CPU? The probe caches a per-conversation
+            # tick baseline and derives a rate across scans, so it neither sleeps
+            # nor blocks (see omnigent/terminals/pane_cpu.py). Ordered LAST: it
+            # is the only signal that costs a tmux call plus /proc reads, and it
+            # is the weakest evidence, so everything cheaper and more direct
+            # decides first. An attached-but-idle viewer contributes nothing
+            # here: the probe measures the pane's own process subtree, never the
+            # tmux clients.
+            try:
+                pane_pid = await asyncio.to_thread(_tmux_pane_pid, str(pane.socket_path), "main")
+                _cpu_probe = app.state.native_pane_cpu_probe
+                cpu = await asyncio.to_thread(_cpu_probe.is_cpu_active, conv_id, pane_pid)
+                if cpu.active:
+                    # INFO, not debug: reaching here means every other signal
+                    # read idle and this pane is being spared SOLELY because
+                    # something in its subtree is burning CPU. That is usually a
+                    # healthy silent child, but it is also how a dead agent with
+                    # a runaway descendant (a wedged MCP server, a polling
+                    # sidecar) stays alive indefinitely -- an accepted tradeoff
+                    # of acceptance item 1, so name the culprit pid and its rate
+                    # to make the case diagnosable instead of mysterious.
+                    _logger.info(
+                        "native pane reaper: sparing conversation %s (%s) on "
+                        "descendant CPU alone: %.1f%% of a core across %d "
+                        "descendants, busiest pid %s at %.1f%%",
+                        conv_id,
+                        pane.terminal_name,
+                        cpu.cpu_fraction * 100.0,
+                        cpu.descendants,
+                        cpu.busiest_pid,
+                        cpu.busiest_fraction * 100.0,
+                    )
+                    return True
+            except Exception:
+                _logger.exception(
+                    "native pane reaper: descendant-CPU check failed for %s; "
+                    "treating pane as busy",
+                    conv_id,
+                )
+                return True
             return False
 
         async def _reap_native_pane(pane: PaneRef) -> None:
@@ -8616,14 +8752,22 @@ def create_runner_app(
                     )
                     return
                 # A message can reuse the pane while the reap waits for the lock.
-                if await _native_pane_is_busy(pane):
+                # Only a confirmed idle reaps: ``None`` (liveness unconfirmable)
+                # leaves the pane as surely as busy does.
+                if await _native_pane_is_busy(pane) is not False:
                     _logger.info(
-                        "native pane reaper: pane for conversation %s became busy while "
-                        "the reap waited; leaving it",
+                        "native pane reaper: pane for conversation %s became busy (or "
+                        "could not be confirmed idle) while the reap waited; leaving it",
                         conv_id,
                         extra={"session_id": conv_id},
                     )
                     return
+                # The pane is going away, so drop the liveness state keyed on it:
+                # its CPU baseline would be stale (and its pid recycled) when the
+                # pane is re-created, and its stream stamp belongs to a stream that
+                # no longer exists. Same helper the session-cleanup path uses. After
+                # the checks above, so a pane left alive keeps its baselines.
+                _clear_native_pane_liveness(conv_id)
                 try:
                     await resource_registry.close_terminal(conv_id, pane.terminal_id)
                 finally:
