@@ -1289,6 +1289,8 @@ async def test_sdk_session_status_does_not_pin_idle_watchdog() -> None:
         "background_shell",
         "pane_output",
         "pane_input",
+        "stream_progress",
+        "stale_stream_progress",
         "no_evidence",
     ],
 )
@@ -1303,16 +1305,30 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
     permission prompt does too, and so does a turn that left a background agent
     working. The pane reaper spares such a pane for the prompt marker, the agent,
     or recent output and input; the watchdog must do the same.
+    Fork: the reaper also spares a pane whose harness stream progressed within
+    the output busy window, so the watchdog honours that stamp too (and ignores
+    one older than the window). Stream progress is harness work, not pane
+    viewing, so it also holds the sandbox keepalive.
 
     :param tmp_path: Pytest temp dir for the approval-wait marker root.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param evidence: Live-work signal to stage, e.g. ``"permission_prompt"``. ``"no_evidence"``
-        leaves the pane idle.
+        and ``"stale_stream_progress"`` leave the pane idle.
     :returns: None.
     """
     from omnigent.harnesses.claude_native import bridge
+    from omnigent.terminals import pane_progress
+    from omnigent.terminals.pane_reaper import PANE_OUTPUT_BUSY_WINDOW_S
 
     conv_id = "conv_idle_edge_live_pane"
+    monkeypatch.delenv("OMNIGENT_PANE_OUTPUT_BUSY_WINDOW_S", raising=False)
+    monkeypatch.setattr(pane_progress, "_last_progress_at", {})
+    if evidence == "stream_progress":
+        pane_progress.note_stream_progress(conv_id)
+    elif evidence == "stale_stream_progress":
+        pane_progress.note_stream_progress(
+            conv_id, now=time.monotonic() - PANE_OUTPUT_BUSY_WINDOW_S - 5.0
+        )
     async with _claude_native_pane_app(tmp_path, monkeypatch, conv_id) as (app, instance):
         instance.screen_changed_within.return_value = evidence == "pane_output"
         instance.client_interaction_within.return_value = evidence == "pane_input"
@@ -1332,12 +1348,15 @@ async def test_native_pane_with_live_work_holds_watchdog_despite_idle_edge(
             # started outlives the turn; that command is still agent work.
             background(conv_id, True)
         assert app.state.native_pane_status[conv_id] == "idle"
-        assert app.state.has_active_work() is (evidence != "no_evidence")
+        idle = evidence in {"no_evidence", "stale_stream_progress"}
+        assert app.state.has_active_work() is (not idle)
         # Sandbox keepalive counts agent work only: recent pane input or output
         # also comes from someone viewing the pane, so only the prompt, a
-        # background agent and a background shell count.
+        # background agent, a background shell and (local carry) harness
+        # stream progress count.
         assert app.state.has_sandbox_work() is (
-            evidence in ("permission_prompt", "background_agent", "background_shell")
+            evidence
+            in ("permission_prompt", "background_agent", "background_shell", "stream_progress")
         )
         if evidence == "background_shell":
             background(conv_id, False)
