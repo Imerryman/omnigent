@@ -81,7 +81,9 @@ def databricks_pi_surface_for_model(model_id: str) -> DatabricksPiSurface:
 # DeepSeek streams its chain of thought on ``reasoning_content``; Pi only reads
 # that channel when the model entry sets ``reasoning``. GLM/kimi/inkling route
 # through the Responses API instead and do not need it.
-PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek",)
+# carry (2026-10-31): the local Qwen3.8-Flash-Next served by Strata streams its chain of thought on
+# ``reasoning_content`` too; Pi must read and re-send it (preserved thinking keeps the prefix cache warm).
+PI_REASONING_MODEL_FRAGMENTS: tuple[str, ...] = ("deepseek", "qwen3.8-flash-next")
 
 # Claude models support extended thinking; reasoning:true enables Pi's controls.
 # Adaptive versus budget-based thinking is configured per model.
