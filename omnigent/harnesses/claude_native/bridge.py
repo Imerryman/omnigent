@@ -3223,7 +3223,20 @@ def augment_claude_args(
             _logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
-        args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
+        args.extend(
+            [
+                # Omnigent worker panes load ONLY the bridge relay (see
+                # build_mcp_config); strict mode prevents Claude from merging the
+                # user-scope ~/.claude.json MCP fleet into every pane, which cost
+                # ~1 GB per pane and ran the host out of memory. Only affects
+                # Omnigent-spawned panes; a hand-launched claude is untouched.
+                # Omitted with --mcp-config under a managed-mcp.json (#12080),
+                # which makes Claude Code refuse both flags.
+                "--strict-mcp-config",
+                "--mcp-config",
+                json.dumps(mcp_config, separators=(",", ":")),
+            ]
+        )
     args.extend(["--settings", str(settings_path)])
     args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
