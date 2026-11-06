@@ -207,6 +207,32 @@ def test_claude_terminal_request_omits_mcp_flags_under_managed_mcp_config(
     assert "SessionStart" in _load_invocation_settings(args)["hooks"]
 
 
+def test_claude_terminal_request_isolates_worker_panes_from_user_mcp_servers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Worker panes load only Omnigent's relay, never the user-scope MCP fleet.
+
+    Without ``--strict-mcp-config`` Claude Code merges every server in the
+    user's ``~/.claude.json`` into each pane (~1 GB per pane on the fork's
+    host), on top of the relay passed with ``--mcp-config``.
+    """
+    monkeypatch.chdir(tmp_path)
+    # No managed-mcp.json deployed, whatever the test host has.
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (tmp_path / "no-etc-claude-code" / "managed-settings.json",),
+    )
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+
+    body = claude_native._claude_terminal_request((), command="claude", bridge_dir=bridge_dir)
+
+    args = body["spec"]["args"]
+    strict_index = args.index("--strict-mcp-config")
+    assert args[strict_index + 1] == "--mcp-config"
+    mcp_config = json.loads(args[strict_index + 2])
+    assert sorted(mcp_config["mcpServers"]) == ["omnigent"]
+
+
 def test_claude_terminal_request_loads_workspace_agents_skills(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
