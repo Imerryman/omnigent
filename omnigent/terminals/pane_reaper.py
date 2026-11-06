@@ -83,6 +83,12 @@ NATIVE_PANE_TERMINAL_NAMES: frozenset[str] = frozenset(
 # Default idle window before an unused native pane is reaped. Mirrors
 # ``HarnessProcessManager``'s 1-hour SDK-proxy default for consistency.
 _DEFAULT_IDLE_TIMEOUT_S = 60 * 60
+# Fork cap (carried since 0.13, re-ported for #12200): on the swapless dev box a
+# long idle window let bursty fan-out pile ~1GB/tree resident to OOM. Upstream
+# now defaults the pane window to the runner's idle timeout (7200 s on .26), so
+# without an explicit env value the window is capped here. The env var remains
+# the explicit override (including ``0`` to disable pane reaping).
+_FORK_PANE_IDLE_CAP_S = 20 * 60
 _DEFAULT_REAPER_INTERVAL_S = 60.0
 _IDLE_TIMEOUT_ENV = "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S"
 
@@ -116,6 +122,10 @@ def resolve_native_pane_idle_timeout_s(
     idle timeout. An unparseable or negative value logs a warning and falls
     back to that default rather than failing the runner at boot.
     """
+    # Fork cap: a runner default above the cap, or a disabled (0) runner
+    # watchdog, still reaps idle panes after _FORK_PANE_IDLE_CAP_S.
+    if default_timeout_s <= 0 or default_timeout_s > _FORK_PANE_IDLE_CAP_S:
+        default_timeout_s = _FORK_PANE_IDLE_CAP_S
     raw = os.environ.get(_IDLE_TIMEOUT_ENV)
     if not raw:
         return float(default_timeout_s)

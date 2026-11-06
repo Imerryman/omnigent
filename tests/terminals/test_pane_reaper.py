@@ -22,6 +22,7 @@ from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.terminals.pane_reaper import (
     _DEFAULT_IDLE_TIMEOUT_S,
+    _FORK_PANE_IDLE_CAP_S,
     _IDLE_TIMEOUT_ENV,
     NATIVE_PANE_TERMINAL_NAMES,
     PANE_OUTPUT_BUSY_WINDOW_S,
@@ -153,12 +154,22 @@ async def test_scan_recheck_spares_pane_that_became_busy() -> None:
 # ── Env resolver ────────────────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
+@pytest.mark.parametrize(
+    ("default_timeout_s", "expected"),
+    [
+        (_DEFAULT_IDLE_TIMEOUT_S, _FORK_PANE_IDLE_CAP_S),
+        (86400, _FORK_PANE_IDLE_CAP_S),
+        (7200, _FORK_PANE_IDLE_CAP_S),
+        (0, _FORK_PANE_IDLE_CAP_S),
+        (600, 600),
+    ],
+)
 def test_resolve_default_when_unset(
-    monkeypatch: pytest.MonkeyPatch, default_timeout_s: float
+    monkeypatch: pytest.MonkeyPatch, default_timeout_s: float, expected: float
 ) -> None:
+    """Fork cap: the runner default is honoured only below 20 min; 0 does not disable."""
     monkeypatch.delenv(_IDLE_TIMEOUT_ENV, raising=False)
-    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == expected
 
 
 @pytest.mark.parametrize("default_timeout_s", [_DEFAULT_IDLE_TIMEOUT_S, 86400, 0])
@@ -179,7 +190,9 @@ def test_resolve_invalid_falls_back(
     monkeypatch: pytest.MonkeyPatch, bad: str, default_timeout_s: float
 ) -> None:
     monkeypatch.setenv(_IDLE_TIMEOUT_ENV, bad)
-    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == default_timeout_s
+    assert resolve_native_pane_idle_timeout_s(default_timeout_s) == min(
+        default_timeout_s or _FORK_PANE_IDLE_CAP_S, _FORK_PANE_IDLE_CAP_S
+    )
 
 
 # ── Loop smoke (start/shutdown + disable) ───────────────────────────────────

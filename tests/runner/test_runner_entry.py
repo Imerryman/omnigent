@@ -2038,7 +2038,11 @@ def test_load_runner_idle_timeout_reads_nested_runner_config(
 def test_create_app_native_panes_inherit_runner_idle_timeout(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, timeout_s: int
 ) -> None:
-    """Native terminals must survive the runner's configured idle window."""
+    """Native terminals use the runner's idle window, capped by the fork at 20 min.
+
+    Fork (v0.21 port of dec79de3d): a runner window above the cap, or a disabled
+    (0) runner watchdog, still reaps idle panes after ``_FORK_PANE_IDLE_CAP_S``.
+    """
     import omnigent.runner._entry as entry_mod
 
     class _FakeProcessManager:
@@ -2059,12 +2063,13 @@ def test_create_app_native_panes_inherit_runner_idle_timeout(
     app = entry_mod.create_app(auth_resolved=True)
     reaper = app.state.native_pane_reaper
     assert reaper is not None
-    assert reaper._idle_timeout_s == timeout_s
-    if timeout_s:
-        pane = PaneRef("conv_idle", "terminal:codex:main", "codex", tmp_path / "tmux.sock")
-        assert reaper._classify(0.0, [pane], busy_convs=set()) == []
-        assert reaper._classify(3601.0, [pane], busy_convs=set()) == []
-        assert reaper._classify(float(timeout_s), [pane], busy_convs=set()) == [pane]
+    from omnigent.terminals.pane_reaper import _FORK_PANE_IDLE_CAP_S
+
+    assert reaper._idle_timeout_s == _FORK_PANE_IDLE_CAP_S
+    pane = PaneRef("conv_idle", "terminal:codex:main", "codex", tmp_path / "tmux.sock")
+    assert reaper._classify(0.0, [pane], busy_convs=set()) == []
+    assert reaper._classify(_FORK_PANE_IDLE_CAP_S - 1.0, [pane], busy_convs=set()) == []
+    assert reaper._classify(float(_FORK_PANE_IDLE_CAP_S), [pane], busy_convs=set()) == [pane]
 
 
 def test_load_runner_idle_timeout_zero_disables_watchdog(
