@@ -112,6 +112,17 @@ _ENV_AGENT_NAME = "HARNESS_PI_AGENT_NAME"
 _ENV_GATEWAY_BASE_URL = "HARNESS_PI_GATEWAY_BASE_URL"
 _ENV_GATEWAY_BASE_URLS = "HARNESS_PI_GATEWAY_BASE_URLS"
 _ENV_GATEWAY_OPENAI_WIRE_API = "HARNESS_PI_GATEWAY_OPENAI_WIRE_API"
+_ENV_GATEWAY_CONTEXT_WINDOW = "HARNESS_PI_GATEWAY_CONTEXT_WINDOW"  # carry 2026-10-31
+_ENV_GATEWAY_MAX_OUTPUT_TOKENS = "HARNESS_PI_GATEWAY_MAX_OUTPUT_TOKENS"  # carry 2026-10-31
+
+
+def _env_positive_int(name: str) -> int | None:
+    """A positive integer from the environment, else None (garbage is ignored, not fatal)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip().isdigit():
+        return None
+    value = int(raw.strip())
+    return value if value > 0 else None
 _ENV_GATEWAY_AUTH_COMMAND = "HARNESS_PI_GATEWAY_AUTH_COMMAND"
 _ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS = "HARNESS_PI_GATEWAY_AUTH_REFRESH_INTERVAL_MS"
 
@@ -240,6 +251,8 @@ def _build_pi_executor() -> Executor:
         base_url_override=os.environ.get(_ENV_GATEWAY_BASE_URL) or None,
         base_urls_override=_resolve_gateway_base_urls(),
         openai_wire_api=os.environ.get(_ENV_GATEWAY_OPENAI_WIRE_API) or None,
+        configured_context_window=_env_positive_int(_ENV_GATEWAY_CONTEXT_WINDOW),
+        configured_max_output_tokens=_env_positive_int(_ENV_GATEWAY_MAX_OUTPUT_TOKENS),
         gateway_auth_command=os.environ.get(_ENV_GATEWAY_AUTH_COMMAND) or None,
         gateway_auth_refresh_interval_ms=os.environ.get(_ENV_GATEWAY_AUTH_REFRESH_INTERVAL_MS)
         or None,

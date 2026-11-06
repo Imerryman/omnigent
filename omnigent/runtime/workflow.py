@@ -991,6 +991,12 @@ def _apply_provider_to_pi(env: dict[str, str], entry: ProviderEntry) -> None:
     env["HARNESS_PI_GATEWAY_BASE_URLS"] = json.dumps(base_urls, sort_keys=True)
     if openai is not None and openai.wire_api is not None:
         env["HARNESS_PI_GATEWAY_OPENAI_WIRE_API"] = openai.wire_api
+    # carry (2026-10-31): headless Pi dropped the provider's configured limits, so models.json fell back to
+    # catalog family guesses. Export them like the wire API; pi_harness passes them to the models.json builder.
+    if auth_source.context_window is not None:
+        env["HARNESS_PI_GATEWAY_CONTEXT_WINDOW"] = str(auth_source.context_window)
+    if auth_source.max_output_tokens is not None:
+        env["HARNESS_PI_GATEWAY_MAX_OUTPUT_TOKENS"] = str(auth_source.max_output_tokens)
     env["HARNESS_PI_GATEWAY_HOST"] = _origin_of(next(iter(base_urls.values())))
     env["HARNESS_PI_GATEWAY_AUTH_COMMAND"] = _provider_auth_command(auth_source)
     # Model precedence: spec model > provider ``models.default`` > catalog
