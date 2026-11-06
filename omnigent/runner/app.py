@@ -2137,10 +2137,20 @@ def create_runner_app(
                 # schedule a bounded grace re-check and fail + wake ONLY if the
                 # work is still undelivered afterwards.
                 _schedule_qwen_subagent_exit_grace(event, error)
+                # v0.21 port: apply #12527's stream bookkeeping (a live stream ends
+                # cancelled, not failed, which terminalizes the work and wakes the
+                # parent, so the grace re-check then finds it terminal), but publish
+                # no idle: a sub-agent with undelivered work may have died, and only
+                # the grace re-check decides. With no live stream the grace re-check
+                # alone fails the work and wakes the parent (concern H).
+                _required_terminal_exit_errors.pop(event.session_id, None)
+                _clean_terminal_exit_responses[event.session_id] = _live_response_id.get(
+                    event.session_id
+                )
                 _release_required_terminal_session(event.session_id)
                 return
-            # v0.21 port: a clean qwen/antigravity exit falls through to the combined
-            # clean-exit branch below (#12527 bookkeeping), which publishes idle.
+            # A clean qwen/antigravity exit falls through to the combined clean-exit
+            # branch below (#12527 bookkeeping), which publishes idle.
 
         # A claude /exit or /quit prints this banner and exits 0. Printing it
         # can flip the idle memo back to "running" before pane death, so treat
