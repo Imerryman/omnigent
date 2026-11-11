@@ -21,6 +21,10 @@ _ENV = "OMNIGENT_CLAUDE_SDK_REPLAY_WINDOW_SHARE"
         ("0", None),
         ("-1", None),
         ("half", 0.5),
+        ("nan", 0.5),
+        ("NaN", 0.5),
+        ("inf", 0.5),
+        ("-inf", 0.5),
     ],
 )
 def test_window_share_env(
@@ -64,3 +68,23 @@ async def test_window_share_sizes_the_fresh_replay(
     else:
         assert f"context window: {omitted}.]" in prompt
         assert "a1 " in prompt
+
+
+def test_non_finite_share_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv(_ENV, "nan")
+    with caplog.at_level("WARNING", logger=mod.logger.name):
+        assert mod._replayed_history_window_share() == 0.5
+    assert _ENV in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_nan_share_keeps_the_default_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(_ENV, "nan")
+    executor = ClaudeSDKExecutor(model="claude-x")
+    with patch.object(mod, "_resolve_replay_context_window", return_value=420):
+        prompt = await executor._fresh_session_prompt(_history(), ExecutorConfig())
+
+    assert isinstance(prompt, str)
+    assert "context window: 2.]" in prompt

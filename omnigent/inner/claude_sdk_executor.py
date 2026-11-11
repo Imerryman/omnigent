@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import pathlib
 import sys
@@ -644,7 +645,7 @@ def _replayed_history_window_share() -> float | None:
     Read the share of the context window a fresh client's replay may fill.
 
     :returns: ``OMNIGENT_CLAUDE_SDK_REPLAY_WINDOW_SHARE`` capped at 1.0, the
-        default share when it is unset or malformed, or ``None`` when it is
+        default share when it is unset, malformed or not finite, or ``None`` when it is
         ``<= 0`` (replay everything).
     """
     raw = os.environ.get(_REPLAYED_HISTORY_WINDOW_SHARE_ENV, "").strip()
@@ -653,8 +654,11 @@ def _replayed_history_window_share() -> float | None:
     try:
         share = float(raw)
     except ValueError:
+        share = math.nan
+    if not math.isfinite(share):
+        # NaN would fail ``share > 0`` and silently disable the budget.
         logger.warning(
-            "%s is not a number (%r); using %s",
+            "%s is not a finite number (%r); using %s",
             _REPLAYED_HISTORY_WINDOW_SHARE_ENV,
             raw,
             _REPLAYED_HISTORY_WINDOW_SHARE,
@@ -717,10 +721,15 @@ def _estimated_replay_tokens(blocks: list[_JsonObject]) -> int:
     """
     Estimate the prompt tokens one rendered prior message adds to a replay.
 
+    Text is priced on its combined size, plus one byte per block for the
+    newline :func:`_coalesce_text_blocks` joins it with, and rounded up once:
+    flooring each block separately priced many short blocks at nothing.
+
     :param blocks: The message's blocks from :func:`_render_prior_message`.
     :returns: A deliberately high estimate, so the replay stays under budget.
     """
     tokens = 0
+    text_bytes = 0
     for block in blocks:
         source = block.get("source")
         if block.get("type") == "text":
@@ -735,8 +744,59 @@ def _estimated_replay_tokens(blocks: list[_JsonObject]) -> int:
         else:
             tokens += _REPLAYED_ATTACHMENT_TOKEN_ESTIMATE
             continue
-        tokens += len(str(text).encode("utf-8")) // _REPLAYED_HISTORY_BYTES_PER_TOKEN
-    return tokens
+        text_bytes += len(str(text).encode("utf-8")) + 1
+    return tokens + -(-text_bytes // _REPLAYED_HISTORY_BYTES_PER_TOKEN)
+
+
+_TOOL_HISTORY_ROLES = ("tool_call", "tool_result")
+
+
+def _replay_call_id(message: Message) -> str | None:
+    """Return the ``metadata.call_id`` pairing a tool call with its result, if any."""
+    if message.get("role") not in _TOOL_HISTORY_ROLES:
+        return None
+    metadata = message.get("metadata")
+    call_id = metadata.get("call_id") if isinstance(metadata, dict) else None
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
+def _replay_cut_points(prior: list[Message]) -> list[bool]:
+    """
+    Mark where a budgeted replay may drop the oldest prior messages.
+
+    A cut never opens the replay with a ``tool_result``, never separates
+    messages that share a ``call_id`` (parallel calls interleave theirs),
+    and never falls inside a run of tool items lacking one, which only
+    their position pairs.
+
+    :param prior: The prior messages a fresh client replays, oldest first.
+    :returns: ``len(prior) + 1`` flags; ``flags[i]`` is ``True`` when
+        ``prior[i:]`` may be replayed without the messages before it.
+    """
+    count = len(prior)
+    spans: dict[str, list[int]] = {}
+    for index, message in enumerate(prior):
+        call_id = _replay_call_id(message)
+        if call_id is not None:
+            spans.setdefault(call_id, [index, index])[1] = index
+    # Difference array: cuts at first+1..last split a call from its result.
+    opened = [0] * (count + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    flags = [True] * (count + 1)
+    split_calls = 0
+    for index in range(1, count):
+        split_calls += opened[index]
+        message, previous = prior[index], prior[index - 1]
+        unpaired_run = (
+            message.get("role") in _TOOL_HISTORY_ROLES
+            and previous.get("role") in _TOOL_HISTORY_ROLES
+            and (_replay_call_id(message) is None or _replay_call_id(previous) is None)
+        )
+        if split_calls or message.get("role") == "tool_result" or unpaired_run:
+            flags[index] = False
+    return flags
 
 
 def _parse_data_uri(uri: str) -> tuple[str, str]:
@@ -3929,15 +3989,22 @@ class ClaudeSDKExecutor(Executor):
         if not prior:
             return latest_content
 
-        kept: list[list[_JsonObject]] = []
+        # Newest first. Keep only up to the oldest message that fits the budget
+        # AND is a cut point, so no tool result outlives its dropped call.
+        rendered_newest_first: list[list[_JsonObject]] = []
+        kept_count = 0
+        cut_points = None if history_token_budget is None else _replay_cut_points(prior)
         remaining_tokens = history_token_budget
-        for msg in reversed(prior):
-            rendered = _render_prior_message(msg)
+        for index in range(len(prior) - 1, -1, -1):
+            rendered = _render_prior_message(prior[index])
             if remaining_tokens is not None:
                 remaining_tokens -= _estimated_replay_tokens(rendered)
                 if remaining_tokens < 0:
                     break
-            kept.append(rendered)
+            rendered_newest_first.append(rendered)
+            if cut_points is None or cut_points[index]:
+                kept_count = len(rendered_newest_first)
+        kept = rendered_newest_first[:kept_count]
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         omitted = len(prior) - len(kept)
