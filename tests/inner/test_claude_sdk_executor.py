@@ -786,7 +786,10 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("turn-", prompt)
         self.assertTrue(prompt.endswith("user: What next?"))
 
-    def test_budgeted_replay_counts_an_image_by_estimate_not_encoded_size(self):
+    # LOCAL (port of #11978 onto v0.21): historical attachments replay as text
+    # placeholders here (local patch 4f4921044), not as image/document blocks
+    # as on upstream main, so a resolved attachment costs only its placeholder.
+    def test_budgeted_replay_counts_a_historical_image_as_its_placeholder(self):
         executor = self._make_executor()
         image_payload = base64.b64encode(b"\0" * 300_000).decode("ascii")
         messages = [
@@ -801,14 +804,15 @@ class TestPromptExtraction(unittest.TestCase):
             {"role": "user", "content": "What next?"},
         ]
 
-        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=2_100)
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=100)
 
-        self.assertEqual(len([block for block in prompt if block.get("type") == "image"]), 1)
-        text = self._text_of(prompt)
-        self.assertIn("Keep this image.", text)
-        self.assertNotIn("omitted", text)
+        self.assertIsInstance(prompt, str)
+        self.assertIn("[image previously shared]", prompt)
+        self.assertIn("Keep this image.", prompt)
+        self.assertNotIn("omitted", prompt)
+        self.assertNotIn(image_payload[:64], prompt)
 
-    def test_budgeted_replay_counts_a_pdf_by_its_encoded_size(self):
+    def test_budgeted_replay_counts_a_historical_pdf_as_its_placeholder(self):
         executor = self._make_executor()
         pdf_payload = base64.b64encode(b"%PDF-1.7" + b"\0" * 300_000).decode("ascii")
         messages = [
@@ -826,14 +830,22 @@ class TestPromptExtraction(unittest.TestCase):
             {"role": "user", "content": "What next?"},
         ]
 
-        prompt = executor._build_prompt(
-            messages, resume_session=False, history_token_budget=100_000
-        )
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=100)
 
         self.assertIsInstance(prompt, str)
-        self.assertIn("[Earlier messages omitted to fit the model's context window: 1.]", prompt)
-        self.assertNotIn("Read this report.", prompt)
-        self.assertIn("assistant: Read.", prompt)
+        self.assertIn("[attachment previously shared]", prompt)
+        self.assertIn("Read this report.", prompt)
+        self.assertNotIn("omitted", prompt)
+
+    def test_replay_estimate_prices_attachment_blocks(self):
+        from omnigent.inner.claude_sdk_executor import _estimated_replay_tokens
+
+        image = {"type": "image", "source": {"type": "base64", "data": "A" * 900_000}}
+        small_pdf = {"type": "document", "source": {"type": "base64", "data": "A" * 300}}
+        big_pdf = {"type": "document", "source": {"type": "base64", "data": "A" * 900_000}}
+        self.assertEqual(_estimated_replay_tokens([image]), 2_000)
+        self.assertEqual(_estimated_replay_tokens([small_pdf]), 2_000)
+        self.assertEqual(_estimated_replay_tokens([big_pdf]), 300_000)
 
 
 # ---------------------------------------------------------------------------
