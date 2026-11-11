@@ -119,6 +119,8 @@ _REPLAYED_HISTORY_WINDOW_SHARE = 0.5
 _REPLAYED_HISTORY_BYTES_PER_TOKEN = 3
 # An image's token cost does not follow its encoded size; this also floors a PDF's estimate.
 _REPLAYED_ATTACHMENT_TOKEN_ESTIMATE = 2_000
+# LOCAL: overrides _REPLAYED_HISTORY_WINDOW_SHARE (capped at 1.0); <= 0 disables the budget.
+_REPLAYED_HISTORY_WINDOW_SHARE_ENV = "OMNIGENT_CLAUDE_SDK_REPLAY_WINDOW_SHARE"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
@@ -635,6 +637,30 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
 def _has_replayable_history(messages: list[Message]) -> bool:
     """Whether a fresh client must replay turns before the latest user message."""
     return sum(msg.get("role") == "user" for msg in messages) > 1
+
+
+def _replayed_history_window_share() -> float | None:
+    """
+    Read the share of the context window a fresh client's replay may fill.
+
+    :returns: ``OMNIGENT_CLAUDE_SDK_REPLAY_WINDOW_SHARE`` capped at 1.0, the
+        default share when it is unset or malformed, or ``None`` when it is
+        ``<= 0`` (replay everything).
+    """
+    raw = os.environ.get(_REPLAYED_HISTORY_WINDOW_SHARE_ENV, "").strip()
+    if not raw:
+        return _REPLAYED_HISTORY_WINDOW_SHARE
+    try:
+        share = float(raw)
+    except ValueError:
+        logger.warning(
+            "%s is not a number (%r); using %s",
+            _REPLAYED_HISTORY_WINDOW_SHARE_ENV,
+            raw,
+            _REPLAYED_HISTORY_WINDOW_SHARE,
+        )
+        return _REPLAYED_HISTORY_WINDOW_SHARE
+    return min(share, 1.0) if share > 0 else None
 
 
 def _resolve_replay_context_window(
@@ -3820,7 +3846,8 @@ class ClaudeSDKExecutor(Executor):
         :returns: The prompt from :meth:`_build_prompt`.
         """
         budget = None
-        if _has_replayable_history(messages):
+        share = _replayed_history_window_share()
+        if share is not None and _has_replayable_history(messages):
             base_model = self._model_override if cfg.model else await self._spec_or_default_model()
             # Off-loop: the window lookup may fetch the model catalog.
             window = await run_sync_on_thread(
@@ -3829,7 +3856,7 @@ class ClaudeSDKExecutor(Executor):
                 base_model,
                 cfg.model,
             )
-            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+            budget = int(window * share)
         return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
 
     @staticmethod
