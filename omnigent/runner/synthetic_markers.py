@@ -1,21 +1,18 @@
 """Synthetic user-role messages the runner injects into session history.
 
-Stdlib-only so executors (``omnigent.inner``) can recognize them without
-importing the runner app.
+Kept free of the runner app's imports so executors (``omnigent.inner``) can
+recognize them. The marker text itself is upstream's
+``omnigent.inner.executor.INTERRUPTION_MARKER_TEXT`` (#12483), aliased here so
+there is one definition.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
 
-CANCELLATION_MARKER_TEXT = (
-    "[System: interrupted]\n"
-    "The user interrupted and abandoned their previous request (the user "
-    "message immediately before this one). Do not resume or act on that "
-    "interrupted request unless the user asks for it again; treat the next "
-    "user message as the current instruction. The preceding assistant "
-    "message may be incomplete."
-)
+from omnigent.inner.executor import INTERRUPTION_MARKER_TEXT
+
+CANCELLATION_MARKER_TEXT = INTERRUPTION_MARKER_TEXT
 
 
 def is_cancellation_marker(message: Mapping[str, object]) -> bool:

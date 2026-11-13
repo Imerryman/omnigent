@@ -12,12 +12,12 @@ from typing import Any, Protocol, cast
 import httpx
 
 from omnigent.debug_logging import runner_primary_session_id
+from omnigent.inner.executor import INTERRUPTION_MARKER_TEXT
 from omnigent.runner.app_support import (
     _resolve_forwarded_message_content,
     _SpecEntry,
 )
 from omnigent.runner.native import _unwrap_resolved_spec
-from omnigent.runner.synthetic_markers import CANCELLATION_MARKER_TEXT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -42,8 +42,7 @@ class SessionHistory:
 
 
 # The user-role item Stop appends; it closes the turn rather than asking for one.
-# CANCELLATION_MARKER_TEXT is defined once in omnigent.runner.synthetic_markers
-# (stdlib-only, so the executors can match it too) and re-exported from here.
+CANCELLATION_MARKER_TEXT = INTERRUPTION_MARKER_TEXT
 
 
 def is_cancellation_marker(item: dict[str, object]) -> bool:
@@ -429,7 +428,7 @@ def build_session_history(
             "content": [
                 {
                     "type": "input_text",
-                    "text": CANCELLATION_MARKER_TEXT,
+                    "text": INTERRUPTION_MARKER_TEXT,
                 }
             ],
         }
