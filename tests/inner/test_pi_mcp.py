@@ -561,3 +561,105 @@ def test_failed_refresh_does_not_block_launch_or_keep_a_stale_copy(
     assert (managed / "mcp.json").resolve() == user_file.resolve()
     assert user_file.read_text(encoding="utf-8") == user_config
     assert not list(managed.glob(".mcp.json.*"))
+
+
+# --- OMNIGENT_PI_HOST_MCP opt-out ----------------------------------------------
+
+
+@pytest.mark.parametrize("value", [None, "", "1", "false"])
+def test_host_servers_are_merged_unless_the_knob_is_zero(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, value: str | None
+) -> None:
+    """Unset, or any value but ``0``, keeps the upstream host merge."""
+    if value is None:
+        monkeypatch.delenv(pi_mcp.PI_HOST_MCP_ENV, raising=False)
+    else:
+        monkeypatch.setenv(pi_mcp.PI_HOST_MCP_ENV, value)
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+
+    managed = _prepare(home, pi_agent)
+
+    assert _managed_servers(managed) == {"github": {"command": "host"}}
+
+
+@pytest.mark.parametrize("value", ["0", " 0 "])
+def test_knob_zero_skips_the_host_merge(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    monkeypatch.setenv(pi_mcp.PI_HOST_MCP_ENV, value)
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+    reads: list[None] = []
+    inventory = pi_mcp._host_mcp_servers
+    monkeypatch.setattr(pi_mcp, "_host_mcp_servers", lambda: reads.append(None) or inventory())
+
+    managed = _prepare(home, pi_agent)
+
+    assert not (managed / "mcp.json").exists()
+    assert not (managed / "mcp.json").is_symlink()
+    assert not (managed / ".omnigent-mcp.json.sha256").exists()
+    assert reads == []
+
+
+def test_knob_zero_links_the_users_own_config(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(pi_mcp.PI_HOST_MCP_ENV, "0")
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+    user_file = pi_agent / "mcp.json"
+    _write_json(user_file, {"mcpServers": {"mine": {"command": "my-server"}}})
+    before = user_file.read_bytes()
+
+    managed = _prepare(home, pi_agent)
+
+    assert (managed / "mcp.json").is_symlink()
+    assert (managed / "mcp.json").resolve() == user_file.resolve()
+    assert user_file.read_bytes() == before
+
+
+def test_knob_zero_drops_a_copy_generated_by_an_earlier_launch(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Turning the knob on for a reused dir removes the host servers from the next launch."""
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+    managed = _prepare(home, pi_agent)
+    assert _managed_servers(managed) == {"github": {"command": "host"}}
+
+    monkeypatch.setenv(pi_mcp.PI_HOST_MCP_ENV, "0")
+    _prepare(home, pi_agent)
+    assert not (managed / "mcp.json").exists()
+    assert not (managed / ".omnigent-mcp.json.sha256").exists()
+
+    _write_json(pi_agent / "mcp.json", {"mcpServers": {"mine": {"command": "my-server"}}})
+    _prepare(home, pi_agent)
+    assert (managed / "mcp.json").resolve() == (pi_agent / "mcp.json").resolve()
+
+
+def test_knob_zero_keeps_a_session_owned_config(
+    home: Path, pi_agent: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+    managed = _prepare(home, pi_agent)
+    session_config = '{"mcpServers": {"added-in-pi": {"command": "mine"}}}'
+    (managed / "mcp.json").write_text(session_config, encoding="utf-8")
+
+    monkeypatch.setenv(pi_mcp.PI_HOST_MCP_ENV, "0")
+    _prepare(home, pi_agent)
+
+    assert (managed / "mcp.json").read_text(encoding="utf-8") == session_config
+
+
+def test_knob_zero_leaves_a_project_pi_config_alone(
+    home: Path, pi_agent: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pi reads a project's ``.pi/mcp.json`` from the session cwd; the knob never touches it."""
+    project_file = tmp_path / "project" / ".pi" / "mcp.json"
+    _write_json(project_file, {"mcpServers": {"repo-tools": {"command": "repo-mcp"}}})
+    before = project_file.read_bytes()
+    monkeypatch.chdir(project_file.parent.parent)
+    monkeypatch.setenv(pi_mcp.PI_HOST_MCP_ENV, "0")
+    _write_json(home / ".claude.json", {"mcpServers": {"github": {"command": "host"}}})
+
+    _prepare(home, pi_agent)
+
+    assert project_file.read_bytes() == before
+    assert sorted(path.name for path in project_file.parent.iterdir()) == ["mcp.json"]

@@ -5557,6 +5557,25 @@ def test_runner_env_allowlist_timeout_knob_set_is_pinned() -> None:
     )
 
 
+def test_build_runner_env_forwards_the_pi_host_mcp_knob() -> None:
+    """``OMNIGENT_PI_HOST_MCP`` is set on the host but read in the runner.
+
+    ``inner/pi_mcp.sync_managed_pi_mcp_config`` runs in the runner, which
+    re-execs with a cleared environment; without the allowlist entry a
+    drop-in setting ``0`` would be stripped and Pi panes would still get the
+    host's MCP servers.
+    """
+    env = _build_runner_env(
+        {"PATH": "/usr/bin:/bin", "OMNIGENT_PI_HOST_MCP": "0"},
+        server_url="http://server",
+        runner_id="runner_abc",
+        binding_token="tok",
+        workspace="/ws",
+        parent_pid=42,
+    )
+    assert env["OMNIGENT_PI_HOST_MCP"] == "0"
+
+
 def test_build_runner_env_propagates_reaper_and_turn_timeouts() -> None:
     """The reaper / turn-timeout knobs reach the runner.
 

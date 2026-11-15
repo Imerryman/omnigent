@@ -815,6 +815,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # Numeric tuning knobs, not secrets.
         "OMNIGENT_HARNESS_IDLE_TIMEOUT_S",
         "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S",
+        # inner/pi_mcp.sync_managed_pi_mcp_config runs in the runner: "0" keeps
+        # the host's MCP servers out of managed Pi agent dirs. Not a secret.
+        "OMNIGENT_PI_HOST_MCP",
         # Opaque request-routing headers (dev/test): a JSON header map folded by
         # cli_auth.databricks_request_headers into every client→server connection
         # so a request pins to a specific server instance/replica. Must reach the
