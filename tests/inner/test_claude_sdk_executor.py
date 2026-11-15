@@ -19,14 +19,17 @@ import pytest
 
 from omnigent.inner.claude_sdk_executor import _to_anthropic_content_blocks
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     ExecutorConfig,
     ExecutorError,
     TextChunk,
     ToolCallComplete,
     ToolCallRequest,
     ToolCallStatus,
+    TurnCancelled,
     TurnComplete,
 )
+from omnigent.runner.synthetic_markers import CANCELLATION_MARKER_TEXT
 from tests._helpers.live_server import terminate_process
 from tests._helpers.managed_mcp import expand_entry_value
 from tests._helpers.stdio_jsonrpc import read_json_line, write_json_line
@@ -211,6 +214,19 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("old one", prompt)
         self.assertNotIn("old two", prompt)
 
+    def test_resumed_session_trailing_run_starts_at_interruption_marker(self):
+        """A kept session already saw the interrupted request; send a pending marker onward."""
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead."},
+        ]
+        prompt = executor._build_prompt(messages, resume_session=True, after_interrupt=True)
+        self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        prompt = executor._build_prompt(messages, resume_session=True)
+        self.assertEqual(prompt, "Summarize instead.")
+
     def test_resumed_session_multimodal_trailing_run_preserves_blocks(self):
         """A multimodal message in the trailing run keeps structured blocks for all."""
         executor = self._make_executor()
@@ -287,10 +303,12 @@ class TestPromptExtraction(unittest.TestCase):
         """Join the text blocks of a structured prompt for framing assertions."""
         return "\n".join(block["text"] for block in prompt if block.get("type") == "text")
 
-    def test_cold_reload_replays_historical_image_as_structured_block(self):
-        # A restarted/fresh SDK client must be able to *look at* an image from
-        # an earlier turn. Flattening it into a text marker leaves the model
-        # describing an attachment it cannot see.
+    def test_cold_reload_replays_historical_image_as_placeholder_text(self):
+        # A restarted/fresh SDK client packs prior history into one replay
+        # message. Re-sending a prior turn's image as a real content block
+        # there is indistinguishable from a freshly attached image, so the
+        # model reports the old photo as just sent. History attachments must
+        # become a visible text placeholder instead.
         executor = self._make_executor()
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
         image_data_uri = f"data:image/png;base64,{image_payload}"
@@ -312,26 +330,24 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
-        self.assertIsInstance(prompt, list)
-        images = [block for block in prompt if block.get("type") == "image"]
-        self.assertEqual(len(images), 1)
-        self.assertEqual(
-            images[0]["source"],
-            {"type": "base64", "media_type": "image/png", "data": image_payload},
-        )
-        # The bytes travel as a structured block, never as prompt text.
-        text = self._text_of(prompt)
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
         self.assertNotIn(image_payload, text)
         self.assertNotIn("data:", text)
-        # Framing and ordering survive around the replayed image.
+        self.assertIn("[image previously shared: screenshot.png]", text)
+        # Framing and ordering survive around the replayed placeholder.
         self.assertIn("Conversation so far:", text)
         self.assertIn("What is shown here?", text)
         self.assertIn("Respond to the latest user message", text)
         self.assertIn("Summarize our conversation.", text)
 
-    def test_cold_reload_replays_historical_file_as_structured_document(self):
-        # The same fidelity requirement applies to non-image attachments: a
-        # resolved PDF must reach the SDK as a document block, not a marker.
+    def test_cold_reload_replays_historical_file_as_placeholder_text(self):
+        # The same requirement applies to non-image attachments: a resolved
+        # PDF from history must become a text placeholder, not a document
+        # block the model reads as a freshly attached file.
         executor = self._make_executor()
         file_payload = base64.b64encode(b"synthetic pdf bytes").decode("ascii")
         file_data_uri = f"data:application/pdf;base64,{file_payload}"
@@ -353,21 +369,113 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "document"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
+        self.assertNotIn(file_payload, text)
+        self.assertIn("[attachment previously shared: doc.pdf]", text)
+        self.assertIn("What does this document say?", text)
+
+    def test_cold_reload_new_turn_image_stays_real_while_history_is_placeholder(self):
+        # The latest user message's own attachments must still travel as
+        # real content blocks (the model needs to see what was just sent);
+        # only the replayed history is downgraded to a placeholder.
+        executor = self._make_executor()
+        history_payload = base64.b64encode(b"old synthetic png bytes").decode("ascii")
+        new_payload = base64.b64encode(b"new synthetic png bytes").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{history_payload}",
+                        "filename": "old.png",
+                    },
+                    {"type": "input_text", "text": "look at this old photo"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the old photo."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{new_payload}",
+                        "filename": "new.png",
+                    },
+                    {"type": "input_text", "text": "and now this one"},
+                ],
+            },
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
         self.assertIsInstance(prompt, list)
-        documents = [block for block in prompt if block.get("type") == "document"]
-        self.assertEqual(len(documents), 1)
+        images = [b for b in prompt if b.get("type") == "image"]
+        self.assertEqual(len(images), 1)
         self.assertEqual(
-            documents[0]["source"],
-            {"type": "base64", "media_type": "application/pdf", "data": file_payload},
+            images[0]["source"],
+            {"type": "base64", "media_type": "image/png", "data": new_payload},
         )
         text = self._text_of(prompt)
-        self.assertNotIn(file_payload, text)
-        self.assertIn("What does this document say?", text)
+        self.assertIn("[image previously shared: old.png]", text)
+        self.assertNotIn(history_payload, text)
+        self.assertIn("look at this old photo", text)
+        self.assertIn("and now this one", text)
+
+    def test_cold_reload_multiple_historical_images_placeholder_handles_missing_filename(self):
+        # Several historical images in the same replay, one missing a
+        # filename: each becomes its own placeholder, falling back to the
+        # bare marker when no filename/file_id metadata is available.
+        executor = self._make_executor()
+        payload_one = base64.b64encode(b"first synthetic png").decode("ascii")
+        payload_two = base64.b64encode(b"second synthetic png").decode("ascii")
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{payload_one}",
+                        "filename": "first.png",
+                    },
+                    {"type": "input_text", "text": "first photo"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the first photo."},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_image",
+                        "image_url": f"data:image/png;base64,{payload_two}",
+                    },
+                    {"type": "input_text", "text": "second photo, no filename"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the second photo."},
+            {"role": "user", "content": "Summarize both photos."},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
+        self.assertIn("[image previously shared: first.png]", text)
+        self.assertIn("[image previously shared]", text)
+        self.assertNotIn(payload_one, text)
+        self.assertNotIn(payload_two, text)
 
     def test_cold_reload_keeps_unresolved_history_attachment_visible(self):
         # A resolved and an unresolved attachment in the same history: the
-        # resolved one becomes real bytes, the unresolved one must still say
-        # so out loud rather than vanish from the structured prompt.
+        # resolved one becomes a placeholder, the unresolved one must still
+        # say so out loud rather than vanish from the prompt.
         executor = self._make_executor()
         image_payload = base64.b64encode(b"synthetic png bytes").decode("ascii")
         messages = [
@@ -393,12 +501,257 @@ class TestPromptExtraction(unittest.TestCase):
 
         prompt = executor._build_prompt(messages, resume_session=False)
 
-        self.assertIsInstance(prompt, list)
-        self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 1)
-        text = self._text_of(prompt)
+        if isinstance(prompt, list):
+            self.assertEqual(len([b for b in prompt if b.get("type") == "image"]), 0)
+            text = self._text_of(prompt)
+        else:
+            text = prompt
+        self.assertIn("[image previously shared: resolved.png]", text)
+        self.assertNotIn(image_payload, text)
         self.assertIn("[Attachment lost.png could not be loaded]", text)
         self.assertNotIn("file_id", text)
         self.assertIn("two attachments", text)
+
+    @staticmethod
+    def _png_block(payload: bytes, filename: str) -> dict:
+        encoded = base64.b64encode(payload).decode("ascii")
+        return {
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{encoded}",
+            "filename": filename,
+        }
+
+    def test_fresh_start_trailing_user_run_keeps_every_image_native(self):
+        # Two user messages after the last assistant reply are BOTH current
+        # input: both images must go as real blocks, not just the last one.
+        executor = self._make_executor()
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"old", "old.png"),
+                    {"type": "input_text", "text": "history text"},
+                ],
+            },
+            {"role": "assistant", "content": "Ready."},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"aaa", "current-a.png"),
+                    {"type": "input_text", "text": "First"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"bbb", "current-b.png"),
+                    {"type": "input_text", "text": "Second"},
+                ],
+            },
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        images = [b for b in prompt if b.get("type") == "image"]
+        self.assertEqual(
+            [b["source"]["data"] for b in images],
+            [base64.b64encode(b"aaa").decode(), base64.b64encode(b"bbb").decode()],
+        )
+        text = self._text_of(prompt)
+        self.assertIn("[image previously shared: old.png]", text)
+        self.assertNotIn("current-a.png", text)
+        self.assertNotIn("current-b.png", text)
+        # Order: history framing first, then the current run in order.
+        kinds = [b.get("type") for b in prompt]
+        self.assertEqual(kinds[-4:], ["image", "text", "image", "text"])
+        self.assertEqual(prompt[-3]["text"], "First")
+        self.assertEqual(prompt[-1]["text"], "Second")
+
+    def test_fresh_start_conversation_so_far_excludes_current_run_text(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": "CURRENT-ONE"},
+            {"role": "user", "content": "CURRENT-TWO"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        text = prompt if isinstance(prompt, str) else self._text_of(prompt)
+        head, sep, tail = text.partition("Respond to the latest user message")
+        self.assertTrue(sep)
+        self.assertIn("Earlier question", head)
+        self.assertIn("assistant: Ready.", head)
+        self.assertNotIn("CURRENT-ONE", head)
+        self.assertNotIn("CURRENT-TWO", head)
+        self.assertEqual(text.count("CURRENT-ONE"), 1)
+        self.assertEqual(text.count("CURRENT-TWO"), 1)
+        self.assertLess(tail.index("CURRENT-ONE"), tail.index("CURRENT-TWO"))
+
+    def test_fresh_start_trailing_run_of_three_with_only_middle_image(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": "one"},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"mid", "middle.png"),
+                    {"type": "input_text", "text": "two"},
+                ],
+            },
+            {"role": "user", "content": "three"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        images = [b for b in prompt if b.get("type") == "image"]
+        self.assertEqual(len(images), 1)
+        self.assertEqual(images[0]["source"]["data"], base64.b64encode(b"mid").decode())
+        text = self._text_of(prompt)
+        self.assertNotIn("previously shared", text)
+        self.assertNotIn("middle.png", text)
+        tail = [b.get("type") if b.get("type") != "text" else b["text"] for b in prompt[-4:]]
+        self.assertEqual(tail, ["one", "image", "two", "three"])
+
+    def test_fresh_start_interruption_marker_closes_the_current_run(self):
+        # The abandoned request (and its image) precedes the runner's
+        # [System: interrupted] marker; only the replacement is current.
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Working on it..."},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"abandoned", "abandoned.png"),
+                    {"type": "input_text", "text": "ABANDONED-REQUEST"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            },
+            {"role": "user", "content": "REPLACEMENT-REQUEST"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        # Nothing native survives, so the prompt collapses to plain text.
+        self.assertIsInstance(prompt, str)
+        text = prompt
+        head, sep, _tail = text.partition("Respond to the latest user message")
+        self.assertTrue(sep)
+        self.assertIn("[image previously shared: abandoned.png]", head)
+        self.assertIn("ABANDONED-REQUEST", head)
+        self.assertIn("[System: interrupted]", head)
+        self.assertNotIn("REPLACEMENT-REQUEST", head)
+        self.assertEqual(text.count("REPLACEMENT-REQUEST"), 1)
+        self.assertEqual(text.count("ABANDONED-REQUEST"), 1)
+        self.assertEqual(text.count("[System: interrupted]"), 1)
+
+    def test_fresh_start_run_after_interruption_marker_keeps_images_native(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "Working on it..."},
+            {"role": "user", "content": "abandoned"},
+            {"role": "user", "content": CANCELLATION_MARKER_TEXT},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"new1", "new1.png"),
+                    {"type": "input_text", "text": "first"},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"new2", "new2.png"),
+                    {"type": "input_text", "text": "second"},
+                ],
+            },
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, list)
+        images = [b for b in prompt if b.get("type") == "image"]
+        self.assertEqual(
+            [b["source"]["data"] for b in images],
+            [base64.b64encode(b"new1").decode(), base64.b64encode(b"new2").decode()],
+        )
+        self.assertNotIn("previously shared", self._text_of(prompt))
+
+    def test_fresh_start_compact_inside_trailing_run_loses_nothing(self):
+        # A synthesized /compact inside the trailing run: everything up to and
+        # including it is history, what follows is current; every message
+        # appears exactly once.
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Earlier question"},
+            {"role": "assistant", "content": "Ready."},
+            {"role": "user", "content": "PRE-COMPACT-CONTENT"},
+            {"role": "user", "content": "/compact"},
+            {"role": "user", "content": "FOLLOW-UP"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        text = prompt if isinstance(prompt, str) else self._text_of(prompt)
+        head, sep, tail = text.partition("Respond to the latest user message")
+        self.assertTrue(sep)
+        self.assertEqual(text.count("PRE-COMPACT-CONTENT"), 1)
+        self.assertEqual(text.count("FOLLOW-UP"), 1)
+        self.assertIn("PRE-COMPACT-CONTENT", head)
+        self.assertIn("user: /compact", head)
+        self.assertNotIn("FOLLOW-UP", head)
+        self.assertIn("FOLLOW-UP", tail)
+
+    def test_fresh_start_compact_inside_trailing_run_keeps_pre_compact_image_once(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "assistant", "content": "Ready."},
+            {
+                "role": "user",
+                "content": [
+                    self._png_block(b"pre", "pre.png"),
+                    {"type": "input_text", "text": "PRE-COMPACT"},
+                ],
+            },
+            {"role": "user", "content": [{"type": "input_text", "text": "/compact"}]},
+            {"role": "user", "content": "FOLLOW-UP"},
+        ]
+
+        prompt = executor._build_prompt(messages, resume_session=False)
+
+        self.assertIsInstance(prompt, str)
+        text = prompt
+        self.assertEqual(text.count("PRE-COMPACT"), 1)
+        self.assertEqual(text.count("FOLLOW-UP"), 1)
+        self.assertIn("[image previously shared: pre.png]", text)
+
+    def test_fresh_start_single_trailing_user_output_is_unchanged(self):
+        # One current user message: the exact prompt shape must not change.
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "The secret codeword is ZEBRA-99."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+
+        self.assertEqual(
+            executor._build_prompt(messages, resume_session=False),
+            "Conversation so far:\n"
+            "user: The secret codeword is ZEBRA-99.\n"
+            "assistant: Understood.\n"
+            "\n"
+            "Respond to the latest user message, using the conversation above as context."
+            "\n\nuser: Summarize our conversation.",
+        )
 
     def test_historical_image_source_block_is_replaced_with_compact_placeholder(self):
         # The ``Read`` tool returns an image file as an Anthropic content block
@@ -451,7 +804,10 @@ class TestPromptExtraction(unittest.TestCase):
         self.assertNotIn("turn-", prompt)
         self.assertTrue(prompt.endswith("user: What next?"))
 
-    def test_budgeted_replay_counts_an_image_by_estimate_not_encoded_size(self):
+    # LOCAL (port of #11978 onto v0.21): historical attachments replay as text
+    # placeholders here (local patch 4f4921044), not as image/document blocks
+    # as on upstream main, so a resolved attachment costs only its placeholder.
+    def test_budgeted_replay_counts_a_historical_image_as_its_placeholder(self):
         executor = self._make_executor()
         image_payload = base64.b64encode(b"\0" * 300_000).decode("ascii")
         messages = [
@@ -466,14 +822,15 @@ class TestPromptExtraction(unittest.TestCase):
             {"role": "user", "content": "What next?"},
         ]
 
-        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=2_100)
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=100)
 
-        self.assertEqual(len([block for block in prompt if block.get("type") == "image"]), 1)
-        text = self._text_of(prompt)
-        self.assertIn("Keep this image.", text)
-        self.assertNotIn("omitted", text)
+        self.assertIsInstance(prompt, str)
+        self.assertIn("[image previously shared]", prompt)
+        self.assertIn("Keep this image.", prompt)
+        self.assertNotIn("omitted", prompt)
+        self.assertNotIn(image_payload[:64], prompt)
 
-    def test_budgeted_replay_counts_a_pdf_by_its_encoded_size(self):
+    def test_budgeted_replay_counts_a_historical_pdf_as_its_placeholder(self):
         executor = self._make_executor()
         pdf_payload = base64.b64encode(b"%PDF-1.7" + b"\0" * 300_000).decode("ascii")
         messages = [
@@ -491,14 +848,22 @@ class TestPromptExtraction(unittest.TestCase):
             {"role": "user", "content": "What next?"},
         ]
 
-        prompt = executor._build_prompt(
-            messages, resume_session=False, history_token_budget=100_000
-        )
+        prompt = executor._build_prompt(messages, resume_session=False, history_token_budget=100)
 
         self.assertIsInstance(prompt, str)
-        self.assertIn("[Earlier messages omitted to fit the model's context window: 1.]", prompt)
-        self.assertNotIn("Read this report.", prompt)
-        self.assertIn("assistant: Read.", prompt)
+        self.assertIn("[attachment previously shared]", prompt)
+        self.assertIn("Read this report.", prompt)
+        self.assertNotIn("omitted", prompt)
+
+    def test_replay_estimate_prices_attachment_blocks(self):
+        from omnigent.inner.claude_sdk_executor import _estimated_replay_tokens
+
+        image = {"type": "image", "source": {"type": "base64", "data": "A" * 900_000}}
+        small_pdf = {"type": "document", "source": {"type": "base64", "data": "A" * 300}}
+        big_pdf = {"type": "document", "source": {"type": "base64", "data": "A" * 900_000}}
+        self.assertEqual(_estimated_replay_tokens([image]), 2_000)
+        self.assertEqual(_estimated_replay_tokens([small_pdf]), 2_000)
+        self.assertEqual(_estimated_replay_tokens([big_pdf]), 300_000)
 
 
 # ---------------------------------------------------------------------------
@@ -3157,49 +3522,115 @@ class TestStreamEventStreaming(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupt_session_interrupts_then_drops_session(self):
-        """A user interrupt fires a safe interrupt, then drops the session.
+    def _interrupt_query_then_follow_up(self, *, compacts: bool):
+        """Interrupt a running query, optionally after a CLI compaction, then send a follow-up."""
+        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-        ``run_turn`` decides whether to resume via
-        ``session_key in self._clients``. Dropping the session after an
-        interrupt is what forces the next turn to rebuild from full
-        history (with the runner's ``[System: interrupted]`` marker)
-        instead of resuming a live session whose transcript still holds
-        the abandoned prompt. If ``_clients`` were left populated, the
-        next turn would resume and silently continue the canceled
-        instruction.
-        """
-        from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
-
-        interrupt = AsyncMock()
+        queries: list[object] = []
+        connect_calls: list[object] = []
         disconnect = AsyncMock()
-        client = type("Client", (), {"interrupt": interrupt, "disconnect": disconnect})()
+        interrupt_calls: list[object] = []
+        query_started = asyncio.Event()
+
+        class _ResultMessage:
+            def __init__(self, session_id, result):
+                self.session_id = session_id
+                self.result = result
+
+        class _SystemMessage:
+            subtype = "hook_started"
+            data = {"hook_event": "PreCompact"}
+            hook_event_name = "PreCompact"
+
+        class _FakeSDK(_sdk_types()):
+            ResultMessage = _ResultMessage
+            SystemMessage = _SystemMessage
+
+            class ClaudeSDKClient(_SDKClient):
+                async def connect(self):
+                    connect_calls.append(self)
+                    self.result_ready = asyncio.Event()
+
+                async def query(self, prompt, session_id="default"):
+                    queries.append(prompt)
+                    query_started.set()
+                    if len(queries) > 1:
+                        self.result_ready.set()
+
+                async def receive_response(self):
+                    if compacts and len(queries) == 1:
+                        yield _SystemMessage()
+                    await self.result_ready.wait()
+                    # The first follow-up ends without assistant text.
+                    yield _ResultMessage(
+                        "claude-session-a", [None, None, "THANKS"][len(queries) - 1]
+                    )
+
+                async def interrupt(self):
+                    interrupt_calls.append(self)
+                    self.result_ready.set()
+
+                async def disconnect(self):
+                    await disconnect()
 
         async def _t():
             executor = ClaudeSDKExecutor()
-            executor._clients["session-a"] = _ClaudeClientState(client=client, model=None)
+            history = [
+                {"role": "user", "content": "Write a long essay.", "session_id": "session-a"}
+            ]
+            with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
 
-            interrupted = await executor.interrupt_session("session-a")
+                async def _collect(messages):
+                    return [e async for e in executor.run_turn(messages, [], "")]
 
-            self.assertTrue(interrupted)
-            # Safe interrupt is attempted first to halt the in-flight turn.
-            interrupt.assert_awaited_once_with()
-            # Then the session is torn down (disconnect) and removed from
-            # _clients so the next turn cannot resume it. An empty dict here
-            # is the invariant that prevents the canceled-instruction leak.
-            disconnect.assert_awaited_once_with()
-            self.assertEqual(executor._clients, {})
+                first_turn = asyncio.create_task(_collect(history))
+                await query_started.wait()
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                self.assertTrue(await executor.interrupt_session("session-a"))
+                first_events = await first_turn
 
-        _run(_t())
+                history.append({"role": "user", "content": INTERRUPTION_MARKER_TEXT})
+                follow_up_events = []
+                for text in ("Summarize instead.", "Thanks."):
+                    history.append({"role": "user", "content": text, "session_id": "session-a"})
+                    follow_up_events.append(await _collect(list(history)))
+            await asyncio.gather(*executor._cancel_close_tasks)
+            return first_events, follow_up_events
 
-    def test_interrupt_session_closes_even_when_interrupt_fails(self):
-        """A failed safe interrupt still drops the session.
+        first_events, follow_up_events = _run(_t())
+        return first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect
 
-        The session must be torn down regardless of whether the SDK's
-        ``interrupt()`` succeeds — otherwise a flaky interrupt would
-        leave the abandoned-prompt session resumable. If ``close_session``
-        is not awaited here, the interrupt-failure path leaks the session.
-        """
+    def test_interrupted_query_keeps_session_for_next_turn(self):
+        """An interrupted query ends as cancelled and the next query resumes the same client."""
+        first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect = (
+            self._interrupt_query_then_follow_up(compacts=False)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(interrupt_calls), 1)
+        self.assertEqual(len(connect_calls), 1)
+        disconnect.assert_not_awaited()
+        self.assertEqual(queries[1], f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertTrue(queries[2].endswith("Thanks."))
+        self.assertFalse(follow_up_events[0][-1].response)
+        self.assertEqual(follow_up_events[1][-1].response, "THANKS")
+
+    def test_interrupted_query_that_compacted_replays_history_in_new_client(self):
+        """A compaction the server never received is not resumed; the next turn replays history."""
+        first_events, follow_up_events, queries, connect_calls, _, _ = (
+            self._interrupt_query_then_follow_up(compacts=True)
+        )
+
+        self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(len(connect_calls), 2)
+        self.assertIn("Conversation so far:", queries[1])
+        self.assertIn("Write a long essay.", queries[1])
+        self.assertNotIn(INTERRUPTION_MARKER_TEXT, queries[2])
+        self.assertIsInstance(follow_up_events[-1][-1], TurnComplete)
+
+    def test_interrupt_session_closes_when_interrupt_fails(self):
+        """A failed interrupt drops the session so a still-running query cannot be resumed."""
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 
         async def fail_interrupt():

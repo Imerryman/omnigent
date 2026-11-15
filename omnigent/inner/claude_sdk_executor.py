@@ -31,6 +31,7 @@ import asyncio
 import base64
 import json
 import logging
+import math
 import os
 import pathlib
 import shutil
@@ -72,6 +73,7 @@ from omnigent.models.claude_model_vocabulary import (
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.models.model_override import is_databricks_model_id
+from omnigent.runner.synthetic_markers import is_cancellation_marker
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.types import RetryPolicy
 from omnigent.telemetry.surface import harness_client_surface
@@ -99,9 +101,11 @@ from .executor import (
     ToolCallRequest,
     ToolCallStatus,
     ToolSpec,
+    TurnCancelled,
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    is_interruption_marker,
     without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
@@ -133,6 +137,8 @@ _REPLAYED_HISTORY_WINDOW_SHARE = 0.5
 _REPLAYED_HISTORY_BYTES_PER_TOKEN = 3
 # An image's token cost does not follow its encoded size; this also floors a PDF's estimate.
 _REPLAYED_ATTACHMENT_TOKEN_ESTIMATE = 2_000
+# LOCAL: overrides _REPLAYED_HISTORY_WINDOW_SHARE (capped at 1.0); <= 0 disables the budget.
+_REPLAYED_HISTORY_WINDOW_SHARE_ENV = "OMNIGENT_CLAUDE_SDK_REPLAY_WINDOW_SHARE"
 
 # Claude Code forwards the ANTHROPIC_CUSTOM_HEADERS value verbatim as
 # request headers. The Databricks Unity Gateway only serves Claude requests
@@ -446,6 +452,8 @@ _CONNECT_TIMEOUT_SECONDS = 60.0
 _QUERY_START_TIMEOUT_SECONDS = 30.0
 _MCP_STATUS_TIMEOUT_SECONDS = 10.0
 _MCP_RECONNECT_TIMEOUT_SECONDS = 30.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_INTERRUPT_TIMEOUT_SECONDS = 1.5
 # When the response stream is quiet for this long we emit a warning,
 # but keep waiting — a long-running native tool can legitimately block
 # the stream far longer than any fixed deadline.
@@ -468,9 +476,9 @@ def _get_inline_data_uri_info(value: Any) -> tuple[str, int] | None:  # type: ig
 
     (non-image files carry the same payload under ``file_data`` instead of
     ``image_url``.) Returns e.g. ``("image/png", 519324)`` — the media type and
-    payload size used to build the compact
-    ``[image: screenshot.png, image/png, 519324 base64 chars]`` placeholder,
-    so the raw base64 never lands in the ``Conversation so far:`` prompt text.
+    payload size, used only to confirm an attachment resolved to real bytes
+    before the caller swaps it for a text placeholder, so the raw base64
+    never lands in the ``Conversation so far:`` prompt text.
     """
     if isinstance(value, str):
         parsed = _parse_replay_data_uri(value)
@@ -530,6 +538,18 @@ def _redact_inline_base64(value: Any) -> Any:  # type: ignore[explicit-any]
     return value
 
 
+def _is_compact_command(message: Message) -> bool:
+    """Return whether ``message`` is the user ``/compact`` control command."""
+    content = message.get("content")
+    return content == "/compact" or (
+        isinstance(content, list)
+        and len(content) == 1
+        and isinstance(content[0], dict)
+        and content[0].get("type") in {"text", "input_text"}
+        and content[0].get("text") == "/compact"
+    )
+
+
 def _text_block(text: str) -> _JsonObject:
     """Build an Anthropic text content block holding *text*."""
     return {"type": "text", "text": text}
@@ -554,24 +574,20 @@ def _coalesce_text_blocks(blocks: list[_JsonObject]) -> list[_JsonObject]:
     return merged
 
 
-def _structured_history_block(block: _JsonObject) -> _JsonObject | None:
+def _history_attachment_placeholder(block: _JsonObject, kind: str) -> str:
     """
-    Convert a resolved history attachment to a real Anthropic block.
+    Compact text placeholder for a resolved historical attachment.
 
-    :param block: A prior-turn content block carrying an inline data URI.
-    :returns: The ``image``/``document`` block, or ``None`` when the block
-        is not a convertible attachment shape — the caller then falls back
-        to the compact text marker rather than dropping the attachment.
+    :param block: The prior-turn ``input_image``/``input_file`` block.
+    :param kind: ``"image"`` or ``"attachment"``, matching ``block``'s type.
+    :returns: e.g. ``"[image previously shared: screenshot.png]"``, naming
+        the attachment by ``filename`` then ``file_id``, or the bare
+        ``"[image previously shared]"`` marker when neither is available.
     """
-    if block.get("type") not in ("input_image", "input_file"):
-        return None
-    try:
-        # Covers a malformed data URI and a bad base64 payload alike
-        # (``binascii.Error`` subclasses ``ValueError``).
-        converted = _to_anthropic_content_blocks([block])
-    except ValueError:
-        return None
-    return converted[0] if converted else None
+    identifier = block.get("filename") or block.get("file_id")
+    if isinstance(identifier, str) and identifier:
+        return f"[{kind} previously shared: {identifier}]"
+    return f"[{kind} previously shared]"
 
 
 def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
@@ -585,25 +601,27 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
     historical image/file block's ``file_id`` has already been resolved to a
     ``data:<media>;base64,...`` URI.
 
-    Those resolved attachments are replayed as **structured** ``image`` /
-    ``document`` blocks, interleaved in order with the surrounding text, so the
-    cold-started client can actually inspect the image instead of reading a
-    description of it. Structured blocks are also what keeps the prompt small:
-    ``json.dumps()``-ing the block flattened the whole base64 payload into
-    prompt TEXT, so the model tokenized the bytes as text rather than counting
-    them as an image — seven ~390KB PNGs expand to ~2.5M tokens, and one real
-    shared session hit a 3.5M-token prompt against a 1M limit.
+    A resolved attachment is **never** replayed as a real ``image``/``document``
+    block: a block inside the "Conversation so far:" replay is indistinguishable
+    from one attached to the current turn, so the cold-started client reports a
+    photo from three turns ago as freshly sent. Instead it becomes a compact
+    ``[image/attachment previously shared: <name>]`` text placeholder — visible
+    proof an attachment existed, without handing the model something it will
+    mistake for new input. (Only the *latest* user message's own attachments,
+    built separately in ``_extract_latest_user_content``, travel as real blocks.)
 
-    Anything that cannot become a structured block never leaks bytes into text.
-    A resolver-produced inline attachment *value* — a whole-string
-    ``data:*;base64,...`` under ``image_url`` / ``file_data``, including nested
-    in dict/list values — is redacted, and an unconvertible attachment falls
-    back to a compact ``[image/attachment: <id>, <media_type>, <N> base64
-    chars]`` marker that preserves *that an attachment was present* without its
-    bytes. An attachment the resolver never inlined renders as the visible
-    "could not be loaded" marker. (This does not attempt to cover non-resolver
-    shapes such as a data URI used as a dict key, a tuple member, or a substring
-    embedded mid-text — the runner never emits those.)
+    Placeholders also keep the prompt small: ``json.dumps()``-ing a resolved
+    block flattens the whole base64 payload into prompt TEXT, so the model
+    tokenizes the bytes as text rather than counting them as an image — seven
+    ~390KB PNGs expand to ~2.5M tokens, and one real shared session hit a
+    3.5M-token prompt against a 1M limit. A resolver-produced inline attachment
+    *value* — a whole-string ``data:*;base64,...`` under ``image_url`` /
+    ``file_data``, including nested in dict/list values — is redacted wherever
+    it isn't converted to a placeholder first. An attachment the resolver never
+    inlined renders as the visible "could not be loaded" marker. (This does not
+    attempt to cover non-resolver shapes such as a data URI used as a dict key,
+    a tuple member, or a substring embedded mid-text — the runner never emits
+    those.)
     """
     if isinstance(content, str):
         sanitized = _redact_inline_base64(content)
@@ -623,18 +641,8 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
 
             inline_data = _get_inline_data_uri_info(block)
             if inline_data is not None:
-                structured = _structured_history_block(block)
-                if structured is not None:
-                    rendered.append(structured)
-                    continue
-                media_type, payload_chars = inline_data
                 kind = "image" if block_type == "input_image" else "attachment"
-                identifier = block.get("filename") or block.get("file_id") or block_type
-                rendered.append(
-                    _text_block(
-                        f"[{kind}: {identifier}, {media_type}, {payload_chars} base64 chars]"
-                    )
-                )
+                rendered.append(_text_block(_history_attachment_placeholder(block, kind)))
                 continue
 
             if block.get("file_id"):
@@ -653,6 +661,33 @@ def _render_prior_content_blocks(content: object) -> list[_JsonObject]:
 def _has_replayable_history(messages: list[Message]) -> bool:
     """Whether a fresh client must replay turns before the latest user message."""
     return sum(msg.get("role") == "user" for msg in messages) > 1
+
+
+def _replayed_history_window_share() -> float | None:
+    """
+    Read the share of the context window a fresh client's replay may fill.
+
+    :returns: ``OMNIGENT_CLAUDE_SDK_REPLAY_WINDOW_SHARE`` capped at 1.0, the
+        default share when it is unset, malformed or not finite, or ``None`` when it is
+        ``<= 0`` (replay everything).
+    """
+    raw = os.environ.get(_REPLAYED_HISTORY_WINDOW_SHARE_ENV, "").strip()
+    if not raw:
+        return _REPLAYED_HISTORY_WINDOW_SHARE
+    try:
+        share = float(raw)
+    except ValueError:
+        share = math.nan
+    if not math.isfinite(share):
+        # NaN would fail ``share > 0`` and silently disable the budget.
+        logger.warning(
+            "%s is not a finite number (%r); using %s",
+            _REPLAYED_HISTORY_WINDOW_SHARE_ENV,
+            raw,
+            _REPLAYED_HISTORY_WINDOW_SHARE,
+        )
+        return _REPLAYED_HISTORY_WINDOW_SHARE
+    return min(share, 1.0) if share > 0 else None
 
 
 def _resolve_replay_context_window(
@@ -709,10 +744,15 @@ def _estimated_replay_tokens(blocks: list[_JsonObject]) -> int:
     """
     Estimate the prompt tokens one rendered prior message adds to a replay.
 
+    Text is priced on its combined size, plus one byte per block for the
+    newline :func:`_coalesce_text_blocks` joins it with, and rounded up once:
+    flooring each block separately priced many short blocks at nothing.
+
     :param blocks: The message's blocks from :func:`_render_prior_message`.
     :returns: A deliberately high estimate, so the replay stays under budget.
     """
     tokens = 0
+    text_bytes = 0
     for block in blocks:
         source = block.get("source")
         if block.get("type") == "text":
@@ -727,8 +767,59 @@ def _estimated_replay_tokens(blocks: list[_JsonObject]) -> int:
         else:
             tokens += _REPLAYED_ATTACHMENT_TOKEN_ESTIMATE
             continue
-        tokens += len(str(text).encode("utf-8")) // _REPLAYED_HISTORY_BYTES_PER_TOKEN
-    return tokens
+        text_bytes += len(str(text).encode("utf-8")) + 1
+    return tokens + -(-text_bytes // _REPLAYED_HISTORY_BYTES_PER_TOKEN)
+
+
+_TOOL_HISTORY_ROLES = ("tool_call", "tool_result")
+
+
+def _replay_call_id(message: Message) -> str | None:
+    """Return the ``metadata.call_id`` pairing a tool call with its result, if any."""
+    if message.get("role") not in _TOOL_HISTORY_ROLES:
+        return None
+    metadata = message.get("metadata")
+    call_id = metadata.get("call_id") if isinstance(metadata, dict) else None
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
+def _replay_cut_points(prior: list[Message]) -> list[bool]:
+    """
+    Mark where a budgeted replay may drop the oldest prior messages.
+
+    A cut never opens the replay with a ``tool_result``, never separates
+    messages that share a ``call_id`` (parallel calls interleave theirs),
+    and never falls inside a run of tool items lacking one, which only
+    their position pairs.
+
+    :param prior: The prior messages a fresh client replays, oldest first.
+    :returns: ``len(prior) + 1`` flags; ``flags[i]`` is ``True`` when
+        ``prior[i:]`` may be replayed without the messages before it.
+    """
+    count = len(prior)
+    spans: dict[str, list[int]] = {}
+    for index, message in enumerate(prior):
+        call_id = _replay_call_id(message)
+        if call_id is not None:
+            spans.setdefault(call_id, [index, index])[1] = index
+    # Difference array: cuts at first+1..last split a call from its result.
+    opened = [0] * (count + 1)
+    for first, last in spans.values():
+        opened[first + 1] += 1
+        opened[last + 1] -= 1
+    flags = [True] * (count + 1)
+    split_calls = 0
+    for index in range(1, count):
+        split_calls += opened[index]
+        message, previous = prior[index], prior[index - 1]
+        unpaired_run = (
+            message.get("role") in _TOOL_HISTORY_ROLES
+            and previous.get("role") in _TOOL_HISTORY_ROLES
+            and (_replay_call_id(message) is None or _replay_call_id(previous) is None)
+        )
+        if split_calls or message.get("role") == "tool_result" or unpaired_run:
+            flags[index] = False
+    return flags
 
 
 def _parse_data_uri(uri: str) -> tuple[str, str]:
@@ -1079,6 +1170,10 @@ class _ClaudeClientState:
     mcp_relay: _ManagedMcpRelay | None = None
     # This client's own sandbox launcher, which exposes the managed config and its relay.
     cli_launcher: str | None = None
+    # Set once the current query has been interrupted; cleared when the next query starts.
+    interrupted: bool = False
+    # Whether the next query must carry the runner's interruption marker.
+    interruption_marker_pending: bool = False
 
 
 def _recording_consents(
@@ -2721,23 +2816,24 @@ class ClaudeSDKExecutor(Executor):
         state = self._clients.get(session_key)
         if state is None:
             return False
-        # Interrupt is best-effort and fast; a failure just falls through to
-        # the close below.
+        state.interruption_marker_pending = True
+        if state.interrupted:
+            return True
+        state.interrupted = True
         try:
-            await asyncio.wait_for(state.client.interrupt(), timeout=0.5)
+            await asyncio.wait_for(state.client.interrupt(), timeout=_INTERRUPT_TIMEOUT_SECONDS)
+            return True
+        except asyncio.CancelledError:
+            state.interrupted = False
+            raise
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
                 "Claude SDK interrupt failed for session %s: %s",
                 session_key,
                 exc,
             )
-        # Always drop the live session after an interrupt. Its transcript
-        # still holds the abandoned prompt, and resumed turns send only the
-        # latest user message (see _build_prompt), so the runner's
-        # "[System: interrupted]" marker would never reach the model. Closing
-        # forces the next turn to rebuild full history (marker included) in a
-        # fresh session — the abandoned request is then visible-but-superseded
-        # rather than silently continued.
+        # The turn may still be running, so drop the session; the next turn
+        # replays history, including the interruption marker, in a fresh one.
         try:
             await self.close_session(session_key)
             return True
@@ -2912,6 +3008,9 @@ class ClaudeSDKExecutor(Executor):
         )
 
     def supports_tool_boundary_interrupt(self) -> bool:
+        return True
+
+    def resumes_after_interrupt(self) -> bool:
         return True
 
     def max_context_tokens(self) -> int | None:
@@ -3390,7 +3489,11 @@ class ClaudeSDKExecutor(Executor):
         await self._evict_terminated_client(session_key)
         resume_session = session_key in self._clients
         prompt = (
-            self._build_prompt(messages, resume_session=True)
+            self._build_prompt(
+                messages,
+                resume_session=True,
+                after_interrupt=self._clients[session_key].interruption_marker_pending,
+            )
             if resume_session
             else await self._fresh_session_prompt(messages, cfg)
         )
@@ -3877,12 +3980,17 @@ class ClaudeSDKExecutor(Executor):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
+                if is_interruption_marker(message):
+                    break
         self._pending_framework_context[session_key] = "\n\n".join(
             notice
             for message in notice_messages
             if message.get("role") == "user"
             for notice in framework_notices(message.get("content"))
         )
+        client_state = self._clients.get(session_key)
+        if client_state is not None:
+            client_state.interrupted = False
         try:
             try:
                 sdk_prompt: str | AsyncIterator[_JsonObject]
@@ -3900,6 +4008,8 @@ class ClaudeSDKExecutor(Executor):
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
+            if client_state is not None:
+                client_state.interruption_marker_pending = False
             message_stream = client.receive_response()
             try:
                 while True:
@@ -4321,6 +4431,14 @@ class ClaudeSDKExecutor(Executor):
         if turn_usage is None:
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
+        if client_state is not None and client_state.interrupted:
+            # The CLI's result for an interrupted query is not a turn outcome. Its compaction
+            # never reaches the server, so drop the compacted client and replay history next turn.
+            if compaction_occurred:
+                self._evict_client_on_cancel(session_key)
+            yield TurnCancelled()
+            return
+
         if terminal_error:
             if compaction_occurred and claude_session_id:
                 compaction_event = _build_compaction_complete_event()
@@ -4398,7 +4516,8 @@ class ClaudeSDKExecutor(Executor):
         :returns: The prompt from :meth:`_build_prompt`.
         """
         budget = None
-        if _has_replayable_history(messages):
+        share = _replayed_history_window_share()
+        if share is not None and _has_replayable_history(messages):
             base_model = self._model_override if cfg.model else await self._spec_or_default_model()
             # Off-loop: the window lookup may fetch the model catalog.
             window = await run_sync_on_thread(
@@ -4407,7 +4526,7 @@ class ClaudeSDKExecutor(Executor):
                 base_model,
                 cfg.model,
             )
-            budget = int(window * _REPLAYED_HISTORY_WINDOW_SHARE)
+            budget = int(window * share)
         return self._build_prompt(messages, resume_session=False, history_token_budget=budget)
 
     @staticmethod
@@ -4416,6 +4535,7 @@ class ClaudeSDKExecutor(Executor):
         *,
         resume_session: bool,
         history_token_budget: int | None = None,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Build the prompt for the SDK.
@@ -4440,34 +4560,66 @@ class ClaudeSDKExecutor(Executor):
             history may use, e.g. ``100000``. The newest prior messages
             that fit are kept behind a marker counting the omitted ones;
             ``None`` replays every prior message.
+        :param after_interrupt: ``True`` when the resumed session's
+            interruption marker has not been delivered yet.
         :returns: A plain string prompt, or a list of Anthropic
             API content block dicts when multimodal blocks are
             present in the latest user message.
         """
         if resume_session:
             # The live session already holds its tool items; only a fresh one replays them.
-            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
+            return ClaudeSDKExecutor._extract_trailing_user_content(
+                without_tool_history(messages), after_interrupt=after_interrupt
+            )
 
         if not _has_replayable_history(messages):
             return ClaudeSDKExecutor._extract_latest_user_content(messages)
 
-        # Check if the latest user message is multimodal — if so,
-        # serialize prior history as a text prefix but preserve the
-        # latest message's content blocks for native multimodal
-        # delivery to the Anthropic API.
-        latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
-        latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
-        prior = messages[:latest_index] + messages[latest_index + 1 :]
+        # The trailing run of consecutive user messages is the current
+        # input and travels natively (multimodal blocks preserved); only
+        # what precedes it is serialized as the text history prefix. The
+        # run stops at (and excludes) a `/compact` control or the runner's
+        # interruption marker, so each message is in exactly one of
+        # history or current. With no trailing user message (e.g. a fork
+        # whose history ends in tool calls, #6574), the last user message
+        # is the current input and everything else, including what follows
+        # it, is history.
+        run_start = len(messages)
+        while run_start > 0:
+            prev = messages[run_start - 1]
+            if (
+                prev.get("role") != "user"
+                or _is_compact_command(prev)
+                or is_cancellation_marker(prev)
+            ):
+                break
+            run_start -= 1
+        if run_start == len(messages):
+            latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
+            latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
+            prior = messages[:latest_index] + messages[latest_index + 1 :]
+        else:
+            latest_content = ClaudeSDKExecutor._extract_trailing_user_content(messages[run_start:])
+            prior = messages[:run_start]
+        if not prior:
+            return latest_content
 
-        kept: list[list[_JsonObject]] = []
+        # Newest first. Keep only up to the oldest message that fits the budget
+        # AND is a cut point, so no tool result outlives its dropped call.
+        rendered_newest_first: list[list[_JsonObject]] = []
+        kept_count = 0
+        cut_points = None if history_token_budget is None else _replay_cut_points(prior)
         remaining_tokens = history_token_budget
-        for msg in reversed(prior):
-            rendered = _render_prior_message(msg)
+        for index in range(len(prior) - 1, -1, -1):
+            rendered = _render_prior_message(prior[index])
             if remaining_tokens is not None:
                 remaining_tokens -= _estimated_replay_tokens(rendered)
                 if remaining_tokens < 0:
                     break
-            kept.append(rendered)
+            rendered_newest_first.append(rendered)
+            if cut_points is None or cut_points[index]:
+                kept_count = len(rendered_newest_first)
+        kept = rendered_newest_first[:kept_count]
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         omitted = len(prior) - len(kept)
@@ -4534,6 +4686,8 @@ class ClaudeSDKExecutor(Executor):
     @staticmethod
     def _extract_trailing_user_content(
         messages: list[Message],
+        *,
+        after_interrupt: bool = False,
     ) -> str | list[_JsonObject]:
         """
         Extract the trailing run of consecutive user messages for the SDK.
@@ -4555,24 +4709,24 @@ class ClaudeSDKExecutor(Executor):
         survive.
 
         :param messages: Conversation history.
+        :param after_interrupt: ``True`` when an interruption marker in
+            the run has not been delivered yet, so it is sent too.
         :returns: A string prompt, or a list of Anthropic content
             block dicts when the trailing run is multimodal.
         """
         trailing: list[Message] = []
         for msg in reversed(messages):
             if msg.get("role") == "user":
-                content = msg.get("content")
-                if content == "/compact" or (
-                    isinstance(content, list)
-                    and len(content) == 1
-                    and isinstance(content[0], dict)
-                    and content[0].get("type") in {"text", "input_text"}
-                    and content[0].get("text") == "/compact"
-                ):
+                if _is_compact_command(msg):
                     # The runner dispatches earlier input before a compact control.
                     # Compaction may emit no assistant text; keep it out of later prompts.
                     if not trailing:
                         return "/compact"
+                    break
+                # The live session already received the user input before an interruption.
+                if is_interruption_marker(msg):
+                    if after_interrupt:
+                        trailing.append(msg)
                     break
                 trailing.append(msg)
             else:

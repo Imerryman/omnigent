@@ -72,6 +72,7 @@ from omnigent.models.codex_model_vocabulary import (
 )
 from omnigent.models.model_fallbacks import CODEX_CATALOG_CLONE_SOURCE_SLUG
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runner.synthetic_markers import is_cancellation_marker
 from omnigent.runtime.mcp_tool_result import decode_mcp_image_result
 from omnigent.spec.repo_scope import repo_scope_dirs
 from omnigent.spec.types import RetryPolicy
@@ -122,6 +123,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    pending_interruption_marker,
 )
 from .hook_scripts.subagent_router import HOOK_TIMEOUT_HEADROOM_S as _ROUTER_HOOK_HEADROOM_S
 from .hook_scripts.subagent_router import REQUEST_TIMEOUT_S as _ROUTER_REQUEST_TIMEOUT_S
@@ -133,6 +135,7 @@ from .model_signer import (
     SignerStartError,
     SubprocessModelSigner,
 )
+from .native_attachments import unresolved_attachment_marker
 
 logger = logging.getLogger(__name__)
 
@@ -180,6 +183,8 @@ _TURN_EVENT_WARN_SECONDS = 600.0
 # warning cadence is unchanged.
 _TURN_EVENT_POLL_SECONDS = 5.0
 _TURN_COMPLETED_DRAIN_SECONDS = 1.0
+# Leaves room under the harness adapter's 2s interrupt settle budget for the turn to end.
+_TURN_INTERRUPT_TIMEOUT_S = 1.5
 # Wall-clock budget for the ``codex --version`` probe. A broken codex
 # build that blocks (e.g. on stdin) must not stall session startup — on
 # timeout the probe kills the process and reports the version as unknown.
@@ -2631,20 +2636,52 @@ def _extract_latest_user_content(
     return ""
 
 
+def _history_attachment_placeholder(block: CodexParams, kind: str) -> str:
+    """
+    Compact text placeholder for a resolved historical attachment.
+
+    A block replayed inside "Conversation so far:" is indistinguishable from
+    one attached to the current turn, so sending it as a real ``input_image``/
+    ``input_file`` block makes a fresh Codex thread report an earlier turn's
+    photo as just sent. This placeholder keeps the attachment visible in the
+    transcript without the model mistaking it for new input.
+
+    :param block: The prior-turn ``input_image``/``input_file`` block.
+    :param kind: ``"image"`` or ``"attachment"``, matching ``block``'s type.
+    :returns: e.g. ``"[image previously shared: screenshot.png]"``, naming
+        the attachment by ``filename`` then ``file_id``, or the bare
+        ``"[image previously shared]"`` marker when neither is available.
+    """
+    identifier = block.get("filename") or block.get("file_id")
+    if isinstance(identifier, str) and identifier:
+        return f"[{kind} previously shared: {identifier}]"
+    return f"[{kind} previously shared]"
+
+
 def _build_initial_prompt(
     messages: list[Message],
 ) -> str | list[CodexParams]:
     """
     Build the initial prompt for a fresh Codex thread.
 
-    Replays prior turns with role labels, keeping attachments as native
-    content blocks. Text-only history retains its plain-string format.
+    Replays prior turns with role labels. "Current" input is the trailing
+    run of consecutive user messages at the very end of history (normally
+    just one message, but the runner may coalesce several buffered steered
+    messages into one continuation turn); only those messages' own
+    attachments stay native content blocks. If the last message is not from
+    the user, there is no current attachment at all. Every other, earlier
+    turn's resolved image/file attachment becomes a text placeholder (see
+    ``_history_attachment_placeholder``) so a cold-started thread cannot
+    mistake replayed history for something just attached. An attachment
+    that never resolved (no inline ``image_url``/``file_data``) keeps the
+    same visible "could not be loaded" marker used elsewhere
+    (:func:`unresolved_attachment_marker`), whether it is current or
+    historical. Text-only history retains its plain-string format.
 
     :param messages: Conversation history.
     :returns: A string prompt or a list of content block dicts.
     """
-    user_messages = [msg for msg in messages if msg.get("role") == "user"]
-    if len(messages) <= 1 or len(user_messages) <= 1:
+    if len(messages) <= 1:
         return _extract_latest_user_content(messages)
 
     has_attachments = any(
@@ -2656,8 +2693,19 @@ def _build_initial_prompt(
         for msg in messages
     )
     if has_attachments:
+        # The trailing run of consecutive user messages is "current" input;
+        # everything before it is history. The runner's interruption marker
+        # closes an abandoned request, so the run stops there. No trailing
+        # user message means no current attachment at all.
+        current_start: int | None = None
+        for idx in range(len(messages) - 1, -1, -1):
+            if messages[idx].get("role") != "user" or is_cancellation_marker(messages[idx]):
+                break
+            current_start = idx
+
         blocks: list[CodexParams] = [{"type": "input_text", "text": "Conversation so far:"}]
-        for msg in messages:
+        for idx, msg in enumerate(messages):
+            is_current = current_start is not None and idx >= current_start
             role = str(msg.get("role", "user")).replace("_", " ")
             blocks.append({"type": "input_text", "text": f"{role}:"})
             content = msg.get("content")
@@ -2672,10 +2720,42 @@ def _build_initial_prompt(
                         text = block.get("text")
                         if isinstance(text, str):
                             blocks.append({"type": "input_text", "text": text})
-                    elif kind == "input_image" and isinstance(block.get("image_url"), str):
-                        blocks.append({"type": "input_image", "image_url": block["image_url"]})
-                    elif kind == "input_file" and isinstance(block.get("file_data"), str):
-                        blocks.append(block)
+                    elif kind == "input_image":
+                        image_url = block.get("image_url")
+                        if not isinstance(image_url, str):
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": unresolved_attachment_marker(block),
+                                }
+                            )
+                        elif is_current:
+                            blocks.append({"type": "input_image", "image_url": image_url})
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": _history_attachment_placeholder(block, "image"),
+                                }
+                            )
+                    elif kind == "input_file":
+                        file_data = block.get("file_data")
+                        if not isinstance(file_data, str):
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": unresolved_attachment_marker(block),
+                                }
+                            )
+                        elif is_current:
+                            blocks.append(block)
+                        else:
+                            blocks.append(
+                                {
+                                    "type": "input_text",
+                                    "text": _history_attachment_placeholder(block, "attachment"),
+                                }
+                            )
                     else:
                         blocks.append(
                             {
@@ -2709,23 +2789,34 @@ def _build_initial_prompt(
     return "\n".join(lines)
 
 
-def _prompt_for_turn(messages: list[Message], *, is_new_thread: bool) -> str | list[CodexParams]:
+def _prompt_for_turn(
+    messages: list[Message], *, is_new_thread: bool, after_interrupt: bool = False
+) -> str | list[CodexParams]:
     """
     Choose the prompt payload for a Codex turn.
 
     A fresh Codex thread must receive the full replayable
     transcript so the harness can preserve parent history on
     sub-agent calls. Resumed threads should only receive the
-    latest user message.
+    latest user message, preceded by the runner's interruption
+    marker when the thread's previous turn was interrupted.
 
     :param messages: Conversation history.
     :param is_new_thread: ``True`` when starting a fresh Codex
         thread.
+    :param after_interrupt: ``True`` when the resumed thread's
+        previous turn was interrupted and no input has followed.
     :returns: A string prompt or a list of content block dicts.
     """
     if is_new_thread:
         return _build_initial_prompt(messages)
-    return _extract_latest_user_content(messages)
+    latest_user_content = _extract_latest_user_content(messages)
+    marker = pending_interruption_marker(messages) if after_interrupt else None
+    if marker is None:
+        return latest_user_content
+    if isinstance(latest_user_content, list):
+        return [{"type": "input_text", "text": marker}, *latest_user_content]
+    return f"{marker}\n\n{latest_user_content}"
 
 
 def _to_codex_input_items(
@@ -3070,6 +3161,9 @@ class _CodexAppServerSession:
         self._native_progress_observed = False
         self._reader_started_turn: str | None = None
         self._reader_completed_turn: str | None = None
+        self._interrupted_turn_id: str | None = None
+        # Whether the next turn's input must carry the runner's interruption marker.
+        self._interruption_marker_pending = False
         self._next_id = 1
         self._started = False
         self._starting = False
@@ -4067,7 +4161,10 @@ class _CodexAppServerSession:
                 if message.get("role") == "user":
                     message["content"] = goal_objective
                     break
-        prompt = _prompt_for_turn(prompt_messages, is_new_thread=is_new_thread)
+        after_interrupt = self._interruption_marker_pending
+        prompt = _prompt_for_turn(
+            prompt_messages, is_new_thread=is_new_thread, after_interrupt=after_interrupt
+        )
         if isinstance(prompt, list):
             turn_input = _to_codex_input_items(prompt)
         else:
@@ -4116,6 +4213,8 @@ class _CodexAppServerSession:
             "turn/start",
             turn_params,
         )
+        if after_interrupt:
+            self._interruption_marker_pending = False
         if effort_via_turn_start:
             self._applied_effort = reasoning_effort
         raw_active_turn_id = start_response.get("result", {}).get("turn", {}).get("id")
@@ -4488,7 +4587,7 @@ class _CodexAppServerSession:
                         self._certificate_failure = None
                     if not final_response:
                         final_response = _latest_buffered_agent_message(message_buffers)
-                    if not final_response:
+                    if not final_response and _codex_turn_status(turn) != "interrupted":
                         final_response = await self._drain_turn_completed_tail(
                             active_turn_id=active_turn_id,
                             message_buffers=message_buffers,
@@ -4598,15 +4697,28 @@ class _CodexAppServerSession:
         return True
 
     async def interrupt_turn(self) -> bool:
-        if self.thread_id is None or self.active_turn_id is None:
+        turn_id = self.active_turn_id
+        if self.thread_id is None:
             return False
-        await self._request(
-            "turn/interrupt",
-            {
-                "threadId": self.thread_id,
-                "turnId": self.active_turn_id,
-            },
-        )
+        # Arming without an active turn is harmless: the marker is sent only if history holds it.
+        self._interruption_marker_pending = True
+        if turn_id is None:
+            return False
+        if turn_id in (self._interrupted_turn_id, self._reader_completed_turn):
+            return True
+        self._interrupted_turn_id = turn_id
+        try:
+            await self._request(
+                "turn/interrupt",
+                {
+                    "threadId": self.thread_id,
+                    "turnId": turn_id,
+                },
+            )
+        except BaseException:
+            if self._interrupted_turn_id == turn_id:
+                self._interrupted_turn_id = None
+            raise
         return True
 
     async def _interrupt_failed_turn(self, cause: str) -> None:
@@ -5244,16 +5356,17 @@ class CodexExecutor(Executor):
     def supports_live_message_queue(self) -> bool:
         return True
 
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._session_states.get(session_key)
         if state is None or state.app_session is None:
             return False
-        # Best-effort interrupt to halt the in-flight turn; a failure just
-        # falls through to the close below.
         try:
-            await asyncio.wait_for(
+            return await asyncio.wait_for(
                 state.app_session.interrupt_turn(),
-                timeout=0.5,
+                timeout=_TURN_INTERRUPT_TIMEOUT_S,
             )
         except Exception as exc:  # noqa: BLE001 — interrupt is best-effort
             logger.warning(
@@ -5261,11 +5374,8 @@ class CodexExecutor(Executor):
                 session_key,
                 exc,
             )
-        # Always drop the session (resets thread_id) so the next turn starts a
-        # fresh thread and replays full history. A resumed thread sends only
-        # the latest user message, which would bypass the runner's
-        # "[System: interrupted]" marker and silently continue the abandoned
-        # request. See claude_sdk_executor.interrupt_session for the rationale.
+        # The turn may still be running, so drop the thread; the next turn starts
+        # a fresh one and replays history, including the interruption marker.
         try:
             await self.close_session(session_key)
             return True

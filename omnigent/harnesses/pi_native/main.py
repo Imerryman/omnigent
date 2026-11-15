@@ -177,6 +177,10 @@ def resolve_pi_executable(
 # that marks a prompt's run as fully finished (after retries and compaction).
 PI_APPROVE_MIN_VERSION = (0, 79, 0)
 PI_AGENT_SETTLED_MIN_VERSION = (0, 80, 4)
+# LOCAL CARRY (2026-11-01, Codex CK27): Pi 0.99.0 added built-in MCP servers (mcp.json, global or trusted project)
+# and 1.0.4 added ``--no-mcp``; since 1.0.4 a plain ``--tools`` allowlist KEEPS MCP tools, so headless omnigent runs
+# pass ``--no-mcp`` to keep Pi's tool set exactly the bridged + allowlisted one.
+PI_NO_MCP_MIN_VERSION = (1, 0, 4)
 
 
 def pi_version(executable: str) -> tuple[int, int, int] | None:

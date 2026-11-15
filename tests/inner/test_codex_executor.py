@@ -51,6 +51,7 @@ from omnigent.inner.codex_goal_command import (
 from omnigent.inner.codex_worker import BROKERED_CODEX_AUTH_COMMAND, BROKERED_CODEX_ENV
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
+    INTERRUPTION_MARKER_TEXT,
     ExecutorConfig,
     ExecutorError,
     ReasoningChunk,
@@ -64,6 +65,7 @@ from omnigent.inner.model_auth import ProviderAuthRequired
 from omnigent.inner.model_egress import FrozenModelRoute
 from omnigent.inner.model_signer import SignerLaunchConfig, SubprocessModelSigner
 from omnigent.native import _native_forwarder_health as native_forwarder_health
+from omnigent.runner.synthetic_markers import CANCELLATION_MARKER_TEXT
 
 
 @pytest.fixture(autouse=True)
@@ -681,18 +683,197 @@ class TestCodexExecutor(unittest.TestCase):
         prompt = _prompt_for_turn(messages, is_new_thread=False)
         self.assertEqual(prompt, "Summarize our conversation.")
 
-    def test_build_initial_prompt_keeps_user_attachments_as_native_blocks(self):
-        # A fresh thread replaying multimodal history must keep image bytes as
-        # native input_image blocks, not flatten the data URI into prompt text.
-        uri = "data:image/png;base64,QUJD"
+    def test_prompt_for_existing_thread_sends_pending_interruption_marker(self):
+        interrupted_history = [
+            {"role": "user", "content": "The secret codeword is ZEBRA-99."},
+            {"role": "assistant", "content": "Understood."},
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+        ]
+
+        follow_up = [*interrupted_history, {"role": "user", "content": "Summarize instead."}]
+        prompt = _prompt_for_turn(follow_up, is_new_thread=False, after_interrupt=True)
+        self.assertEqual(prompt, f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.")
+        self.assertEqual(_prompt_for_turn(follow_up, is_new_thread=False), "Summarize instead.")
+
+        image = {"type": "input_image", "image_url": "data:image/png;base64,QUJD"}
+        prompt = _prompt_for_turn(
+            [*interrupted_history, {"role": "user", "content": [image]}],
+            is_new_thread=False,
+            after_interrupt=True,
+        )
+        self.assertEqual(prompt, [{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}, image])
+
+    def test_prompt_for_existing_thread_sends_delivered_interruption_marker_once(self):
         messages = [
-            {"role": "user", "content": [{"type": "input_image", "image_url": uri}]},
+            {"role": "user", "content": "Write a long essay."},
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead."},
+            {"role": "assistant", "content": "Summary."},
+            {"role": "user", "content": "Thanks."},
+        ]
+        self.assertEqual(
+            _prompt_for_turn(messages, is_new_thread=False, after_interrupt=True), "Thanks."
+        )
+
+    def test_resumed_thread_sends_interruption_marker_once_after_textless_reply(self):
+        """A follow-up that ends without assistant text does not re-arm the marker."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[
+                    {"result": {}},
+                    {"result": {"turn": {"id": "turn-2"}}},
+                    {"result": {"turn": {"id": "turn-3"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            self.assertTrue(await session.interrupt_turn())
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            ]
+            for turn_id, text in (("turn-2", "Summarize instead."), ("turn-3", "Thanks.")):
+                history.append({"role": "user", "content": text})
+                session._events.put_nowait(
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": turn_id, "status": "completed"}},
+                    }
+                )
+                async with asyncio.timeout(10):
+                    events = [
+                        event
+                        async for event in session.run_turn(
+                            messages=list(history),
+                            tools=[],
+                            system_prompt="",
+                            model="gpt-5",
+                            cwd=".",
+                            sandbox="workspace-write",
+                        )
+                    ]
+                self.assertIsInstance(events[-1], TurnComplete)
+                self.assertFalse(events[-1].response)
+
+            turn_inputs = [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+            self.assertEqual(
+                turn_inputs,
+                [
+                    [
+                        {
+                            "type": "text",
+                            "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead.",
+                        }
+                    ],
+                    [{"type": "text", "text": "Thanks."}],
+                ],
+            )
+
+        _run(_t())
+
+    def _follow_up_inputs_after_failed_start(self, active_turn_id: str | None):
+        """Interrupt the thread, fail the follow-up's ``turn/start``, retry, and return inputs."""
+
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo", cwd="/tmp/workspace", env={}, tool_executor=None
+            )
+            session.start = AsyncMock()
+            session._proc = _FakeProcess()
+            session.thread_id = "thread-1"
+            session.active_turn_id = active_turn_id
+            interrupt_responses = [{"result": {}}] if active_turn_id else []
+            session._request = AsyncMock(
+                side_effect=[
+                    *interrupt_responses,
+                    RuntimeError("turn/start failed"),
+                    {"result": {"turn": {"id": "turn-2"}}},
+                ]
+            )
+            session._drain_turn_completed_tail = AsyncMock(return_value=None)
+            await session.interrupt_turn()
+            session.active_turn_id = None
+
+            history = [
+                {"role": "user", "content": "Write a long essay."},
+                {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+                {"role": "user", "content": "Summarize instead."},
+            ]
+            turn_kwargs = {
+                "tools": [],
+                "system_prompt": "",
+                "model": "gpt-5",
+                "cwd": ".",
+                "sandbox": "workspace-write",
+            }
+            with self.assertRaises(RuntimeError):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            session._events.put_nowait(
+                {
+                    "method": "turn/completed",
+                    "params": {"turn": {"id": "turn-2", "status": "completed"}},
+                }
+            )
+            async with asyncio.timeout(10):
+                async for _event in session.run_turn(messages=list(history), **turn_kwargs):
+                    pass
+            return [
+                call.args[1]["input"]
+                for call in session._request.await_args_list
+                if call.args[0] == "turn/start"
+            ]
+
+        return _run(_t())
+
+    def test_follow_up_retried_after_failed_start_keeps_interruption_marker(self):
+        """The marker stays pending until Codex accepts a turn, even if no turn was active."""
+        with_marker = [
+            {"type": "text", "text": f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."}
+        ]
+        for active_turn_id in ("turn-1", None):
+            with self.subTest(active_turn_id=active_turn_id):
+                self.assertEqual(
+                    self._follow_up_inputs_after_failed_start(active_turn_id),
+                    [with_marker, with_marker],
+                )
+
+    def test_build_initial_prompt_keeps_latest_user_attachment_as_native_block(self):
+        # A fresh thread replaying multimodal history must keep the LATEST
+        # user message's own image as a native input_image block (the model
+        # needs to see what was just attached), but an earlier turn's
+        # resolved image must NOT be replayed as a real block — a block
+        # inside "Conversation so far:" is indistinguishable from one just
+        # attached, so the cold-started thread would report an old photo as
+        # freshly sent.
+        history_uri = "data:image/png;base64,SGlzdG9yeQ=="
+        latest_uri = "data:image/png;base64,TGF0ZXN0"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": history_uri, "filename": "old.png"}
+                ],
+            },
             {"role": "assistant", "content": "Saw it."},
             {
                 "role": "user",
                 "content": [
                     {"type": "input_text", "text": "Compare."},
-                    {"type": "input_image", "image_url": uri},
+                    {"type": "input_image", "image_url": latest_uri, "filename": "new.png"},
                 ],
             },
         ]
@@ -700,9 +881,300 @@ class TestCodexExecutor(unittest.TestCase):
         self.assertIsInstance(prompt, list)
         wire = _to_codex_input_items(prompt)
         images = [item for item in wire if item["type"] == "image"]
-        self.assertEqual(images, [{"type": "image", "url": uri}, {"type": "image", "url": uri}])
+        self.assertEqual(images, [{"type": "image", "url": latest_uri}])
         text = "\n".join(item["text"] for item in wire if item["type"] == "text")
-        self.assertNotIn(uri, text)
+        self.assertNotIn(history_uri, text)
+        self.assertNotIn(latest_uri, text)
+        self.assertIn("[image previously shared: old.png]", text)
+
+    def test_build_initial_prompt_new_turn_text_only_no_historical_image_block(self):
+        # History image + a text-only new turn: the history image must not
+        # survive as a real block at all, and a placeholder must be present.
+        history_uri = "data:image/png;base64,SGlzdG9yeQ=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": history_uri, "filename": "shot.png"},
+                    {"type": "input_text", "text": "what is this?"},
+                ],
+            },
+            {"role": "assistant", "content": "A screenshot."},
+            {"role": "user", "content": "Summarize our conversation."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        self.assertEqual([item for item in wire if item["type"] == "image"], [])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(history_uri, text)
+        self.assertIn("[image previously shared: shot.png]", text)
+        self.assertIn("Summarize our conversation.", text)
+
+    def test_build_initial_prompt_multiple_historical_images_missing_filename(self):
+        # Several historical images in the same replay, one missing a
+        # filename/file_id: each becomes its own placeholder, falling back
+        # to the bare marker when no identifying metadata is available.
+        uri_one = "data:image/png;base64,T25l"
+        uri_two = "data:image/png;base64,VHdv"
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": uri_one, "filename": "first.png"},
+                    {"type": "input_text", "text": "first photo"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the first photo."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": uri_two},
+                    {"type": "input_text", "text": "second photo, no filename"},
+                ],
+            },
+            {"role": "assistant", "content": "Noted the second photo."},
+            {"role": "user", "content": "Summarize both photos."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        self.assertEqual([item for item in wire if item["type"] == "image"], [])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(uri_one, text)
+        self.assertNotIn(uri_two, text)
+        self.assertIn("[image previously shared: first.png]", text)
+        self.assertIn("[image previously shared]", text)
+
+    def test_build_initial_prompt_historical_file_attachment_becomes_placeholder(self):
+        # The same requirement applies to non-image attachments: a resolved
+        # historical file must become a text placeholder, not a real
+        # input_file block, while the latest turn's own file attachment
+        # (here, a text file) still reaches the model as real content.
+        history_file_data = "data:application/pdf;base64,SGlzdG9yeVBkZg=="
+        latest_file_data = (
+            f"data:text/plain;base64,{base64.b64encode(b'new file contents').decode('ascii')}"
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": history_file_data,
+                        "filename": "report.pdf",
+                    },
+                    {"type": "input_text", "text": "What does this say?"},
+                ],
+            },
+            {"role": "assistant", "content": "It discusses quarterly results."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_file", "file_data": latest_file_data, "filename": "new.txt"},
+                    {"type": "input_text", "text": "And this one?"},
+                ],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(history_file_data, text)
+        self.assertNotIn("SGlzdG9yeVBkZg==", text)
+        self.assertIn("[attachment previously shared: report.pdf]", text)
+        self.assertIn("new file contents", text)
+        self.assertIn("And this one?", text)
+
+    def test_prompt_for_existing_thread_resumed_path_unchanged_with_attachments(self):
+        # The warm/resumed-thread path must keep using only the latest user
+        # message's content, unaffected by the history-placeholder change.
+        uri = "data:image/png;base64,TGF0ZXN0"
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": "data:image/png;base64,T2xk"}],
+            },
+            {"role": "assistant", "content": "Saw it."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "and now this"},
+                    {"type": "input_image", "image_url": uri},
+                ],
+            },
+        ]
+        prompt = _prompt_for_turn(messages, is_new_thread=False)
+        self.assertEqual(
+            prompt,
+            [
+                {"type": "input_text", "text": "and now this"},
+                {"type": "input_image", "image_url": uri},
+            ],
+        )
+
+    def test_build_initial_prompt_no_trailing_user_run_is_all_history(self):
+        # "Current" is the TRAILING run of user inputs after the last
+        # non-user item. Here the lone user message is followed by an
+        # assistant turn and a tool result, so nothing trails: its image
+        # must become a placeholder like any other historical attachment,
+        # and the assistant/tool turns after it must still be replayed.
+        history_uri = "data:image/png;base64,SGlzdG9yeQ=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": history_uri, "filename": "old.png"}
+                ],
+            },
+            {"role": "assistant", "content": "Looking it up."},
+            {"role": "tool", "content": "tool result: 42"},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        self.assertEqual([item for item in wire if item["type"] == "image"], [])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn(history_uri, text)
+        self.assertIn("[image previously shared: old.png]", text)
+        self.assertIn("tool result: 42", text)
+
+    def test_build_initial_prompt_keeps_all_trailing_buffered_user_images_native(self):
+        # Several buffered user inputs coalesced into one continuation turn
+        # (no assistant/tool turn between them and the end of history) are
+        # ALL "current" -- every one of their images must stay native, not
+        # just the last.
+        uri_a = "data:image/png;base64,QQ=="
+        uri_b = "data:image/png;base64,Qg=="
+        messages = [
+            {"role": "assistant", "content": "Go ahead."},
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": uri_a, "filename": "a.png"}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": uri_b, "filename": "b.png"}],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(
+            images, [{"type": "image", "url": uri_a}, {"type": "image", "url": uri_b}]
+        )
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertNotIn("previously shared", text)
+
+    def test_build_initial_prompt_interruption_marker_closes_the_current_run(self):
+        # The abandoned request's image precedes the runner's
+        # [System: interrupted] marker, so it is history (placeholder); only
+        # the replacement after the marker is current.
+        uri_old = "data:image/png;base64,QQ=="
+        uri_new = "data:image/png;base64,Qg=="
+        messages = [
+            {"role": "assistant", "content": "Working on it..."},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": uri_old, "filename": "abandoned.png"}
+                ],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_text", "text": CANCELLATION_MARKER_TEXT}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "input_image", "image_url": uri_new, "filename": "new.png"}],
+            },
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        images = [item for item in wire if item["type"] == "image"]
+        self.assertEqual(images, [{"type": "image", "url": uri_new}])
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertIn("[image previously shared: abandoned.png]", text)
+        self.assertNotIn("new.png", text)
+
+    def test_build_initial_prompt_unresolved_historical_attachment_keeps_could_not_be_loaded(
+        self,
+    ):
+        # An attachment whose image_url never got resolved must keep the
+        # same visible "[Attachment <name> could not be loaded]" marker used
+        # elsewhere (native_attachments.unresolved_attachment_marker), not
+        # the generic "[Unavailable history content: ...]" catch-all.
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "file_id": "missing", "filename": "photo.png"}
+                ],
+            },
+            {"role": "assistant", "content": "Noted."},
+            {"role": "user", "content": "Summarize."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertIn("[Attachment photo.png could not be loaded]", text)
+        self.assertNotIn("Unavailable history content", text)
+
+    def test_build_initial_prompt_historical_attachment_placeholder_falls_back_to_file_id(self):
+        # A resolved historical attachment with no filename, only a
+        # file_id, must name the attachment by that file_id in its
+        # placeholder rather than falling back to the bare marker.
+        history_uri = "data:image/png;base64,SGlzdG9yeQ=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_image", "image_url": history_uri, "file_id": "file_abc123"}
+                ],
+            },
+            {"role": "assistant", "content": "Saw it."},
+            {"role": "user", "content": "Summarize."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        wire = _to_codex_input_items(prompt)
+        text = "\n".join(item["text"] for item in wire if item["type"] == "text")
+        self.assertIn("[image previously shared: file_abc123]", text)
+
+    def test_build_initial_prompt_drops_historical_binary_input_file_before_wire_conversion(
+        self,
+    ):
+        # Assert directly on the intermediate prompt (not just the final
+        # wire-format items): _to_codex_input_items silently drops binary
+        # input_file blocks, so a wire-level assertion alone could not
+        # catch a regression where a historical input_file block is left as
+        # a real (non-placeholder) block instead of a text placeholder.
+        history_file_data = "data:application/pdf;base64,SGlzdG9yeVBkZg=="
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_file",
+                        "file_data": history_file_data,
+                        "filename": "report.pdf",
+                    }
+                ],
+            },
+            {"role": "assistant", "content": "Read it."},
+            {"role": "user", "content": "Summarize."},
+        ]
+        prompt = _build_initial_prompt(messages)
+        self.assertIsInstance(prompt, list)
+        historical_input_file_blocks = [
+            block
+            for block in prompt
+            if isinstance(block, dict) and block.get("type") == "input_file"
+        ]
+        self.assertEqual(historical_input_file_blocks, [])
 
     def test_goal_objective_requires_a_standalone_command(self):
         self.assertEqual(
@@ -1608,17 +2080,8 @@ class TestCodexExecutor(unittest.TestCase):
 
         _run(_t())
 
-    def test_interrupt_session_interrupts_then_drops_session(self):
-        """A user interrupt halts the turn AND drops the session.
-
-        Codex resumes the same thread on the next turn and sends only the
-        latest user message, so a retained session would bypass the
-        runner's ``[System: interrupted]`` marker and continue the
-        abandoned request. Dropping the session (close resets thread_id)
-        forces the next turn to start a fresh thread and replay full
-        history. An empty ``_session_states`` is the invariant that
-        prevents the canceled-instruction leak.
-        """
+    def test_interrupt_session_interrupts_and_keeps_session(self):
+        """A user interrupt halts the turn and keeps the thread for the next turn."""
 
         async def _t():
             fake_session = _FakeAppSession([[TurnComplete(response="done")]])
@@ -1638,10 +2101,35 @@ class TestCodexExecutor(unittest.TestCase):
 
             interrupted = await executor.interrupt_session("s1")
             self.assertTrue(interrupted)
-            # Interrupt is attempted first to halt the in-flight turn.
             self.assertTrue(fake_session.interrupted)
-            # Then the session is closed and removed so the next turn starts a
-            # fresh thread and replays full history (marker included).
+            self.assertFalse(fake_session.closed)
+            self.assertIn("s1", executor._session_states)
+            self.assertTrue(executor.resumes_after_interrupt())
+
+        _run(_t())
+
+    def test_interrupt_session_drops_session_when_interrupt_fails(self):
+        """An unconfirmed interrupt drops the thread so the next turn replays history."""
+
+        async def _t():
+            fake_session = _FakeAppSession([[TurnComplete(response="done")]])
+            fake_session.interrupt_turn = AsyncMock(side_effect=RuntimeError("app-server gone"))
+            executor = CodexExecutor(
+                codex_path="/bin/echo",
+                app_session_factory=lambda **kwargs: fake_session,
+            )
+
+            _ = [
+                e
+                async for e in executor.run_turn(
+                    [{"role": "user", "content": "hi", "session_id": "s1"}],
+                    [],
+                    "",
+                )
+            ]
+
+            interrupted = await executor.interrupt_session("s1")
+            self.assertTrue(interrupted)
             self.assertTrue(fake_session.closed)
             self.assertEqual(executor._session_states, {})
 
@@ -1770,6 +2258,54 @@ class TestCodexExecutor(unittest.TestCase):
                     "turnId": "turn-1",
                 },
             )
+
+        _run(_t())
+
+    def test_app_server_interrupt_turn_interrupts_each_turn_once(self):
+        async def _t():
+            session = _CodexAppServerSession(
+                codex_path="/bin/echo",
+                cwd="/tmp/workspace",
+                env={},
+                tool_executor=None,
+            )
+            session.thread_id = "thread-1"
+            session.active_turn_id = "turn-1"
+            session._request = AsyncMock(
+                side_effect=[RuntimeError("socket reset"), {"result": {}}]
+            )
+
+            with self.assertRaises(RuntimeError):
+                await session.interrupt_turn()
+            self.assertTrue(await session.interrupt_turn())
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(session._request.await_count, 2)
+
+            session.active_turn_id = "turn-2"
+            session._reader_completed_turn = "turn-2"
+            self.assertTrue(await session.interrupt_turn())
+            self.assertEqual(session._request.await_count, 2)
+
+        _run(_t())
+
+    def test_app_server_interrupted_turn_completes_without_waiting_for_tail(self):
+        async def _t():
+            session = _session_with_scripted_turn()
+            session._drain_turn_completed_tail = AsyncMock(return_value="late text")
+
+            events = await _run_turn_with_events(
+                session,
+                [
+                    {
+                        "method": "turn/completed",
+                        "params": {"turn": {"id": "turn-1", "status": "interrupted"}},
+                    }
+                ],
+            )
+
+            self.assertIsInstance(events[-1], TurnComplete)
+            self.assertFalse(events[-1].response)
+            session._drain_turn_completed_tail.assert_not_awaited()
 
         _run(_t())
 

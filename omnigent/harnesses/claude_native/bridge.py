@@ -3205,7 +3205,20 @@ def augment_claude_args(
             _logger.warning(MANAGED_MCP_RELAY_MISSING_WARNING)
     else:
         mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
-        args.extend(["--mcp-config", json.dumps(mcp_config, separators=(",", ":"))])
+        args.extend(
+            [
+                # Omnigent worker panes load ONLY the bridge relay (see
+                # build_mcp_config); strict mode prevents Claude from merging the
+                # user-scope ~/.claude.json MCP fleet into every pane, which cost
+                # ~1 GB per pane and ran the host out of memory. Only affects
+                # Omnigent-spawned panes; a hand-launched claude is untouched.
+                # Omitted with --mcp-config under a managed-mcp.json (#12080),
+                # which makes Claude Code refuse both flags.
+                "--strict-mcp-config",
+                "--mcp-config",
+                json.dumps(mcp_config, separators=(",", ":")),
+            ]
+        )
     args.extend(["--settings", str(settings_path)])
     args = _merge_append_system_prompt(args, append_system_prompt, bridge_dir=bridge_dir)
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
@@ -4859,6 +4872,26 @@ def write_tmux_target(
     if pid is not None:
         payload["pid"] = pid
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
+
+
+def advertised_tmux_socket_gone(bridge_dir: Path) -> bool:
+    """
+    Whether the tmux socket advertised for this bridge no longer exists.
+
+    Closing a terminal kills its tmux server and removes the private dir the
+    socket lives in, so a missing socket is positive evidence the pane is gone.
+    An unadvertised or unreadable target is not evidence either way and reads
+    as ``False``.
+
+    :param bridge_dir: Bridge directory path, e.g.
+        ``/tmp/omnigent/claude-native/<digest>``.
+    :returns: ``True`` only when ``tmux.json`` names a socket that is missing.
+    """
+    payload = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
+    if not isinstance(socket_path, str) or not socket_path:
+        return False
+    return not Path(socket_path).exists()
 
 
 @delivery_diagnostics.trace_delivery(
