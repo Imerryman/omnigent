@@ -149,8 +149,23 @@ _TURN_IDLE_TIMEOUT_S = float(
 # tradeoff: under the default config a steadily-emitting turn has NO
 # wall-clock cap (this constant does not bound active turns); only when
 # the idle watchdog is disabled (``HARNESS_TURN_TIMEOUT_S <= 0``) does
-# this act as a strict wall-clock cap. ``<= 0`` disables.
+# this act as a strict wall-clock cap. Pending human waits also extend it,
+# up to :data:`_HUMAN_WAIT_TIMEOUT_S`. ``<= 0`` disables.
 _TURN_ABSOLUTE_TIMEOUT_S = float(os.environ.get("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "10800"))
+
+# Budget for ONE pending human wait (an elicitation such as AskUserQuestion,
+# or a human-gated policy verdict) to hold the absolute ceiling open. A turn
+# parked on a human emits only heartbeats, so without this the ceiling —
+# anchored at turn start — killed a question asked late in a turn while the
+# human was still answering, and the answer was then dropped. While a wait is
+# pending and younger than this budget, heartbeats keep the ceiling at least
+# one window (the idle window; the absolute window when the idle watchdog is
+# disabled) past now; once the budget is spent the extension stops, so an
+# abandoned question still terminates ~budget + one window after it was asked.
+# Matches the 24h AskUserQuestion hook / native elicitation timeouts in
+# ``server/routes/_sessions/common.py`` and :data:`_POLICY_EVAL_TIMEOUT_S`.
+# ``<= 0`` disables the extension (human waits count against the ceiling).
+_HUMAN_WAIT_TIMEOUT_S = float(os.environ.get("HARNESS_HUMAN_WAIT_TIMEOUT_S", "86400"))
 
 # Retry only pre-output wedges after confirmed teardown. Replaying a turn
 # with progress can duplicate tool effects; retries never extend the hard cap.
@@ -482,9 +497,17 @@ class TurnContext:
         self._pending_elicitations: dict[str, asyncio.Future[ElicitationResult]] = {}
         # Human-approval waits in flight (elicitation replies, policy
         # verdicts). While > 0 heartbeats hold the idle window open so an
-        # unanswered approval isn't failed as a wedged turn; the absolute
-        # ceiling still applies.
+        # unanswered approval isn't failed as a wedged turn, and hold the
+        # absolute ceiling open for up to ``_HUMAN_WAIT_TIMEOUT_S``.
+        # Only mutate via ``_begin_human_wait`` / ``_end_human_wait``.
         self._pending_human_waits = 0
+        # Loop time the in-flight human wait(s) began (counter 0 -> 1);
+        # ``None`` while no wait is pending.
+        self._human_wait_started_at: float | None = None
+        # ``(started, ended)`` loop times of the most recent completed wait,
+        # so the absolute-watchdog error can tell a cap that fired mid-wait
+        # (the cancellation unwinds the wait before the error is built).
+        self._last_human_wait: tuple[float, float] | None = None
         # Layer 3 per-policy-evaluation state:
         # ``evaluation_id`` → Future[PolicyVerdictPayload].
         # Populated by ``evaluate_policy``; resolved by the
@@ -506,9 +529,11 @@ class TurnContext:
         # event so a long-but-active turn isn't killed mid-turn.
         # ``None`` disables it (watchdog off, or outside a guarded run).
         self._reset_idle_watchdog: Callable[[], None] | None = None
-        # Idle-only keep-alive hook. Unlike ``_reset_idle_watchdog`` it
-        # never extends the absolute ceiling; used by heartbeats while a
-        # human wait is pending so the hard cap still bounds the turn.
+        # Human-wait keep-alive hook, called by heartbeats while a human
+        # wait is pending (and once when one opens). Holds the idle
+        # deadline and, only within the human-wait budget, the absolute
+        # ceiling — unlike ``_reset_idle_watchdog`` it does not count as
+        # progress, so an abandoned wait still terminates.
         self._hold_idle_watchdog: Callable[[], None] | None = None
         self._has_progress = False
 
@@ -537,8 +562,9 @@ class TurnContext:
         # forever). Exception: while a human approval (elicitation reply,
         # policy verdict) is pending, the turn can legitimately emit nothing
         # but heartbeats for as long as the human takes, so heartbeats hold
-        # the idle window open then — via the idle-only hook, so the
-        # absolute ceiling stays the hard cap even for an ignored approval.
+        # the watchdogs open then — via the human-wait hook, which extends
+        # the absolute ceiling only within ``_HUMAN_WAIT_TIMEOUT_S`` so an
+        # ignored approval still terminates.
         if not isinstance(event, HeartbeatEvent):
             if not isinstance(event, RetryEvent) and not (
                 isinstance(event, PolicyEvaluationRequestEvent)
@@ -550,6 +576,45 @@ class TurnContext:
         elif self._pending_human_waits > 0 and self._hold_idle_watchdog is not None:
             self._hold_idle_watchdog()
         self._event_queue.put_nowait(event)
+
+    def _begin_human_wait(self) -> None:
+        """Mark a human wait as pending; pair with :meth:`_end_human_wait`.
+
+        Stamps the wait's start on the 0 -> 1 transition (the budget runs
+        from the first of overlapping waits) and applies the human-wait hold
+        at once rather than at the next heartbeat, which can be up to
+        :data:`_HEARTBEAT_INTERVAL_S` away — later than a near ceiling.
+        """
+        self._pending_human_waits += 1
+        if self._pending_human_waits == 1:
+            self._human_wait_started_at = asyncio.get_running_loop().time()
+        if self._hold_idle_watchdog is not None:
+            self._hold_idle_watchdog()
+
+    def _end_human_wait(self) -> None:
+        """Release one pending human wait; call from a ``finally``."""
+        self._pending_human_waits -= 1
+        if self._pending_human_waits == 0 and self._human_wait_started_at is not None:
+            self._last_human_wait = (
+                self._human_wait_started_at,
+                asyncio.get_running_loop().time(),
+            )
+            self._human_wait_started_at = None
+
+    def _human_wait_pending_since(self, at: float) -> float | None:
+        """Start time of the human wait that was pending at loop time *at*.
+
+        :param at: Loop time to check, e.g. the absolute deadline.
+        :returns: The wait's start loop time, or ``None`` if no human wait
+            was pending at *at*.
+        """
+        if self._human_wait_started_at is not None:
+            return self._human_wait_started_at
+        if self._last_human_wait is not None:
+            started, ended = self._last_human_wait
+            if started <= at <= ended:
+                return started
+        return None
 
     async def dispatch_tool(self, call_id: str, name: str, arguments: str, agent: str) -> str:
         """
@@ -643,21 +708,23 @@ class TurnContext:
         """
         future: asyncio.Future[ElicitationResult] = asyncio.get_running_loop().create_future()
         self._pending_elicitations[elicitation_id] = future
-        self._pending_human_waits += 1
-        self.emit(
-            ElicitationRequestEvent(
-                type="response.elicitation_request",
-                elicitation_id=elicitation_id,
-                params=params,
-            )
-        )
         result: ElicitationResult | None = None
         try:
+            # Inside the ``try`` (its counter bump can't raise) so the
+            # ``finally`` always balances it, even if the hold hook raises.
+            self._begin_human_wait()
+            self.emit(
+                ElicitationRequestEvent(
+                    type="response.elicitation_request",
+                    elicitation_id=elicitation_id,
+                    params=params,
+                )
+            )
             result = await future
             return result
         finally:
             self._pending_elicitations.pop(elicitation_id, None)
-            self._pending_human_waits -= 1
+            self._end_human_wait()
             self.emit(
                 ElicitationResolvedEvent(
                     type="response.elicitation_resolved",
@@ -759,20 +826,20 @@ class TurnContext:
             else min(_POLICY_EVAL_TIMEOUT_S, _UNGATED_POLICY_EVAL_TIMEOUT_S)
         )
         # Unlike elicit's unbounded park, this wait is already bounded by
-        # the wait_for below; the counter only holds the idle window open,
-        # and only for phases that can actually wait on a human.
-        if human_gated:
-            self._pending_human_waits += 1
-        _logger.info("Policy evaluation %s requested (phase=%s)", evaluation_id, phase)
-        self.emit(
-            PolicyEvaluationRequestEvent(
-                type="policy_evaluation.requested",
-                evaluation_id=evaluation_id,
-                phase=phase,
-                data=data,
-            )
-        )
+        # the wait_for below; the human-wait bracket only holds the
+        # watchdogs open, and only for phases that can wait on a human.
         try:
+            if human_gated:
+                self._begin_human_wait()
+            _logger.info("Policy evaluation %s requested (phase=%s)", evaluation_id, phase)
+            self.emit(
+                PolicyEvaluationRequestEvent(
+                    type="policy_evaluation.requested",
+                    evaluation_id=evaluation_id,
+                    phase=phase,
+                    data=data,
+                )
+            )
             verdict = await asyncio.wait_for(future, timeout=timeout_s)
             _logger.info("Policy evaluation %s resolved: %s", evaluation_id, verdict.action)
             return verdict
@@ -800,7 +867,7 @@ class TurnContext:
         finally:
             self._pending_policy_evaluations.pop(evaluation_id, None)
             if human_gated:
-                self._pending_human_waits -= 1
+                self._end_human_wait()
 
     def _complete_policy_evaluation(
         self, evaluation_id: str, verdict: PolicyVerdictPayload
@@ -1772,7 +1839,9 @@ class HarnessApp:
           actively-progressing turn is never killed merely for running
           long. A turn that outlives the ceiling and then stalls dies via
           the idle watchdog; only with the idle watchdog disabled does
-          this act as a strict wall-clock cap.
+          this act as a strict wall-clock cap. A pending human wait holds
+          the ceiling open too (see ``_hold_idle``), for at most
+          :data:`_HUMAN_WAIT_TIMEOUT_S` per wait plus one window.
 
         Retry a wedged invocation or confirmed transport loss only before
         progress and after the subclass confirms executor cleanup.
@@ -1785,6 +1854,7 @@ class HarnessApp:
         """
         idle_timeout = _TURN_IDLE_TIMEOUT_S
         absolute_timeout = _TURN_ABSOLUTE_TIMEOUT_S
+        human_wait_timeout = _HUMAN_WAIT_TIMEOUT_S
         # ``asyncio.timeout(None)`` is a no-op, so ``<= 0`` disables each.
         absolute_wd = asyncio.timeout(absolute_timeout if absolute_timeout > 0 else None)
         attempts = 1 + max(0, _WEDGED_TURN_RECOVERY_RETRIES)
@@ -1825,16 +1895,42 @@ class HarnessApp:
                             ):
                                 absolute_wd.reschedule(now + idle_timeout)
 
-                        def _hold_idle(idle_wd: asyncio.Timeout = idle_wd) -> None:
-                            # Keep-alive during a pending human wait: push
-                            # ONLY the idle deadline, never the absolute
-                            # ceiling — an approval that is never answered
-                            # must still terminate at the hard cap.
-                            if not idle_wd.expired():
-                                idle_wd.reschedule(loop.time() + idle_timeout)
-
                         ctx._reset_idle_watchdog = _reset
-                        ctx._hold_idle_watchdog = _hold_idle
+
+                    def _hold_idle(idle_wd: asyncio.Timeout = idle_wd) -> None:
+                        # Keep-alive during a pending human wait (each
+                        # heartbeat, plus once as the wait opens). Not
+                        # progress: it holds the idle deadline and, while
+                        # the wait is younger than ``human_wait_timeout``,
+                        # keeps the absolute ceiling at least one window
+                        # past now — the idle window, or the absolute
+                        # window when the idle watchdog is disabled — so a
+                        # question asked late in a turn isn't killed while
+                        # the human answers. Past the budget the ceiling
+                        # stops moving, so an abandoned wait terminates
+                        # ~budget + one window after it began. Same
+                        # ``expired()`` / ``when()`` guards as ``_reset``;
+                        # never shortens (or enables a disabled) ceiling.
+                        now = loop.time()
+                        if idle_timeout > 0 and not idle_wd.expired():
+                            idle_wd.reschedule(now + idle_timeout)
+                        started = ctx._human_wait_started_at
+                        if (
+                            human_wait_timeout <= 0
+                            or started is None
+                            or now - started >= human_wait_timeout
+                        ):
+                            return
+                        window = idle_timeout if idle_timeout > 0 else absolute_timeout
+                        absolute_deadline = absolute_wd.when()
+                        if (
+                            not absolute_wd.expired()
+                            and absolute_deadline is not None
+                            and absolute_deadline < now + window
+                        ):
+                            absolute_wd.reschedule(now + window)
+
+                    ctx._hold_idle_watchdog = _hold_idle
                     try:
                         async with idle_wd:
                             await self.run_turn(request, ctx)
@@ -1928,16 +2024,35 @@ class HarnessApp:
             if idle_wd is not None and idle_wd.expired():
                 raise self._idle_watchdog_error(ctx, idle_timeout, attempt) from exc
             if absolute_wd.expired():
-                _logger.warning(
-                    "run_turn for %s exceeded the %.0fs absolute turn ceiling; "
-                    "marking the turn failed",
-                    ctx.response_id,
-                    absolute_timeout,
+                # By now the cancellation has unwound any human wait, so ask
+                # whether one was pending at the moment the ceiling fired.
+                fired_at = absolute_wd.when()
+                wait_started = (
+                    ctx._human_wait_pending_since(fired_at) if fired_at is not None else None
                 )
-                raise RuntimeError(
-                    f"turn exceeded the {absolute_timeout:.0f}s harness absolute watchdog "
-                    f"(total turn duration cap)"
-                ) from exc
+                if wait_started is not None and fired_at is not None:
+                    waited = fired_at - wait_started
+                    if human_wait_timeout > 0 and waited >= human_wait_timeout:
+                        message = (
+                            f"turn expired after waiting {waited:.0f}s for a human answer "
+                            f"(question/approval); the {human_wait_timeout:.0f}s human-wait "
+                            f"limit was reached (harness absolute watchdog)"
+                        )
+                    else:
+                        message = (
+                            f"turn exceeded the {absolute_timeout:.0f}s harness absolute "
+                            f"watchdog (total turn duration cap) after waiting {waited:.0f}s "
+                            f"for a human answer (question/approval)"
+                        )
+                else:
+                    message = (
+                        f"turn exceeded the {absolute_timeout:.0f}s harness absolute watchdog "
+                        f"(total turn duration cap)"
+                    )
+                _logger.warning(
+                    "run_turn for %s: %s; marking the turn failed", ctx.response_id, message
+                )
+                raise RuntimeError(message) from exc
             # Neither ceiling tripped — an inner ``run_turn`` TimeoutError;
             # pass it through unchanged.
             raise
