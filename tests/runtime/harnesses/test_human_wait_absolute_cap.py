@@ -17,7 +17,10 @@ The rules covered here (in-process, driving ``_guarded_run_turn`` directly):
    one completes;
 4. ``HARNESS_HUMAN_WAIT_TIMEOUT_S <= 0`` restores the old behavior;
 5. the begin/end bracket stamps and clears the wait start on every exit
-   path, for both elicitations and human-gated policy evaluations.
+   path, for both elicitations and human-gated policy evaluations — and a
+   policy-only wait (no elicitation to stamp it) holds the cap on its own;
+6. the hold applies as the wait opens, so a cap that falls before the first
+   heartbeat of the wait does not fire.
 
 How to run::
 
@@ -321,3 +324,96 @@ async def test_overlapping_waits_keep_the_first_start(monkeypatch: pytest.Monkey
     await elicit
     assert ctx._pending_human_waits == 0
     assert ctx._human_wait_started_at is None
+
+
+class _PolicyGateApp(HarnessApp):
+    """Works briefly, then parks on a human-gated policy verdict (no elicitation).
+
+    Records whether the wait start was stamped while the gate was open.
+    """
+
+    def __init__(self, *, ask_after: float, heartbeat: float = 0.05) -> None:
+        super().__init__()
+        self._ask_after = ask_after
+        self._heartbeat = heartbeat
+        self.verdict: str | None = None
+
+    async def run_turn(self, request: Any, ctx: TurnContext) -> None:
+        del request
+
+        async def _beat() -> None:
+            while True:
+                await asyncio.sleep(self._heartbeat)
+                ctx.emit(HeartbeatEvent(type="response.heartbeat"))
+
+        beat = asyncio.create_task(_beat())
+        try:
+            ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="work "))
+            await asyncio.sleep(self._ask_after)
+            verdict = await ctx.evaluate_policy("poleval_gate", "PHASE_TOOL_CALL", {})
+            self.verdict = verdict.action
+            ctx.emit(OutputTextDeltaEvent(type="response.output_text.delta", delta="done"))
+        finally:
+            beat.cancel()
+
+
+async def test_policy_only_wait_holds_the_cap_until_approved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A human-gated policy wait alone stamps the wait and outlives the cap.
+
+    No elicitation in the turn, so nothing else can stamp the wait start: the
+    policy path's own bracket must. Without it, heartbeats only hold the idle
+    window and the turn dies at the 0.5s cap before the 1.2s approval.
+    """
+    _set_timeouts(monkeypatch, idle=0.3, absolute=0.5, human_wait=86400.0)
+    app = _PolicyGateApp(ask_after=0.1)
+    ctx = _make_ctx("resp_policy_only")
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    stamped_while_open: list[float | None] = []
+
+    async def _approve() -> None:
+        while "poleval_gate" not in ctx._pending_policy_evaluations:
+            await asyncio.sleep(0.01)
+        stamped_while_open.append(ctx._human_wait_started_at)
+        await asyncio.sleep(max(0.0, started + 1.2 - loop.time()))
+        assert ctx._complete_policy_evaluation(
+            "poleval_gate", _scaffold.PolicyVerdictPayload(action="POLICY_ACTION_ALLOW")
+        ), "the policy gate was no longer pending when the human approved"
+
+    approver = asyncio.create_task(_approve())
+    try:
+        async with asyncio.timeout(10):
+            await app._guarded_run_turn(None, ctx)  # type: ignore[arg-type]
+    finally:
+        approver.cancel()
+    elapsed = loop.time() - started
+
+    assert stamped_while_open and stamped_while_open[0] is not None, (
+        "a human-gated policy wait must stamp _human_wait_started_at when it opens"
+    )
+    assert app.verdict == "POLICY_ACTION_ALLOW"
+    assert elapsed >= 1.2, f"turn ended before the approval arrived ({elapsed:.2f}s)"
+    assert ctx._pending_human_waits == 0
+    assert ctx._human_wait_started_at is None, "the stamp is cleared once the verdict lands"
+
+
+async def test_wait_opened_just_before_the_cap_is_held_before_any_heartbeat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The hold applies as the wait opens, not only at the next heartbeat.
+
+    Idle watchdog off (so the request event's progress reset can't help),
+    1s cap, question at ~0.8s, heartbeats every 5s (none before the answer),
+    answer at ~1.4s. Only the hold applied at wait-open keeps the turn past
+    the 1s cap.
+    """
+    _set_timeouts(monkeypatch, idle=0.0, absolute=1.0, human_wait=86400.0)
+    app = _LateQuestionApp(ask_after=0.8, work_tick=0.2, heartbeat=5.0)
+    ctx = _make_ctx("resp_hold_at_open")
+
+    elapsed = await _run_answered(app, ctx, answer_after=1.4)
+
+    assert app.answer == "accept"
+    assert elapsed >= 1.4, f"turn ended before the answer arrived ({elapsed:.2f}s)"
