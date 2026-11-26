@@ -4161,15 +4161,19 @@ def create_runner_app(
         _hermes_terminal_ensure_locks.pop(session_id, None)
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
-        await _native_runtime.teardown_codex_native_app_server(session_id)
-        await _cancel_auto_forwarder_task(session_id)
-        # Drop the native-pane liveness ledgers for this session. Both are keyed
-        # on conversation id and were previously cleared only on the reaper's own
-        # teardown path, so a session that ended CLEANLY left residue behind
-        # (bounded and evictable, but still stale state a later same-id session
-        # could read). After the forwarder (the stream ledger's only writer) is
-        # cancelled, so a final stamp cannot outlive the clear.
-        _clear_native_pane_liveness(session_id)
+        try:
+            await _native_runtime.teardown_codex_native_app_server(session_id)
+            await _cancel_auto_forwarder_task(session_id)
+        finally:
+            # Drop the native-pane liveness ledgers for this session. Both are keyed
+            # on conversation id and were previously cleared only on the reaper's own
+            # teardown path, so a session that ended CLEANLY left residue behind
+            # (bounded and evictable, but still stale state a later same-id session
+            # could read). After the forwarder (the stream ledger's only writer) is
+            # cancelled, so a final stamp cannot outlive the clear; in ``finally``
+            # (as on the reaper path) so a failed or cancelled teardown still clears
+            # them; the exception, CancelledError included, propagates unchanged.
+            _clear_native_pane_liveness(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
 

@@ -19,6 +19,7 @@ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.native import native_cost_popup
+from omnigent.runner import app as runner_app_module
 from omnigent.runner.app import create_runner_app
 from omnigent.runner.native import orchestration as native_runtime
 from omnigent.runner.resource_registry import SessionResourceRegistry
@@ -1097,6 +1098,45 @@ async def test_session_cleanup_clears_both_liveness_ledgers(
 
     assert pane_progress.stream_progress_age_s("conv_ending") is None
     assert "conv_ending" not in probe._samples
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, asyncio.CancelledError])
+async def test_session_delete_clears_liveness_when_forwarder_cancel_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException],
+) -> None:
+    """A failed or cancelled forwarder teardown still clears both liveness ledgers.
+
+    Session deletion clears the ledgers after cancelling the forwarder; without a
+    ``finally`` an exception there (or the delete itself being cancelled) left the
+    stream stamp and CPU baseline behind for a later same-id session. The
+    exception must still propagate: cleanup must not swallow a cancellation.
+    """
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 5_000})
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    probe = app.state.native_pane_cpu_probe
+
+    async def _failing_cancel(_session_id: str) -> None:
+        raise failure("forwarder cancel failed")
+
+    monkeypatch.setattr(runner_app_module, "_cancel_auto_forwarder_task", _failing_cancel)
+    pane_progress.note_stream_progress("conv_failing")
+    probe.is_cpu_active("conv_failing", 4242)
+    assert pane_progress.stream_progress_age_s("conv_failing") is not None
+    assert "conv_failing" in probe._samples
+
+    (delete_session,) = [
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/v1/sessions/{session_id}"
+        and "DELETE" in getattr(route, "methods", set())
+    ]
+    with pytest.raises(failure):
+        await delete_session("conv_failing")
+
+    assert pane_progress.stream_progress_age_s("conv_failing") is None
+    assert "conv_failing" not in probe._samples
 
 
 # ---------------------------------------------------------------------------
