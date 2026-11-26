@@ -1023,6 +1023,57 @@ async def test_sparing_on_cpu_alone_logs_the_culprit_pid_and_rate(
     assert "90.0%" in logged[0]  # pid 12's share of the 100%-of-a-core total
 
 
+@pytest.mark.parametrize("stamp_during", ["close_terminal", "forwarder_cancel"])
+async def test_reap_clears_liveness_after_a_final_stream_write_during_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stamp_during: str,
+) -> None:
+    """A stream stamp that lands while the reap tears the pane down is not inherited.
+
+    The forwarder keeps running while ``close_terminal`` is awaited and can
+    stamp once more as it is cancelled. Clearing the ledgers before those awaits
+    left that final stamp behind, so a re-created pane on the same conversation
+    looked like it had recent work. The clear must come after the forwarder is
+    cancelled, still inside the reap.
+    """
+    conv = "conv_final_write"
+    monkeypatch.setattr(pane_cpu, "_subtree_cpu_ticks", lambda _pid: {11: 5_000})
+    closed: list[str] = []
+
+    async def _close_terminal(self: object, session_id: str, terminal_id: str) -> None:
+        closed.append(terminal_id)
+        if stamp_during == "close_terminal":
+            pane_progress.note_stream_progress(session_id)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(SessionResourceRegistry, "close_terminal", _close_terminal)
+    app = _silent_pane_app(monkeypatch, tmp_path)
+    probe = app.state.native_pane_cpu_probe
+
+    forwarder_started = asyncio.Event()
+
+    async def _forwarder() -> None:
+        forwarder_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            if stamp_during == "forwarder_cancel":
+                pane_progress.note_stream_progress(conv)
+
+    task = asyncio.ensure_future(_forwarder())
+    await forwarder_started.wait()
+    monkeypatch.setitem(native_runtime._AUTO_FORWARDER_TASKS, conv, task)
+
+    pane = _pane(conv)
+    await app.state.native_pane_reaper._reap(pane)
+
+    assert closed == [pane.terminal_id]
+    assert task.done()
+    assert pane_progress.stream_progress_age_s(conv) is None
+    assert conv not in probe._samples
+
+
 async def test_session_cleanup_clears_both_liveness_ledgers(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

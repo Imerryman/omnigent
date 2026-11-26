@@ -4162,14 +4162,14 @@ def create_runner_app(
         _repl_terminal_ensure_locks.pop(session_id, None)
         _interrupted_sessions.discard(session_id)
         await _native_runtime.teardown_codex_native_app_server(session_id)
+        await _cancel_auto_forwarder_task(session_id)
         # Drop the native-pane liveness ledgers for this session. Both are keyed
         # on conversation id and were previously cleared only on the reaper's own
         # teardown path, so a session that ended CLEANLY left residue behind
         # (bounded and evictable, but still stale state a later same-id session
-        # could read). The forwarder that writes the stream ledger is cancelled
-        # just below, so clearing here cannot race a live writer.
+        # could read). After the forwarder (the stream ledger's only writer) is
+        # cancelled, so a final stamp cannot outlive the clear.
         _clear_native_pane_liveness(session_id)
-        await _cancel_auto_forwarder_task(session_id)
         # Close any OpenCode server that no forwarder adopted.
         await _native_runtime.teardown_opencode_native_server(session_id)
 
@@ -9712,20 +9712,25 @@ def create_runner_app(
                         extra={"session_id": conv_id},
                     )
                     return
-                # The pane is going away, so drop the liveness state keyed on it:
-                # its CPU baseline would be stale (and its pid recycled) when the
-                # pane is re-created, and its stream stamp belongs to a stream that
-                # no longer exists. Same helper the session-cleanup path uses. After
-                # the checks above, so a pane left alive keeps its baselines.
-                _clear_native_pane_liveness(conv_id)
                 try:
                     await resource_registry.close_terminal(conv_id, pane.terminal_id)
                 finally:
                     # The pane's forwarder, helper server and tool relay outlive it
                     # otherwise; ``finally`` so a partially failed close cannot leak them.
-                    await _native_runtime.teardown_codex_native_app_server(conv_id)
-                    await _cancel_auto_forwarder_task(conv_id)
-                    await _native_runtime.teardown_opencode_native_server(conv_id)
+                    try:
+                        await _native_runtime.teardown_codex_native_app_server(conv_id)
+                        await _cancel_auto_forwarder_task(conv_id)
+                        await _native_runtime.teardown_opencode_native_server(conv_id)
+                    finally:
+                        # The pane is gone, so drop the liveness state keyed on it:
+                        # its CPU baseline would be stale (and its pid recycled) when
+                        # the pane is re-created, and its stream stamp belongs to a
+                        # stream that no longer exists. Only AFTER the forwarder is
+                        # cancelled: it keeps stamping while close_terminal() is
+                        # awaited, and a stamp landing after an earlier clear would
+                        # hand a re-created pane a stale recent-work signal. Still
+                        # under the ensure lock, so a re-create cannot interleave.
+                        _clear_native_pane_liveness(conv_id)
                     if binding := _session_comment_relays.get(conv_id):
                         _discard_comment_relay(conv_id, binding.relay)
                     _publish_terminal_deleted_event(
