@@ -3476,10 +3476,17 @@ class PiExecutor(Executor):
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
                     return
-                # LOCAL CARRY (Codex CK30): Pi 1.1.0+ marks a cancelled run with ``aborted: true`` on
-                # agent_settled; a cancel between model calls settles WITHOUT an aborted message_end, so
-                # report it as an error (like the aborted message_end path) instead of a completed turn.
-                if event.get("aborted") is True:
+                # LOCAL CARRY (Codex CK30): Pi 1.1.0+ marks a cancelled run with
+                # ``aborted: true`` on agent_settled; a cancel between model calls
+                # settles WITHOUT an aborted message_end, so report it as an error
+                # (like the aborted message_end path) instead of a completed turn.
+                # Gated on abort_requested: a deliberate Interrupt keeps upstream
+                # #12483's path (the turn completes at this boundary and the idle
+                # process is kept for the next prompt); only an abort nobody asked
+                # for becomes an error.
+                if event.get("aborted") is True and not (
+                    state is not None and state.abort_requested
+                ):
                     yield ExecutorError(message="aborted")
                     return
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)

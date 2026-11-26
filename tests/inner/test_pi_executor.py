@@ -6538,6 +6538,70 @@ def test_aborted_settle_without_aborted_message_is_not_a_completion() -> None:
     _run(_test())
 
 
+@pytest.mark.parametrize(
+    "with_aborted_message",
+    [pytest.param(True, id="aborted-message_end"), pytest.param(False, id="between-model-calls")],
+)
+def test_requested_abort_settled_aborted_keeps_session(with_aborted_message: bool) -> None:
+    """LOCAL CARRY (CK30 gate): a deliberate Interrupt whose ``agent_settled`` carries
+    ``aborted: true`` (Pi 1.1.0+) keeps upstream #12483's behaviour: the interrupted turn
+    completes at the run boundary, the kept process is reused, and the next prompt gets the
+    interruption marker. Only an unrequested aborted settle is an error (test above)."""
+
+    async def _test() -> None:
+        aborted = _assistant_message("partial", stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+            ]
+        )
+        first_message = {
+            "role": "user",
+            "content": "Write a long essay.",
+            "session_id": _SESSION_KEY,
+        }
+        turn = executor.run_turn([first_message], [], "system")
+        assert await anext(turn) == TextChunk(text="partial")
+
+        assert await executor.interrupt_session(_SESSION_KEY)
+        boundary = [_rpc_frame(type="response", command="abort", success=True)]
+        if with_aborted_message:
+            boundary += [
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+            ]
+        else:
+            boundary.append(_rpc_frame(type="agent_end", messages=[], willRetry=False))
+        boundary += [
+            _rpc_frame(type="agent_settled", aborted=True),
+            *_plain_answer_frames("SUMMARY"),
+        ]
+        for frame in boundary:
+            rpc._line_queue.put_nowait(frame)
+        first_rest = [event async for event in turn]
+
+        assert [type(e) for e in first_rest] == [TurnComplete]
+        assert _SESSION_KEY in executor._session_states
+        assert rpc.process is not None
+
+        history = [
+            first_message,
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead.", "session_id": _SESSION_KEY},
+        ]
+        follow_up = [event async for event in executor.run_turn(history, [], "system")]
+        assert [e.response for e in follow_up if isinstance(e, TurnComplete)] == ["SUMMARY"]
+        assert [e for e in follow_up if isinstance(e, ExecutorError)] == []
+        commands = [json.loads(line) for line in rpc.process.stdin.data]
+        assert [command["type"] for command in commands] == ["prompt", "abort", "prompt"]
+        assert commands[2]["message"] == f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
 def test_settled_turn_returns_recovered_answer_after_auto_retry() -> None:
     """A retryable provider error followed by pi's own recovery completes
     the turn with the recovered answer instead of the abandoned error."""
