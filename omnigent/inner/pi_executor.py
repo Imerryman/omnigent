@@ -866,6 +866,8 @@ def _build_models_json(
     catalog_models: Sequence[model_catalog.ModelEntry] = (),
     model_wire_apis: Mapping[str, frozenset[ModelWireAPI]] | None = None,
     openai_wire_api: str | None = None,
+    configured_context_window: int | None = None,
+    configured_max_output_tokens: int | None = None,
 ) -> _PiModelsConfig:
     # Pi's models.json mixes str/int/bool/list/dict across provider configs;
     """Build a Pi ``models.json`` with protocol-specific gateway providers.
@@ -1041,7 +1043,15 @@ def _build_models_json(
                 url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
                 for url in (base_urls or {}).values()
             ):
-                model_entry = pi_generic_model_json_entry(model)
+                if configured_context_window is None and configured_max_output_tokens is None:
+                    # Unset limits keep upstream's exact call shape.
+                    model_entry = pi_generic_model_json_entry(model)
+                else:
+                    model_entry = pi_generic_model_json_entry(
+                        model,
+                        configured_context_window=configured_context_window,
+                        configured_max_output_tokens=configured_max_output_tokens,
+                    )
             else:
                 model_entry = {"id": model, "input": ["text", "image"]}
                 if pi_model_is_reasoning(model) or (
@@ -1052,6 +1062,14 @@ def _build_models_json(
             if provider["api"] == "anthropic-messages":
                 model_entry = pi_model_with_thinking_defaults(model_entry)
             entry = dict(model_entry)
+            if "qwen3.8-flash-next" in model.lower():
+                # carry 2026-10-31: Strata streams usage; scoped to this model
+                # (other providers keep their flags).
+                compat = entry.get("compat")
+                entry["compat"] = {
+                    **(compat if isinstance(compat, dict) else {}),
+                    "supportsUsageInStreaming": True,
+                }
             provider["models"] = [*provider["models"], entry]
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
@@ -2176,6 +2194,8 @@ class PiExecutor(Executor):
         base_url_override: str | None = None,
         base_urls_override: dict[str, str] | None = None,
         openai_wire_api: str | None = None,
+        configured_context_window: int | None = None,
+        configured_max_output_tokens: int | None = None,
         gateway_auth_command: str | None = None,
         gateway_auth_refresh_interval_ms: str | None = None,
         retry_policy: RetryPolicy | None = None,
@@ -2279,6 +2299,9 @@ class PiExecutor(Executor):
         if openai_wire_api not in (None, RESPONSES_WIRE_API, CHAT_WIRE_API):
             raise ValueError(f"unsupported Pi OpenAI wire API: {openai_wire_api!r}")
         self._openai_wire_api = openai_wire_api
+        # carry 2026-10-31: provider-configured limits for the generic gateway model entry
+        self._configured_context_window = configured_context_window
+        self._configured_max_output_tokens = configured_max_output_tokens
         self._gateway_model_entries: tuple[model_catalog.ModelEntry, ...] | None = None
         self._gateway_model_wire_apis: dict[str, frozenset[ModelWireAPI]] | None = None
         self._gateway_auth_command = gateway_auth_command
@@ -2315,6 +2338,7 @@ class PiExecutor(Executor):
         from omnigent.harnesses.pi_native.main import (
             PI_AGENT_SETTLED_MIN_VERSION,
             PI_APPROVE_MIN_VERSION,
+            PI_NO_MCP_MIN_VERSION,
             pi_version,
         )
 
@@ -2342,6 +2366,10 @@ class PiExecutor(Executor):
             # resources. In a runner-driven session there is nobody at the
             # terminal to answer it, so we approve when the flag is supported.
             self._extra_args.append("--approve")
+        if self._pi_version is not None and self._pi_version >= PI_NO_MCP_MIN_VERSION:
+            # LOCAL CARRY (Codex CK27): no Pi built-in MCP servers in
+            # omnigent-driven runs (see PI_NO_MCP_MIN_VERSION).
+            self._extra_args.append("--no-mcp")
         self._bundle_dir = bundle_dir
         self._agent_name = agent_name
         self._skills_filter = skills_filter
@@ -3035,6 +3063,8 @@ class PiExecutor(Executor):
                 catalog_models=self._gateway_model_entries or (),
                 model_wire_apis=wire_catalog,
                 openai_wire_api=self._openai_wire_api,
+                configured_context_window=self._configured_context_window,
+                configured_max_output_tokens=self._configured_max_output_tokens,
             )
 
         if state.rpc is not None:
@@ -3169,13 +3199,22 @@ class PiExecutor(Executor):
         }
         if images:
             command["images"] = images
+        # LOCAL (CK30 race): consume the previous turn's interruption BEFORE awaiting
+        # the prompt write. Upstream clears the flag after send_command(), so an
+        # Interrupt landing while stdin.drain() is suspended (flag set, ``abort``
+        # sent) was erased when delivery resumed; with the CK30 gate that turned a
+        # deliberate Interrupt into ExecutorError("aborted"). A failed send restores
+        # the consumed flag so the retry still carries the interruption marker.
+        consumed_abort = state is not None and state.abort_requested
+        if state is not None:
+            state.abort_requested = False
         try:
             await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
+            if state is not None and consumed_abort:
+                state.abort_requested = True
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
-        if state is not None:
-            state.abort_requested = False
 
         # Read events until the turn boundary: ``agent_settled`` on pi >= 0.80.4,
         # where one prompt may span several ``agent_end`` runs (retry, compaction,
@@ -3445,6 +3484,19 @@ class PiExecutor(Executor):
                     yield compaction
                 if pending_error is not None:
                     yield ExecutorError(message=pending_error)
+                    return
+                # LOCAL CARRY (Codex CK30): Pi 1.1.0+ marks a cancelled run with
+                # ``aborted: true`` on agent_settled; a cancel between model calls
+                # settles WITHOUT an aborted message_end, so report it as an error
+                # (like the aborted message_end path) instead of a completed turn.
+                # Gated on abort_requested: a deliberate Interrupt keeps upstream
+                # #12483's path (the turn completes at this boundary and the idle
+                # process is kept for the next prompt); only an abort nobody asked
+                # for becomes an error.
+                if event.get("aborted") is True and not (
+                    state is not None and state.abort_requested
+                ):
+                    yield ExecutorError(message="aborted")
                     return
                 turn_usage = _aggregate_pi_turn_usage(message_usages, model)
                 _notify_usage_from_dict(model=model, usage=turn_usage)

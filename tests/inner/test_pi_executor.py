@@ -6497,6 +6497,222 @@ def test_constructor_probes_pi_version_once() -> None:
     assert "--approve" in executor._extra_args
 
 
+def test_pi_with_builtin_mcp_gets_no_mcp() -> None:
+    """LOCAL CARRY: Pi >= 1.0.4 keeps MCP tools past a --tools allowlist, so
+    omnigent passes --no-mcp."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi_native.main.pi_version", return_value=(1, 4, 0)),
+    ):
+        executor = PiExecutor()
+    assert "--no-mcp" in executor._extra_args
+    assert "--no-tools" in executor._extra_args
+
+
+def test_pi_before_no_mcp_flag_does_not_get_it() -> None:
+    """LOCAL CARRY: Pi < 1.0.4 has no --no-mcp flag (0.87.1 would reject it)."""
+    with (
+        patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
+        patch("omnigent.harnesses.pi_native.main.pi_version", return_value=(0, 87, 1)),
+    ):
+        executor = PiExecutor()
+    assert "--no-mcp" not in executor._extra_args
+
+
+def test_aborted_settle_without_aborted_message_is_not_a_completion() -> None:
+    """LOCAL CARRY: Pi 1.1.0+ ``agent_settled.aborted`` (cancel between model calls, no aborted
+    message_end) must surface as an error, never as a TurnComplete."""
+
+    async def _test() -> None:
+        frames = [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(type="agent_start"),
+            _rpc_frame(type="agent_end", messages=[], willRetry=False),
+            _rpc_frame(type="agent_settled", aborted=True),
+        ]
+        executor, _rpc = _session_executor(frames)
+        events = await _run_session_turn(executor, "hello")
+        assert [e for e in events if isinstance(e, TurnComplete)] == []
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == ["aborted"]
+
+    _run(_test())
+
+
+@pytest.mark.parametrize(
+    "with_aborted_message",
+    [pytest.param(True, id="aborted-message_end"), pytest.param(False, id="between-model-calls")],
+)
+def test_requested_abort_settled_aborted_keeps_session(with_aborted_message: bool) -> None:
+    """LOCAL CARRY (CK30 gate): a deliberate Interrupt whose ``agent_settled`` carries
+    ``aborted: true`` (Pi 1.1.0+) keeps upstream #12483's behaviour: the interrupted turn
+    completes at the run boundary, the kept process is reused, and the next prompt gets the
+    interruption marker. Only an unrequested aborted settle is an error (test above)."""
+
+    async def _test() -> None:
+        aborted = _assistant_message("partial", stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor(
+            [
+                _rpc_frame(type="response", success=True),
+                _rpc_frame(type="message_start", message={"role": "assistant"}),
+                _text_delta_frame("partial"),
+            ]
+        )
+        first_message = {
+            "role": "user",
+            "content": "Write a long essay.",
+            "session_id": _SESSION_KEY,
+        }
+        turn = executor.run_turn([first_message], [], "system")
+        assert await anext(turn) == TextChunk(text="partial")
+
+        assert await executor.interrupt_session(_SESSION_KEY)
+        boundary = [_rpc_frame(type="response", command="abort", success=True)]
+        if with_aborted_message:
+            boundary += [
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+            ]
+        else:
+            boundary.append(_rpc_frame(type="agent_end", messages=[], willRetry=False))
+        boundary += [
+            _rpc_frame(type="agent_settled", aborted=True),
+            *_plain_answer_frames("SUMMARY"),
+        ]
+        for frame in boundary:
+            rpc._line_queue.put_nowait(frame)
+        first_rest = [event async for event in turn]
+
+        assert [type(e) for e in first_rest] == [TurnComplete]
+        assert _SESSION_KEY in executor._session_states
+        assert rpc.process is not None
+
+        history = [
+            first_message,
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead.", "session_id": _SESSION_KEY},
+        ]
+        follow_up = [event async for event in executor.run_turn(history, [], "system")]
+        assert [e.response for e in follow_up if isinstance(e, TurnComplete)] == ["SUMMARY"]
+        assert [e for e in follow_up if isinstance(e, ExecutorError)] == []
+        commands = [json.loads(line) for line in rpc.process.stdin.data]
+        assert [command["type"] for command in commands] == ["prompt", "abort", "prompt"]
+        assert commands[2]["message"] == f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+class _BlockingFirstDrainWriter(_FakeStreamWriter):
+    """stdin whose first ``drain()`` parks until released: a prompt write that
+    suspends mid-delivery (a full pipe)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_drain_entered = asyncio.Event()
+        self.release_first_drain = asyncio.Event()
+        self._drains = 0
+
+    async def drain(self) -> None:
+        self._drains += 1
+        if self._drains == 1:
+            self.first_drain_entered.set()
+            await self.release_first_drain.wait()
+
+
+@pytest.mark.parametrize(
+    "with_aborted_message",
+    [pytest.param(True, id="aborted-message_end"), pytest.param(False, id="between-model-calls")],
+)
+def test_interrupt_during_blocked_prompt_delivery_keeps_session(
+    with_aborted_message: bool,
+) -> None:
+    """LOCAL (CK30 race): an Interrupt that lands while the prompt's ``drain()`` is
+    suspended must survive prompt delivery. Upstream cleared ``abort_requested``
+    after awaiting the write, erasing the request, so the aborted settle became
+    ExecutorError("aborted") for a deliberate Interrupt."""
+
+    async def _test() -> None:
+        aborted = _assistant_message("", stop_reason="aborted", error_message="aborted")
+        executor, rpc = _session_executor([])
+        stdin = _BlockingFirstDrainWriter()
+        rpc.process.stdin = stdin
+        state = executor._session_states[_SESSION_KEY]
+        first_message = {
+            "role": "user",
+            "content": "Write a long essay.",
+            "session_id": _SESSION_KEY,
+        }
+        turn = executor.run_turn([first_message], [], "system")
+        first = asyncio.ensure_future(anext(turn))
+        await asyncio.wait_for(stdin.first_drain_entered.wait(), 5)
+
+        assert await executor.interrupt_session(_SESSION_KEY)
+        assert state.abort_requested is True
+        stdin.release_first_drain.set()
+
+        boundary = [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(type="response", command="abort", success=True),
+        ]
+        if with_aborted_message:
+            boundary += [
+                _rpc_frame(type="message_end", message=aborted),
+                _rpc_frame(type="agent_end", messages=[aborted], willRetry=False),
+            ]
+        else:
+            boundary.append(_rpc_frame(type="agent_end", messages=[], willRetry=False))
+        boundary += [
+            _rpc_frame(type="agent_settled", aborted=True),
+            *_plain_answer_frames("SUMMARY"),
+        ]
+        for frame in boundary:
+            rpc._line_queue.put_nowait(frame)
+        events = [await asyncio.wait_for(first, 5)] + [event async for event in turn]
+
+        assert [e for e in events if isinstance(e, ExecutorError)] == []
+        assert [type(e) for e in events] == [TurnComplete]
+        assert _SESSION_KEY in executor._session_states
+        assert state.abort_requested is True, "the in-flight Interrupt was erased"
+
+        history = [
+            first_message,
+            {"role": "user", "content": INTERRUPTION_MARKER_TEXT},
+            {"role": "user", "content": "Summarize instead.", "session_id": _SESSION_KEY},
+        ]
+        follow_up = [event async for event in executor.run_turn(history, [], "system")]
+        assert [e.response for e in follow_up if isinstance(e, TurnComplete)] == ["SUMMARY"]
+        commands = [json.loads(line) for line in stdin.data]
+        assert [command["type"] for command in commands] == ["prompt", "abort", "prompt"]
+        assert commands[2]["message"] == f"{INTERRUPTION_MARKER_TEXT}\n\nSummarize instead."
+        assert state.abort_requested is False
+        assert rpc._line_queue.empty()
+
+    _run(_test())
+
+
+def test_failed_prompt_send_keeps_the_previous_interruption() -> None:
+    """LOCAL (CK30 race fix): the interruption flag is consumed before the prompt
+    write; a send that fails puts it back so the retry still gets the marker."""
+
+    async def _test() -> None:
+        executor, rpc = _session_executor([])
+        state = executor._session_states[_SESSION_KEY]
+        state._has_sent_prompt = True
+        state.abort_requested = True
+
+        async def _broken_drain() -> None:
+            raise BrokenPipeError("pipe closed")
+
+        rpc.process.stdin.drain = _broken_drain
+        events = await _run_session_turn(executor, "next")
+        assert [e.message for e in events if isinstance(e, ExecutorError)] == [
+            "Failed to send prompt to Pi: pipe closed"
+        ]
+        assert state.abort_requested is True
+
+    _run(_test())
+
+
 def test_settled_turn_returns_recovered_answer_after_auto_retry() -> None:
     """A retryable provider error followed by pi's own recovery completes
     the turn with the recovered answer instead of the abandoned error."""
@@ -7315,6 +7531,40 @@ def test_generic_and_databricks_reasoning_use_pi_compat_detection(base_urls, wir
     for provider in config["providers"].values():
         if provider["api"].startswith("openai"):
             assert "supportsReasoningEffort" not in provider["compat"]
+
+
+def test_strata_qwen_model_entry_streams_usage() -> None:
+    """LOCAL CARRY: the Strata-served qwen3.8-flash-next entry opts into streamed
+    usage; other models keep their provider's flags."""
+    base_urls = {"openai": "http://generic.example/v1"}
+    for model, expected in (("qwen3.8-flash-next", True), ("custom-model", None)):
+        config = _build_models_json("http://generic.example", "synthetic", base_urls, model=model)
+        entry = next(p for p in config["providers"].values() if p["models"])["models"][0]
+        compat = entry.get("compat", {})
+        assert compat.get("supportsUsageInStreaming") is expected, model
+
+
+def test_generic_models_json_carries_configured_limits() -> None:
+    """LOCAL CARRY: a provider's configured context window / max output tokens
+    reach the generic gateway model entry; unset limits keep the catalog entry."""
+    base_urls = {"openai": "http://generic.example/v1"}
+    configured = _build_models_json(
+        "http://generic.example",
+        "synthetic",
+        base_urls,
+        model="custom-model",
+        configured_context_window=131072,
+        configured_max_output_tokens=8192,
+    )
+    entry = next(p for p in configured["providers"].values() if p["models"])["models"][0]
+    assert entry["contextWindow"] == 131072
+    assert entry["maxTokens"] == 8192
+    unset = _build_models_json(
+        "http://generic.example", "synthetic", base_urls, model="custom-model"
+    )
+    entry = next(p for p in unset["providers"].values() if p["models"])["models"][0]
+    assert entry.get("contextWindow") != 131072
+    assert entry.get("maxTokens") != 8192
 
 
 @pytest.mark.parametrize("destination", ["generic", "mixed-databricks", "catalog"])

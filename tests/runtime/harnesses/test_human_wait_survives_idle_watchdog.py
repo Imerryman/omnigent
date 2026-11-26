@@ -12,9 +12,10 @@ respond.
 
 Expected fix: while a human request is pending (inside ``ctx.elicit``
 or ``ctx.evaluate_policy``), heartbeats SHOULD reset the idle watchdog
-so the approval window stays open.  The absolute per-turn ceiling
-(``HARNESS_TURN_ABSOLUTE_TIMEOUT_S``) must remain unchanged — it is
-still the hard cap even during a human wait.
+so the approval window stays open.  They also hold the absolute per-turn
+ceiling (``HARNESS_TURN_ABSOLUTE_TIMEOUT_S``) open, but only for the
+human-wait budget (``HARNESS_HUMAN_WAIT_TIMEOUT_S``), so an approval
+that is never answered still terminates.
 
 The three tests here cover the three observable rules stated in the fix
 description:
@@ -196,16 +197,18 @@ def use_parking_elicit_fast_heartbeat_normal_idle(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.fixture
-def use_parking_elicit_fast_heartbeat_short_absolute(monkeypatch: pytest.MonkeyPatch) -> None:
+def use_parking_elicit_fast_heartbeat_short_human_wait(monkeypatch: pytest.MonkeyPatch) -> None:
     """
-    Abandoned-approval fixture: a 2s idle window and a 3s absolute
-    ceiling. Heartbeats hold the idle window open past 2s while parked on
-    the elicitation, but the turn must still terminate at the absolute
-    cap (~3s) when nobody ever answers — heartbeats must never extend it.
+    Abandoned-approval fixture: a 1s idle window, a 1s absolute ceiling
+    and a 3s human-wait budget. Heartbeats hold both watchdogs open while
+    parked on the elicitation, but only for the human-wait budget: the
+    turn must outlive the 1s agent cap and still terminate at ~3s + one
+    idle window when nobody ever answers.
     """
     monkeypatch.setenv("HARNESS_TEST_FIXTURE", "parking_elicit_fast_heartbeat")
-    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "2")
-    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "3")
+    monkeypatch.setenv("HARNESS_TURN_TIMEOUT_S", "1")
+    monkeypatch.setenv("HARNESS_TURN_ABSOLUTE_TIMEOUT_S", "1")
+    monkeypatch.setenv("HARNESS_HUMAN_WAIT_TIMEOUT_S", "3")
 
 
 # ---------------------------------------------------------------------------
@@ -407,20 +410,20 @@ async def test_elicit_counter_brackets_the_pending_wait(
 
 @pytest.mark.asyncio
 async def test_abandoned_elicitation_still_dies_at_the_absolute_cap(
-    use_parking_elicit_fast_heartbeat_short_absolute: None,
+    use_parking_elicit_fast_heartbeat_short_human_wait: None,
     manager: HarnessProcessManager,
 ) -> None:
     """
-    Hard-cap rule: an elicitation that is NEVER answered must still fail at
-    the absolute per-turn ceiling, even though heartbeats hold the idle
-    window open while the wait is pending.
+    Hard-cap rule: an elicitation that is NEVER answered must still fail,
+    once the human-wait budget is spent — not at the agent's absolute cap.
 
-    Idle window 2s, absolute cap 3s, heartbeats every 0.2s, no reply ever
-    sent. The heartbeats carry the turn past the 2s idle window (the fix),
-    but must not extend the 3s absolute ceiling — the stream has to close
-    with response.failed at ~3s. If heartbeats wrongly pushed the absolute
-    deadline too, the stream would never terminate and the outer timeout
-    would trip instead.
+    Idle window 1s, absolute cap 1s, human-wait budget 3s, heartbeats every
+    0.2s, no reply ever sent. The heartbeats carry the turn past both the
+    1s idle window and the 1s absolute cap, but stop extending the ceiling
+    once the wait is 3s old — the stream has to close with response.failed
+    at ~4s (budget + one idle window), naming the human-wait limit. If
+    heartbeats extended the ceiling without bound, the stream would never
+    terminate and the outer timeout would trip instead.
     """
     conv_id = "conv_hw_abandoned"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -440,12 +443,19 @@ async def test_abandoned_elicitation_still_dies_at_the_absolute_cap(
         f"The turn never parked on the elicitation; got {event_types!r}"
     )
     assert event_types[-1] == "response.failed", (
-        f"An abandoned approval must terminate at the absolute cap; "
-        f"got terminal={event_types[-1]!r}. Full types: {event_types!r}"
+        f"An abandoned approval must terminate once the human-wait budget is "
+        f"spent; got terminal={event_types[-1]!r}. Full types: {event_types!r}"
     )
-    # It survived the 2s idle window on heartbeats (the fix) but was cut at
-    # the 3s absolute cap — well before the 20s outer guard.
-    assert 2.0 < elapsed < 15.0, (
-        f"Expected termination at the ~3s absolute cap (after outliving the "
-        f"2s idle window); stream closed after {elapsed:.1f}s"
+    # It outlived the 1s agent cap on heartbeats but was cut once the 3s
+    # human-wait budget ran out — well before the 20s outer guard.
+    assert 3.0 < elapsed < 15.0, (
+        f"Expected termination at ~3s human-wait budget + 1s idle window "
+        f"(after outliving the 1s absolute cap); stream closed after {elapsed:.1f}s"
     )
+    error = events[-1].data["response"]["error"]
+    assert error is not None, f"response.failed carried no error: {events[-1].data!r}"
+    assert "human-wait limit was reached" in error["message"], (
+        f"The terminal error must name the human-wait limit, not the agent "
+        f"duration cap; got {error!r}."
+    )
+    assert "absolute watchdog" in error["message"], error

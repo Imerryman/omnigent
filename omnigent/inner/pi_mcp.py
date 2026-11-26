@@ -26,6 +26,8 @@ _logger = logging.getLogger(__name__)
 PiMcpServer: TypeAlias = dict[str, object]
 
 PI_MCP_CONFIG_NAME = "mcp.json"
+# Host knob, read in the runner: "0" keeps the host MCP inventory out of managed Pi dirs.
+PI_HOST_MCP_ENV = "OMNIGENT_PI_HOST_MCP"
 # Holds the SHA-256 of the last generated copy, so a copy Pi or the user changed is kept.
 _GENERATED_DIGEST_NAME = ".omnigent-mcp.json.sha256"
 # Pi already loads its own ``mcp.json``; the inventory can list it too, and its
@@ -236,6 +238,11 @@ def pi_mcp_servers_from_host(
     return translated
 
 
+def host_mcp_enabled() -> bool:
+    """Whether managed Pi dirs get the host's MCP servers (``OMNIGENT_PI_HOST_MCP=0`` opts out)."""
+    return os.environ.get(PI_HOST_MCP_ENV, "").strip() != "0"
+
+
 def _host_mcp_servers() -> list[ConfiguredMcpServer]:
     from omnigent.host.mcp_inventory import configured_mcp_servers
 
@@ -353,6 +360,11 @@ def sync_managed_pi_mcp_config(
     try:
         if _is_session_owned(target, digest):
             _logger.info("Keeping the session's own Pi MCP config %s", target)
+            return
+        # Pi starts every server in mcp.json per session, so a host with a heavy
+        # MCP inventory can keep Pi on the user's own file only.
+        if not host_mcp_enabled():
+            _restore_user_link(target, source, digest)
             return
         user_config = _read_user_config(source)
         merged = (
