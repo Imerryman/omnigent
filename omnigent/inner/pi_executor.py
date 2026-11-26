@@ -3199,13 +3199,22 @@ class PiExecutor(Executor):
         }
         if images:
             command["images"] = images
+        # LOCAL (CK30 race): consume the previous turn's interruption BEFORE awaiting
+        # the prompt write. Upstream clears the flag after send_command(), so an
+        # Interrupt landing while stdin.drain() is suspended (flag set, ``abort``
+        # sent) was erased when delivery resumed; with the CK30 gate that turned a
+        # deliberate Interrupt into ExecutorError("aborted"). A failed send restores
+        # the consumed flag so the retry still carries the interruption marker.
+        consumed_abort = state is not None and state.abort_requested
+        if state is not None:
+            state.abort_requested = False
         try:
             await rpc.send_command(command)
         except Exception as exc:  # noqa: BLE001 — executor boundary surfaces prompt-send errors as ExecutorError
+            if state is not None and consumed_abort:
+                state.abort_requested = True
             yield ExecutorError(message=f"Failed to send prompt to Pi: {exc}")
             return
-        if state is not None:
-            state.abort_requested = False
 
         # Read events until the turn boundary: ``agent_settled`` on pi >= 0.80.4,
         # where one prompt may span several ``agent_end`` runs (retry, compaction,
